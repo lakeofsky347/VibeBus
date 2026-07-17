@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows build, test, and package
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup show active-toolchain
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 6.0.x
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Build unsigned release assets
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+
+      - name: Validate MSI and extracted payload
+        shell: pwsh
+        run: |
+          $msiFiles = @(Get-ChildItem -LiteralPath dist -Filter "VibeBus-*-windows-x64.msi")
+          if ($msiFiles.Count -ne 1) {
+            throw "Expected exactly one MSI, found $($msiFiles.Count)."
+          }
+          $msi = $msiFiles[0]
+          ./scripts/test-installer.ps1 -MsiPath $msi.FullName
+
+      - name: Upload CI release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: vibebus-windows-${{ github.sha }}
+          path: |
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
+            dist/release-manifest.json
+          if-no-files-found: error
+          retention-days: 14
