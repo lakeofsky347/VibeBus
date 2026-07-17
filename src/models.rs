@@ -181,8 +181,19 @@ pub struct SubscriptionView {
     pub name: String,
     pub event_types: Vec<String>,
     pub cursor_sequence: i64,
+    pub pending_delivery: Option<SubscriptionDeliveryView>,
+    pub last_acked_delivery_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionDeliveryView {
+    pub delivery_id: String,
+    pub from_sequence: i64,
+    pub through_sequence: i64,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +202,27 @@ pub struct SubscriptionPoll {
     pub subscription: SubscriptionView,
     pub events: Vec<EventView>,
     pub scanned_through_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionPeek {
+    pub subscription: SubscriptionView,
+    pub delivery: Option<SubscriptionDeliveryView>,
+    pub events: Vec<EventView>,
+    pub scanned_through_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionAck {
+    pub subscription_id: String,
+    pub agent: String,
+    pub name: String,
+    pub delivery_id: String,
+    pub cursor_sequence: i64,
+    pub acknowledged_at: i64,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -86,11 +86,19 @@ Artifact publication accepts an idempotency key. The request identity includes t
 | Query events | `event list` | `vibebus_events` |
 | Create subscription | `subscription create` | `vibebus_subscription_create` |
 | List owned subscriptions | `subscription list` | `vibebus_subscription_list` |
-| Poll and advance | `subscription poll` | `vibebus_subscription_poll` |
+| Peek replay-safe delivery | `subscription peek` | `vibebus_subscription_peek` |
+| ACK replay-safe delivery | `subscription ack` | `vibebus_subscription_ack` |
+| Poll and advance (legacy) | `subscription poll` | `vibebus_subscription_poll` |
 
 Events use a project-wide monotonically increasing `sequence`. Query with `afterSequence`/`--after` and retain the last returned sequence. An empty event-type filter means all types; a non-empty filter accepts up to 32 exact event names. Message events contain routing metadata, not message subjects or bodies.
 
-Subscriptions belong to one authenticated agent and are unique by agent and name. Omitting `fromSequence` starts at the current project tail; `0` replays matching history. Polling returns up to 500 matching events and atomically advances the stored cursor. It is consume-on-poll: if a caller loses the response after the database commit, use the independently durable inbox/task facts for critical recovery; callers needing replay control should use `event list` with their own committed cursor.
+Subscriptions belong to one authenticated agent and are unique by agent and name. Omitting `fromSequence` starts at the current project tail; `0` replays matching history. Subscription views expose the committed cursor, an optional pending delivery, and the most recently acknowledged delivery ID.
+
+`peek` creates at most one pending delivery containing up to 500 matching events without advancing the committed cursor. Repeating peek returns that same delivery and full batch, even if the new request specifies a smaller limit or newer events have arrived. A delivery may contain zero matching events when it represents a scanned range of non-matching project events; it must still be acknowledged to advance over that range.
+
+`ack` accepts the pending `deliveryId`, advances the committed cursor through the delivery range, and clears the pending state. Retrying the most recent successful ACK returns the original cursor and timestamp with `replayed=true`. A wrong or stale ID conflicts. This provides at-least-once access to the batch, not exactly-once processing; consumers must make side effects idempotent and ACK only after the complete batch succeeds.
+
+Legacy `poll` remains available for compatibility. It returns up to 500 events and commits immediately, so a response lost after commit is not replayed. It refuses to run while a replay-safe delivery is pending and therefore cannot silently cross an unacknowledged batch.
 
 ## Structured handoff
 

@@ -27,7 +27,8 @@ Use the bundled `vibebus` MCP server as the single coordination interface. VibeB
 - Use `vibebus_handoff_send` for a resumable transfer. Include a concise summary, task ID when applicable, decisions, verified artifact IDs, blockers, and next actions. It is always high priority and requires recipient ACK.
 - Use `requiresAck` for information that another task must explicitly consume. Recipients should call `vibebus_ack` after acting on it.
 - Give every externally retried send, handoff, reservation acquire/renew, or artifact publish a stable `idempotencyKey`. Reuse it only for the identical logical request; a changed payload must use a new key.
-- For lightweight change detection, create one named `vibebus_subscription_create` subscription and poll it at safe boundaries. Omit `fromSequence` to start at the current tail; use `0` only when deliberate history replay is needed. Poll commits the cursor, so critical instructions must also be messages/tasks rather than event-only payloads.
+- For event-driven coordination, create one named `vibebus_subscription_create` subscription. Omit `fromSequence` to start at the current tail; use `0` only for deliberate history replay. Prefer `vibebus_subscription_peek`, process every returned event idempotently, then call `vibebus_subscription_ack` with the returned delivery ID. A repeated peek returns the same pending delivery until ACK.
+- Use legacy `vibebus_subscription_poll` only for non-critical consume-on-poll workflows. It commits immediately and refuses to cross a pending replay-safe delivery.
 - Complete work with `vibebus_task_complete` using the latest version. Dependency tasks unlock automatically after prerequisites complete.
 
 ## Conflict handling
@@ -38,9 +39,9 @@ Use the bundled `vibebus` MCP server as the single coordination interface. VibeB
 - Reservation expired: acquire a new reservation; renewal cannot revive a released or expired lease.
 - Version conflict: re-read current state, reconcile the new facts, then retry with the new version.
 - Idempotency conflict: do not alter the request under the old key. Inspect the already-completed operation, then either accept it or choose a new key for a genuinely new mutation.
-- Subscription poll conflict: another consumer advanced the same named cursor. Re-list the subscription and continue from its stored cursor; do not assume the returned batch was yours.
+- Subscription delivery conflict: another consumer changed the named cursor or a different delivery is pending. Re-list the subscription, re-peek the pending delivery, and never ACK an ID that was not returned to this consumer.
 - Missing project marker: do not initialize a project implicitly. Tell the user that `vibebus init` must be run deliberately at the intended root.
 
 ## End of turn
 
-Before handing off or stopping, check the inbox once, publish verified artifacts, send a structured handoff or blocker, release reservations no longer needed, and ensure owned task state reflects reality. Never claim that VibeBus can awaken or inject text into an already-running Codex generation, or that a subscription response lost after cursor commit will replay automatically.
+Before handing off or stopping, check the inbox once, ACK only fully processed subscription deliveries, publish verified artifacts, send a structured handoff or blocker, release reservations no longer needed, and ensure owned task state reflects reality. Never claim that VibeBus can awaken or inject text into an already-running Codex generation. Peek/ACK provides at-least-once access to a batch, not exactly-once side effects; handlers must remain idempotent.

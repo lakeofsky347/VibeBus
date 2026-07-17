@@ -75,6 +75,8 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     assert!(names.contains(&"vibebus_reservation_renew"));
     assert!(names.contains(&"vibebus_events"));
     assert!(names.contains(&"vibebus_subscription_poll"));
+    assert!(names.contains(&"vibebus_subscription_peek"));
+    assert!(names.contains(&"vibebus_subscription_ack"));
     assert!(names.contains(&"vibebus_handoff_send"));
     assert!(names.contains(&"vibebus_handoff_snapshot"));
 

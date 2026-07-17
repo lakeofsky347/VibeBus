@@ -232,6 +232,17 @@ pub struct SubscriptionPollRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct SubscriptionAckRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: String,
+    pub name: String,
+    pub delivery_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct HandoffSendRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
@@ -663,6 +674,44 @@ impl VibeBusMcp {
                 &request.token,
                 &request.name,
                 request.limit.unwrap_or(100),
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Peek a replay-safe subscription delivery without advancing its committed cursor"
+    )]
+    fn vibebus_subscription_peek(
+        &self,
+        Parameters(request): Parameters<SubscriptionPollRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.peek_subscription(
+                &request.agent,
+                &request.token,
+                &request.name,
+                request.limit.unwrap_or(100),
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Acknowledge a replay-safe subscription delivery and advance its committed cursor"
+    )]
+    fn vibebus_subscription_ack(
+        &self,
+        Parameters(request): Parameters<SubscriptionAckRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.acknowledge_subscription(
+                &request.agent,
+                &request.token,
+                &request.name,
+                &request.delivery_id,
             )
             .map_err(bus_error)?,
         )

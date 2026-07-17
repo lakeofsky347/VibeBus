@@ -301,6 +301,26 @@ enum SubscriptionCommand {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    Peek {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    Ack {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        delivery: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -590,6 +610,24 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             } => {
                 let token = resolve_token(token)?;
                 json!(bus.poll_subscription(&agent, &token, &name, limit)?)
+            }
+            SubscriptionCommand::Peek {
+                agent,
+                token,
+                name,
+                limit,
+            } => {
+                let token = resolve_token(token)?;
+                json!(bus.peek_subscription(&agent, &token, &name, limit)?)
+            }
+            SubscriptionCommand::Ack {
+                agent,
+                token,
+                name,
+                delivery,
+            } => {
+                let token = resolve_token(token)?;
+                json!(bus.acknowledge_subscription(&agent, &token, &name, &delivery)?)
             }
         },
         Command::Handoff { command } => match command {

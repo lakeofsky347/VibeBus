@@ -117,12 +117,12 @@ fn cli_exposes_subscription_and_structured_handoff_workflows() {
     assert_eq!(handoff["result"]["priority"], "high");
     assert_eq!(handoff["result"]["requiresAck"], true);
 
-    let polled = run_cli(
+    let peeked = run_cli(
         project.path(),
         data.path(),
         &[
             "subscription",
-            "poll",
+            "peek",
             "--agent",
             "cli-receiver",
             "--token",
@@ -131,7 +131,57 @@ fn cli_exposes_subscription_and_structured_handoff_workflows() {
             "handoffs",
         ],
     );
-    assert_eq!(polled["result"]["events"].as_array().unwrap().len(), 1);
+    assert_eq!(peeked["result"]["events"].as_array().unwrap().len(), 1);
+    let delivery_id = peeked["result"]["delivery"]["deliveryId"].as_str().unwrap();
+    let replayed = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "subscription",
+            "peek",
+            "--agent",
+            "cli-receiver",
+            "--token",
+            receiver_token,
+            "--name",
+            "handoffs",
+        ],
+    );
+    assert_eq!(replayed["result"]["delivery"]["deliveryId"], delivery_id);
+    let acknowledged = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "subscription",
+            "ack",
+            "--agent",
+            "cli-receiver",
+            "--token",
+            receiver_token,
+            "--name",
+            "handoffs",
+            "--delivery",
+            delivery_id,
+        ],
+    );
+    assert_eq!(acknowledged["result"]["replayed"], false);
+    let acknowledged_retry = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "subscription",
+            "ack",
+            "--agent",
+            "cli-receiver",
+            "--token",
+            receiver_token,
+            "--name",
+            "handoffs",
+            "--delivery",
+            delivery_id,
+        ],
+    );
+    assert_eq!(acknowledged_retry["result"]["replayed"], true);
 
     let snapshot = run_cli(
         project.path(),

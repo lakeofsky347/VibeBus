@@ -51,7 +51,7 @@ The database is outside the repository by default:
 | `reservations` | TTL-backed path intent |
 | `artifacts` | File path, hash, summary, task relation, metadata |
 | `idempotency_records` | Operation-scoped request hashes and cached responses |
-| `subscriptions` | Agent-owned filters and durable event cursors |
+| `subscriptions` | Agent-owned filters, committed cursors, pending deliveries, and last-ACK state |
 | `events` | Append-only audit facts |
 | `schema_migrations` | Applied database schema versions |
 
@@ -68,8 +68,9 @@ The database is outside the repository by default:
 9. Backup creation never overwrites an existing destination.
 10. Successful agent recovery rotates both the bearer token and single-use recovery key.
 11. An idempotency key either returns its original response or conflicts on payload drift.
-12. Subscription polling advances one owned cursor atomically and rejects concurrent stale updates.
+12. A subscription has at most one pending replay-safe delivery; its committed cursor moves only after matching ACK.
 13. Structured handoffs are directed, high-priority, and marked as requiring acknowledgement.
+14. Legacy consume-on-poll cannot advance through an unacknowledged replay-safe delivery.
 
 ## Recovery and retry boundaries
 
@@ -79,7 +80,11 @@ Externally retried writes record a canonical JSON request hash and serialized re
 
 ## Event consumption
 
-Every mutation appends a project event in the same transaction. The integer `sequence` is the canonical ordering cursor. Direct event queries are stateless and replayable from a caller-retained cursor; named subscriptions keep an authenticated agent-owned cursor in SQLite and consume on poll. Critical payloads such as handoffs remain independently durable in the directed inbox, so event cursors are notification/indexing state rather than the sole copy of work instructions.
+Every domain mutation appends a project event in the same transaction. The integer `sequence` is the canonical ordering cursor. Direct event queries are stateless and replayable from a caller-retained cursor.
+
+Named subscriptions keep an authenticated agent-owned committed cursor in SQLite. Replay-safe peek writes one pending delivery range without moving that cursor; repeated peeks reconstruct the same immutable event range. ACK atomically moves the cursor, records the most recent acknowledged delivery for retry recovery, and clears pending state. Cursor bookkeeping deliberately does not append another event, avoiding an infinite self-notification loop for wildcard subscriptions.
+
+Legacy polling still consumes and commits in one call, but it conflicts whenever pending delivery state exists. Future retention must never delete events inside any pending delivery range. Critical payloads such as handoffs remain independently durable in the directed inbox, so event delivery is notification/indexing state rather than the sole copy of work instructions.
 
 ## Codex plugin lifecycle
 
@@ -99,5 +104,5 @@ The MCP process starts from the installed plugin directory. For that reason ever
 - remote multi-host synchronization;
 - automatic Git merging or conflict resolution;
 - holding secrets in repository files.
-- guaranteeing response delivery after a subscription poll has committed its cursor;
+- exactly-once consumer side effects; replay-safe delivery is at-least-once until ACK;
 - automatic secure credential-vault integration or cross-device credential recovery.

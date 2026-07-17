@@ -397,7 +397,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 5);
+    assert_eq!(doctor.schema_version, 6);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -512,6 +512,20 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
         .unwrap();
     assert!(columns.contains(&"recovery_hash".to_owned()));
     assert!(columns.contains(&"token_generation".to_owned()));
+    let subscription_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(subscriptions)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(subscription_columns.contains(&"pending_delivery_id".to_owned()));
+    assert!(subscription_columns.contains(&"pending_from_sequence".to_owned()));
+    assert!(subscription_columns.contains(&"pending_through_sequence".to_owned()));
+    assert!(subscription_columns.contains(&"pending_created_at".to_owned()));
+    assert!(subscription_columns.contains(&"last_acked_delivery_id".to_owned()));
+    assert!(subscription_columns.contains(&"last_acked_through_sequence".to_owned()));
+    assert!(subscription_columns.contains(&"last_acked_at".to_owned()));
 }
 
 #[test]
@@ -734,6 +748,263 @@ fn event_subscriptions_filter_and_advance_a_durable_cursor() {
         .unwrap();
     assert_eq!(subscriptions.len(), 1);
     assert_eq!(subscriptions[0].name, "messages");
+}
+
+#[test]
+fn subscription_peek_replays_until_idempotent_ack_and_blocks_legacy_poll() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let sender = bus.register_agent("peek-sender", "coordination").unwrap();
+    let receiver = bus
+        .register_agent("peek-receiver", "implementation")
+        .unwrap();
+    bus.create_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "replay-safe",
+        &["message_sent".to_owned()],
+        Some(0),
+    )
+    .unwrap();
+
+    let first = bus
+        .send_message(
+            "peek-sender",
+            &sender.token,
+            &["peek-receiver".to_owned()],
+            "First",
+            "First replay-safe message",
+            None,
+            "normal",
+            false,
+        )
+        .unwrap();
+    bus.send_message(
+        "peek-sender",
+        &sender.token,
+        &["peek-receiver".to_owned()],
+        "Second",
+        "Second replay-safe message",
+        None,
+        "normal",
+        false,
+    )
+    .unwrap();
+
+    let peeked = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 1)
+        .unwrap();
+    let delivery = peeked.delivery.clone().expect("pending delivery");
+    assert_eq!(peeked.events.len(), 1);
+    assert_eq!(peeked.events[0].entity_id, first.message_id);
+    assert_eq!(
+        peeked
+            .subscription
+            .pending_delivery
+            .as_ref()
+            .unwrap()
+            .delivery_id,
+        delivery.delivery_id
+    );
+    assert_eq!(peeked.subscription.cursor_sequence, 0);
+
+    bus.send_message(
+        "peek-sender",
+        &sender.token,
+        &["peek-receiver".to_owned()],
+        "Third",
+        "Created while the first delivery is pending",
+        None,
+        "normal",
+        false,
+    )
+    .unwrap();
+    let replayed = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 500)
+        .unwrap();
+    assert_eq!(
+        replayed.delivery.as_ref().unwrap().delivery_id,
+        delivery.delivery_id
+    );
+    assert_eq!(replayed.events.len(), 1);
+    assert_eq!(replayed.events[0].entity_id, first.message_id);
+    assert!(
+        bus.poll_subscription("peek-receiver", &receiver.token, "replay-safe", 10)
+            .is_err(),
+        "legacy consume-on-poll must not cross a pending replay-safe delivery"
+    );
+    assert!(
+        bus.acknowledge_subscription("peek-receiver", &receiver.token, "replay-safe", "sdl_wrong",)
+            .is_err()
+    );
+
+    let acknowledged = bus
+        .acknowledge_subscription(
+            "peek-receiver",
+            &receiver.token,
+            "replay-safe",
+            &delivery.delivery_id,
+        )
+        .unwrap();
+    assert!(!acknowledged.replayed);
+    assert_eq!(acknowledged.cursor_sequence, delivery.through_sequence);
+    let acknowledged_retry = bus
+        .acknowledge_subscription(
+            "peek-receiver",
+            &receiver.token,
+            "replay-safe",
+            &delivery.delivery_id,
+        )
+        .unwrap();
+    assert!(acknowledged_retry.replayed);
+    assert_eq!(
+        acknowledged_retry.acknowledged_at,
+        acknowledged.acknowledged_at
+    );
+
+    let next = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 10)
+        .unwrap();
+    let next_delivery = next.delivery.clone().unwrap();
+    assert_eq!(next.events.len(), 2);
+    assert!(
+        next.events
+            .iter()
+            .all(|event| event.event_type == "message_sent")
+    );
+    bus.acknowledge_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "replay-safe",
+        &next_delivery.delivery_id,
+    )
+    .unwrap();
+    let caught_up = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 10)
+        .unwrap();
+    assert!(caught_up.delivery.is_none());
+    assert!(caught_up.events.is_empty());
+
+    bus.create_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "filtered-empty",
+        &["artifact_published".to_owned()],
+        Some(0),
+    )
+    .unwrap();
+    let empty = bus
+        .peek_subscription("peek-receiver", &receiver.token, "filtered-empty", 10)
+        .unwrap();
+    let empty_delivery = empty.delivery.clone().unwrap();
+    assert!(empty.events.is_empty());
+    assert!(empty_delivery.through_sequence > empty_delivery.from_sequence);
+    let empty_replay = bus
+        .peek_subscription("peek-receiver", &receiver.token, "filtered-empty", 10)
+        .unwrap();
+    assert_eq!(
+        empty_replay.delivery.unwrap().delivery_id,
+        empty_delivery.delivery_id
+    );
+    bus.acknowledge_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "filtered-empty",
+        &empty_delivery.delivery_id,
+    )
+    .unwrap();
+}
+
+#[test]
+fn concurrent_subscription_peek_and_ack_converge_on_one_delivery() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let sender = bus
+        .register_agent("concurrent-peek-sender", "coordination")
+        .unwrap();
+    let receiver = bus
+        .register_agent("concurrent-peek-receiver", "implementation")
+        .unwrap();
+    bus.create_subscription(
+        "concurrent-peek-receiver",
+        &receiver.token,
+        "concurrent",
+        &["message_sent".to_owned()],
+        Some(0),
+    )
+    .unwrap();
+    bus.send_message(
+        "concurrent-peek-sender",
+        &sender.token,
+        &["concurrent-peek-receiver".to_owned()],
+        "Concurrent delivery",
+        "Both peekers must receive one delivery identity",
+        None,
+        "normal",
+        false,
+    )
+    .unwrap();
+    drop(bus);
+
+    let root = harness.project.path().to_path_buf();
+    let data = harness.data.path().to_path_buf();
+    let barrier = Arc::new(Barrier::new(3));
+    let peek_handles = (0..2)
+        .map(|_| {
+            let root = root.clone();
+            let data = data.clone();
+            let token = receiver.token.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.peek_subscription("concurrent-peek-receiver", &token, "concurrent", 10)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let peeks = peek_handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    let delivery_id = peeks[0].delivery.as_ref().unwrap().delivery_id.clone();
+    assert_eq!(peeks[1].delivery.as_ref().unwrap().delivery_id, delivery_id);
+    assert_eq!(peeks[0].events.len(), 1);
+    assert_eq!(peeks[1].events.len(), 1);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let ack_handles = (0..2)
+        .map(|_| {
+            let root = root.clone();
+            let data = data.clone();
+            let token = receiver.token.clone();
+            let delivery_id = delivery_id.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.acknowledge_subscription(
+                    "concurrent-peek-receiver",
+                    &token,
+                    "concurrent",
+                    &delivery_id,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let acknowledgements = ack_handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        acknowledgements[0].cursor_sequence,
+        acknowledgements[1].cursor_sequence
+    );
+    assert_eq!(
+        acknowledgements.iter().filter(|ack| ack.replayed).count(),
+        1
+    );
 }
 
 #[test]

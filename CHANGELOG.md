@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-07-17
+
+- Added replay-safe subscription peek with one persistent pending delivery per subscription.
+- Added explicit, retry-safe subscription acknowledgement that advances the committed cursor.
+- Preserved legacy consume-on-poll behavior while preventing it from crossing a pending delivery.
+- Added schema-v6 migration fields for pending and most-recent acknowledged delivery state.
+- Expanded CLI, MCP, core migration, replay, empty-filter, conflict, concurrency, and idempotent-ACK tests.
+
 ## 0.2.0 - 2026-07-17
 
 - Added single-use agent recovery keys with bearer-token rotation and generation tracking.

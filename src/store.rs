@@ -16,11 +16,12 @@ use crate::error::{BusError, Result};
 use crate::models::{
     AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, DoctorReport, EventView,
     HandoffSnapshot, MessageReceipt, MessageView, ProjectMetadata, RecoveryKeyView, ReleaseResult,
-    ReservationView, SubscriptionPoll, SubscriptionView, TaskView,
+    ReservationView, SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll,
+    SubscriptionView, TaskView,
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const TASK_STATUSES: &[&str] = &[
     "pending",
     "ready",
@@ -48,6 +49,35 @@ struct TaskRecord {
     blocked_reason: Option<String>,
     created_at: i64,
     updated_at: i64,
+}
+
+struct SubscriptionRecord {
+    subscription_id: String,
+    name: String,
+    event_types: Vec<String>,
+    cursor_sequence: i64,
+    pending_delivery: Option<SubscriptionDeliveryView>,
+    last_acked_delivery_id: Option<String>,
+    last_acked_through_sequence: Option<i64>,
+    last_acked_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl SubscriptionRecord {
+    fn view(&self, agent: &str) -> SubscriptionView {
+        SubscriptionView {
+            subscription_id: self.subscription_id.clone(),
+            agent: agent.to_owned(),
+            name: self.name.clone(),
+            event_types: self.event_types.clone(),
+            cursor_sequence: self.cursor_sequence,
+            pending_delivery: self.pending_delivery.clone(),
+            last_acked_delivery_id: self.last_acked_delivery_id.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
 }
 
 pub struct Bus {
@@ -1361,6 +1391,8 @@ impl Bus {
             name: name.to_owned(),
             event_types: event_types.to_vec(),
             cursor_sequence,
+            pending_delivery: None,
+            last_acked_delivery_id: None,
             created_at: now,
             updated_at: now,
         })
@@ -1369,23 +1401,21 @@ impl Bus {
     pub fn list_subscriptions(&self, agent: &str, token: &str) -> Result<Vec<SubscriptionView>> {
         let actor = self.authenticate(agent, token)?;
         let mut statement = self.conn.prepare(
-            "SELECT id, name, event_types_json, cursor_sequence, created_at, updated_at
+            "SELECT id, name, event_types_json, cursor_sequence, created_at, updated_at,
+                    pending_delivery_id, pending_from_sequence, pending_through_sequence,
+                    pending_created_at, last_acked_delivery_id,
+                    last_acked_through_sequence, last_acked_at
              FROM subscriptions WHERE project_id = ?1 AND agent_id = ?2 ORDER BY name",
         )?;
-        let rows = statement.query_map(params![self.project.project_id, actor.id], |row| {
-            let event_types_json: String = row.get(2)?;
-            let event_types = parse_json_column(&event_types_json, 2)?;
-            Ok(SubscriptionView {
-                subscription_id: row.get(0)?,
-                agent: actor.name.clone(),
-                name: row.get(1)?,
-                event_types,
-                cursor_sequence: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let rows = statement.query_map(
+            params![self.project.project_id, actor.id],
+            map_subscription_record,
+        )?;
+        Ok(rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|record| record.view(&actor.name))
+            .collect())
     }
 
     pub fn poll_subscription(
@@ -1406,36 +1436,25 @@ impl Bus {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<(String, String, i64, i64, i64)> = tx
-            .query_row(
-                "SELECT id, event_types_json, cursor_sequence, created_at, updated_at
-                 FROM subscriptions WHERE project_id = ?1 AND agent_id = ?2 AND name = ?3",
-                params![self.project.project_id, actor.id, name],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let (subscription_id, event_types_json, cursor_sequence, created_at, _updated_at) = current
+        let mut record = load_subscription_record(&tx, &self.project.project_id, &actor.id, name)?
             .ok_or_else(|| {
                 BusError::Validation(format!(
                     "subscription '{name}' does not exist for agent '{}'",
                     actor.name
                 ))
             })?;
-        let event_types: Vec<String> = serde_json::from_str(&event_types_json)?;
+        if let Some(delivery) = &record.pending_delivery {
+            return Err(BusError::Conflict(format!(
+                "subscription '{name}' has pending delivery '{}'; acknowledge it or continue with peek",
+                delivery.delivery_id
+            )));
+        }
         let events = query_events(
             &tx,
             &self.project.project_id,
-            cursor_sequence,
+            record.cursor_sequence,
             limit,
-            &event_types,
+            &record.event_types,
         )?;
         let latest_sequence = latest_event_sequence(&tx, &self.project.project_id)?;
         let scanned_through_sequence = events
@@ -1444,13 +1463,14 @@ impl Bus {
             .unwrap_or(latest_sequence);
         let changed = tx.execute(
             "UPDATE subscriptions SET cursor_sequence = ?1, updated_at = ?2
-             WHERE project_id = ?3 AND id = ?4 AND cursor_sequence = ?5",
+             WHERE project_id = ?3 AND id = ?4 AND cursor_sequence = ?5
+               AND pending_delivery_id IS NULL",
             params![
                 scanned_through_sequence,
                 now,
                 self.project.project_id,
-                subscription_id,
-                cursor_sequence
+                record.subscription_id,
+                record.cursor_sequence
             ],
         )?;
         if changed != 1 {
@@ -1459,18 +1479,199 @@ impl Bus {
             )));
         }
         tx.commit()?;
+        record.cursor_sequence = scanned_through_sequence;
+        record.updated_at = now;
         Ok(SubscriptionPoll {
-            subscription: SubscriptionView {
-                subscription_id,
-                agent: actor.name,
-                name: name.to_owned(),
-                event_types,
-                cursor_sequence: scanned_through_sequence,
-                created_at,
-                updated_at: now,
-            },
+            subscription: record.view(&actor.name),
             events,
             scanned_through_sequence,
+        })
+    }
+
+    pub fn peek_subscription(
+        &mut self,
+        agent: &str,
+        token: &str,
+        name: &str,
+        limit: usize,
+    ) -> Result<SubscriptionPeek> {
+        validate_identifier("subscription name", name)?;
+        if !(1..=500).contains(&limit) {
+            return Err(BusError::Validation(
+                "subscription peek limit must be between 1 and 500".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut record = load_subscription_record(&tx, &self.project.project_id, &actor.id, name)?
+            .ok_or_else(|| {
+                BusError::Validation(format!(
+                    "subscription '{name}' does not exist for agent '{}'",
+                    actor.name
+                ))
+            })?;
+
+        let (delivery, events) = if let Some(delivery) = record.pending_delivery.clone() {
+            let events = query_events_through(
+                &tx,
+                &self.project.project_id,
+                delivery.from_sequence,
+                delivery.through_sequence,
+                500,
+                &record.event_types,
+            )?;
+            (Some(delivery), events)
+        } else {
+            let events = query_events(
+                &tx,
+                &self.project.project_id,
+                record.cursor_sequence,
+                limit,
+                &record.event_types,
+            )?;
+            let latest_sequence = latest_event_sequence(&tx, &self.project.project_id)?;
+            let through_sequence = events
+                .last()
+                .map(|event| event.sequence)
+                .unwrap_or(latest_sequence);
+            if through_sequence > record.cursor_sequence {
+                let delivery = SubscriptionDeliveryView {
+                    delivery_id: format!("sdl_{}", Uuid::new_v4().simple()),
+                    from_sequence: record.cursor_sequence,
+                    through_sequence,
+                    created_at: now,
+                };
+                let changed = tx.execute(
+                    "UPDATE subscriptions
+                     SET pending_delivery_id = ?1, pending_from_sequence = ?2,
+                         pending_through_sequence = ?3, pending_created_at = ?4,
+                         updated_at = ?4
+                     WHERE project_id = ?5 AND id = ?6 AND cursor_sequence = ?7
+                       AND pending_delivery_id IS NULL",
+                    params![
+                        delivery.delivery_id,
+                        delivery.from_sequence,
+                        delivery.through_sequence,
+                        now,
+                        self.project.project_id,
+                        record.subscription_id,
+                        record.cursor_sequence
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(BusError::Conflict(format!(
+                        "subscription '{name}' was peeked concurrently"
+                    )));
+                }
+                record.pending_delivery = Some(delivery.clone());
+                record.updated_at = now;
+                (Some(delivery), events)
+            } else {
+                (None, events)
+            }
+        };
+        let scanned_through_sequence = delivery
+            .as_ref()
+            .map(|pending| pending.through_sequence)
+            .unwrap_or(record.cursor_sequence);
+        tx.commit()?;
+        Ok(SubscriptionPeek {
+            subscription: record.view(&actor.name),
+            delivery,
+            events,
+            scanned_through_sequence,
+        })
+    }
+
+    pub fn acknowledge_subscription(
+        &mut self,
+        agent: &str,
+        token: &str,
+        name: &str,
+        delivery_id: &str,
+    ) -> Result<SubscriptionAck> {
+        validate_identifier("subscription name", name)?;
+        validate_identifier("delivery id", delivery_id)?;
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = load_subscription_record(&tx, &self.project.project_id, &actor.id, name)?
+            .ok_or_else(|| {
+                BusError::Validation(format!(
+                    "subscription '{name}' does not exist for agent '{}'",
+                    actor.name
+                ))
+            })?;
+
+        if record.last_acked_delivery_id.as_deref() == Some(delivery_id) {
+            let cursor_sequence = record.last_acked_through_sequence.ok_or_else(|| {
+                BusError::Validation("subscription last ACK cursor is incomplete".into())
+            })?;
+            let acknowledged_at = record.last_acked_at.ok_or_else(|| {
+                BusError::Validation("subscription last ACK timestamp is incomplete".into())
+            })?;
+            tx.commit()?;
+            return Ok(SubscriptionAck {
+                subscription_id: record.subscription_id,
+                agent: actor.name,
+                name: record.name,
+                delivery_id: delivery_id.to_owned(),
+                cursor_sequence,
+                acknowledged_at,
+                replayed: true,
+            });
+        }
+
+        let pending = record.pending_delivery.ok_or_else(|| {
+            BusError::Conflict(format!(
+                "subscription '{name}' has no pending delivery to acknowledge"
+            ))
+        })?;
+        if pending.delivery_id != delivery_id {
+            return Err(BusError::Conflict(format!(
+                "subscription '{name}' expects delivery '{}', not '{delivery_id}'",
+                pending.delivery_id
+            )));
+        }
+        let changed = tx.execute(
+            "UPDATE subscriptions
+             SET cursor_sequence = ?1,
+                 pending_delivery_id = NULL,
+                 pending_from_sequence = NULL,
+                 pending_through_sequence = NULL,
+                 pending_created_at = NULL,
+                 last_acked_delivery_id = ?2,
+                 last_acked_through_sequence = ?1,
+                 last_acked_at = ?3,
+                 updated_at = ?3
+             WHERE project_id = ?4 AND id = ?5 AND pending_delivery_id = ?2",
+            params![
+                pending.through_sequence,
+                delivery_id,
+                now,
+                self.project.project_id,
+                record.subscription_id
+            ],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(format!(
+                "subscription '{name}' delivery was acknowledged concurrently"
+            )));
+        }
+        tx.commit()?;
+        Ok(SubscriptionAck {
+            subscription_id: record.subscription_id,
+            agent: actor.name,
+            name: record.name,
+            delivery_id: delivery_id.to_owned(),
+            cursor_sequence: pending.through_sequence,
+            acknowledged_at: now,
+            replayed: false,
         })
     }
 
@@ -1873,6 +2074,13 @@ impl Bus {
                 name TEXT NOT NULL,
                 event_types_json TEXT NOT NULL,
                 cursor_sequence INTEGER NOT NULL,
+                pending_delivery_id TEXT,
+                pending_from_sequence INTEGER,
+                pending_through_sequence INTEGER,
+                pending_created_at INTEGER,
+                last_acked_delivery_id TEXT,
+                last_acked_through_sequence INTEGER,
+                last_acked_at INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(project_id, agent_id, name),
@@ -1915,6 +2123,33 @@ impl Bus {
             "token_generation",
             "INTEGER NOT NULL DEFAULT 1",
         )?;
+        ensure_column(&self.conn, "subscriptions", "pending_delivery_id", "TEXT")?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "pending_from_sequence",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "pending_through_sequence",
+            "INTEGER",
+        )?;
+        ensure_column(&self.conn, "subscriptions", "pending_created_at", "INTEGER")?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "last_acked_delivery_id",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "last_acked_through_sequence",
+            "INTEGER",
+        )?;
+        ensure_column(&self.conn, "subscriptions", "last_acked_at", "INTEGER")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![SCHEMA_VERSION, now_ms()],
@@ -1948,6 +2183,72 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         read_at: row.get(9)?,
         ack_at: row.get(10)?,
     })
+}
+
+fn map_subscription_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubscriptionRecord> {
+    let event_types_json: String = row.get(2)?;
+    let pending_delivery_id: Option<String> = row.get(6)?;
+    let pending_from_sequence: Option<i64> = row.get(7)?;
+    let pending_through_sequence: Option<i64> = row.get(8)?;
+    let pending_created_at: Option<i64> = row.get(9)?;
+    let pending_delivery = match (
+        pending_delivery_id,
+        pending_from_sequence,
+        pending_through_sequence,
+        pending_created_at,
+    ) {
+        (Some(delivery_id), Some(from_sequence), Some(through_sequence), Some(created_at)) => {
+            Some(SubscriptionDeliveryView {
+                delivery_id,
+                from_sequence,
+                through_sequence,
+                created_at,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "subscription pending delivery columns are inconsistent",
+                )),
+            ));
+        }
+    };
+    Ok(SubscriptionRecord {
+        subscription_id: row.get(0)?,
+        name: row.get(1)?,
+        event_types: parse_json_column(&event_types_json, 2)?,
+        cursor_sequence: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        pending_delivery,
+        last_acked_delivery_id: row.get(10)?,
+        last_acked_through_sequence: row.get(11)?,
+        last_acked_at: row.get(12)?,
+    })
+}
+
+fn load_subscription_record(
+    connection: &Connection,
+    project_id: &str,
+    agent_id: &str,
+    name: &str,
+) -> Result<Option<SubscriptionRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT id, name, event_types_json, cursor_sequence, created_at, updated_at,
+                    pending_delivery_id, pending_from_sequence, pending_through_sequence,
+                    pending_created_at, last_acked_delivery_id,
+                    last_acked_through_sequence, last_acked_at
+             FROM subscriptions
+             WHERE project_id = ?1 AND agent_id = ?2 AND name = ?3",
+            params![project_id, agent_id, name],
+            map_subscription_record,
+        )
+        .optional()?)
 }
 
 fn append_event(
@@ -2024,6 +2325,47 @@ fn query_events(
     limit: usize,
     event_types: &[String],
 ) -> Result<Vec<EventView>> {
+    query_events_window(
+        connection,
+        project_id,
+        after_sequence,
+        None,
+        limit,
+        event_types,
+    )
+}
+
+fn query_events_through(
+    connection: &Connection,
+    project_id: &str,
+    after_sequence: i64,
+    through_sequence: i64,
+    limit: usize,
+    event_types: &[String],
+) -> Result<Vec<EventView>> {
+    if through_sequence < after_sequence {
+        return Err(BusError::Validation(
+            "event delivery range cannot move backwards".into(),
+        ));
+    }
+    query_events_window(
+        connection,
+        project_id,
+        after_sequence,
+        Some(through_sequence),
+        limit,
+        event_types,
+    )
+}
+
+fn query_events_window(
+    connection: &Connection,
+    project_id: &str,
+    after_sequence: i64,
+    through_sequence: Option<i64>,
+    limit: usize,
+    event_types: &[String],
+) -> Result<Vec<EventView>> {
     validate_event_query(after_sequence, limit, event_types)?;
     let mut sql = String::from(
         "SELECT e.sequence, e.id, actor.name, e.event_type, e.entity_type,
@@ -2032,6 +2374,9 @@ fn query_events(
          LEFT JOIN agents actor ON actor.id = e.actor_agent_id
          WHERE e.project_id = ? AND e.sequence > ?",
     );
+    if through_sequence.is_some() {
+        sql.push_str(" AND e.sequence <= ?");
+    }
     if !event_types.is_empty() {
         sql.push_str(" AND e.event_type IN (");
         sql.push_str(&vec!["?"; event_types.len()].join(", "));
@@ -2039,9 +2384,12 @@ fn query_events(
     }
     sql.push_str(" ORDER BY e.sequence LIMIT ?");
 
-    let mut values = Vec::with_capacity(event_types.len() + 3);
+    let mut values = Vec::with_capacity(event_types.len() + 4);
     values.push(rusqlite::types::Value::Text(project_id.to_owned()));
     values.push(rusqlite::types::Value::Integer(after_sequence));
+    if let Some(through_sequence) = through_sequence {
+        values.push(rusqlite::types::Value::Integer(through_sequence));
+    }
     values.extend(
         event_types
             .iter()
