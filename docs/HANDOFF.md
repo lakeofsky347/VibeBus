@@ -2,10 +2,12 @@
 
 ## Current baseline
 
-VibeBus 0.8 is a working native Windows MVP. Rust core, CLI, stdio MCP, Codex Skill, SessionStart Hook, repo marketplace, tests, health check, backup, repeatable Windows CI, per-user MSI/portable packaging, checksums, and fail-closed production signing/publishing automation are present. Windows current-user credential storage and token fallback, Agent recovery, reservation renewal, retry idempotency, ordered events, replay-safe named subscriptions, structured handoffs, message closing, durable task/thread bindings, operator-approved bounded retention, and resume snapshots are implemented.
+VibeBus 0.8 is a working native Windows MVP. Rust core, CLI, stdio MCP, Codex Skill, SessionStart Hook, repo marketplace, tests, health check, backup, repeatable Windows CI, per-user MSI/portable packaging, checksums, and fail-closed production signing/publishing automation are present. Windows current-user credential storage and token fallback, Agent recovery, reservation renewal, retry idempotency, ordered events, replay-safe named subscriptions, structured handoffs, message closing, durable task/thread bindings, operator-approved bounded retention, and resume snapshots are implemented. The complete real-terminal operator lifecycle has also passed on a disposable project, including exact-plan consumption/replay, generation invalidation, and explicit vault cleanup.
 
 Local recovery copies are kept under the ignored `backups/` directory:
 
+- `vibebus-source-0.8-operator-cleanup.zip` is the committed 0.8 source after adding explicit operator-vault cleanup and its disposable acceptance runbook; SHA-256 `1c75669d8ae107ebcc71c7c0faebda0677bb96db48a258262008d288b6240dbc`.
+- `vibebus-0.8-operator-cleanup.db` is the accepted live schema-v9 coordination snapshot before disposable real-terminal acceptance; SHA-256 `db029e78e31eafe16dbc7bfad83345a9c0c9ba7d9ed74200b5ef8abd59cd0372`.
 - `vibebus-source-0.7-final.zip` is the final committed 0.7 source, CI/release workflows, installer authoring, documentation, marketplace, project marker, and packaged plugin produced with `git archive`; ignored toolchains, release outputs, runtime data, and credentials are excluded.
 - `vibebus-0.7-final.db` is the accepted schema-v8 coordination snapshot after release-package and local plugin acceptance; SHA-256 `d16d1eb828beb40d947cbe851fdb92325577107ef7035f0d7fb6955e9b5715b5`.
 - `vibebus-0.8-pre-migration.db` is the schema-v8 recovery point made by the 0.7 binary immediately before the live schema-v9 migration; SHA-256 `78d9479ec2b394cc247e6078aac89beea7fe615942aa367e6b1d848ea4a58ee5`.
@@ -16,6 +18,8 @@ Local recovery copies are kept under the ignored `backups/` directory:
 - `vibebus-0.5-pre-retention.db` is the pre-cleanup recovery point; SHA-256 `f3035b043f44a8e11893f2f44e963ce875e0450d1ce1484296ddaaae5b1020ed`.
 - `vibebus-0.5-final.db` is the accepted schema-v8 post-cleanup project snapshot; SHA-256 `4e100e59647f54428716744336fddb5728e5b165b264551fa34ed8c1a631a4c3`.
 - The 0.1 through 0.4 source/database backups remain available for rollback/reference.
+
+The disposable operator acceptance recovery points are retained under ignored `.tools/operator-acceptance/`: `pre-operator.db`, `pre-retention.db`, `pre-rotation.db`, and `pre-cleanup.db`. Their hashes and accepted lifecycle evidence are recorded in `docs/operator-acceptance.md`; the disposable live `project` and `data` directories and both Windows vault entries were removed after verification.
 
 Run these first:
 
@@ -50,7 +54,7 @@ The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`,
 ## Recommended next slice
 
 1. Perform the two-real-task desktop acceptance recorded in `docs/acceptance.md`; plugin installation is complete, but creating user-owned top-level tasks requires explicit user action/authorization.
-2. Follow `docs/operator-acceptance.md` in the prepared disposable project and complete the real-terminal initialization/approval/rotation/deletion acceptance, then decide whether to initialize the operator capability for the live project.
+2. Decide separately whether the live project should ever initialize its operator capability; it intentionally remains unconfigured after the disposable acceptance and must not inherit test authority.
 3. Configure the protected `release` environment and a real Windows code-signing certificate, then execute the tag, signed asset, disposable-profile install/uninstall, and downloaded-checksum acceptance in `docs/release.md`.
 4. Only then evaluate an optional Codex thread notification bridge; keep SQLite authoritative and treat UI delivery as best effort.
 

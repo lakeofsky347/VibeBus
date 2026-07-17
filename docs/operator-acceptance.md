@@ -109,3 +109,22 @@ Require `deleted=true`, `configured=true`, `stored=false`, and `ready=false`. Th
 ## Evidence to retain
 
 Record only non-secret evidence: project ID, schema version, backup hashes, plan IDs, candidate/protection counts, operator generations, approval ID, apply/replay timestamps, expected rotation failure kind, deletion status, and final `doctor` result. Never retain the operator secret, Agent token, recovery key, credential BLOB, or terminal transcript containing secret material.
+
+## Accepted execution evidence (2026-07-17)
+
+The runbook was completed against disposable project `prj_dafdc8aab7584786850b6d73097111d1`; the live coordination project's operator remained unconfigured. The disposable database stayed on schema 9 with `doctor.ok=true`, integrity `ok`, WAL, and foreign keys enabled through the final pre-cleanup check.
+
+Recovery points were created at every authority-changing boundary:
+
+| Recovery point | SHA-256 |
+| --- | --- |
+| Before operator initialization | `489bacca651372f501fc9894695875ace463c40e339612d81dc760604827dfb2` |
+| After initialization, before first approval | `acfc08a0785683483a89d8a919113de2cd8f120799cf22caf4accd4ca490cd26` |
+| After apply/replay, before rotation | `19871a156630956651bdd8e3d6b18c73ee68e9377abed9f23ae2724e157a87d5` |
+| After rotation invalidation, before credential cleanup | `de6bbe4349be5067db6df43917add61e5290679ee18fe18bca25a90aa1402faf` |
+
+The generation-1 positive path used plan `rtp_cb6234128dfa5a16fb83c387144672bb8d87fecf255bb7f09b0ef95090d28452`. All five candidate counts were zero, pending deliveries and subscriptions were zero, and both safe/latest event sequence values were 1. Interactive approval `rap_9611d72e24c64ab6a09168554fc1c3af` was consumed once. The first Agent apply returned `replayed=false`; its retry returned `replayed=true`; both reported `appliedAt=1784296232174` and the same approval ID.
+
+The rotation-invalidation path used fresh plan `rtp_fd2b64c50ff188777e2d8255c2918f827a39bc867df3300845c8208c76533bdd` and generation-1 approval `rap_04b44c72c6184a0a90e15eac40e07184`. Its five candidate counts were zero, pending deliveries and subscriptions were zero, and both safe/latest event sequence values were 2. After an interactive rotation advanced the database and vault to generation 2 with `ready=true`, applying that unchanged generation-1-approved plan failed with `operator_approval_required`. The successful retention-run count remained one and the invalidated approval remained unconsumed.
+
+Explicit Agent credential deletion returned `deleted=true` and `stored=false`. Interactive operator credential deletion then returned `deleted=true`, retained database state `configured=true` at generation 2, and reported `stored=false` plus `ready=false`. After exact path and parent validation, only the disposable `project` and `data` directories were recursively removed; the four non-secret recovery databases remain as ignored local evidence artifacts.

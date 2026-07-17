@@ -93,8 +93,17 @@ Before the 0.8 live migration, the 0.7 binary created `vibebus-0.8-pre-migration
 
 `operator status` on the live project reports DB configuration `false`, vault storage `false`, and `ready=false` with the isolated target `VibeBusOperator:prj_51ac137e4aa342a7a80bda77d94cfbc5`. No operator credential was initialized on the user's behalf. This proves the safe migration/default-deny state; interactive initialization, rotation, restoration, and a real operator-approved live cleanup remain explicit maintainer actions.
 
+## Real-terminal operator acceptance
+
+The complete operator lifecycle was accepted on disposable schema-9 project `prj_dafdc8aab7584786850b6d73097111d1` without changing the live project's operator state. Interactive initialization stored a redacted generation-1 operator credential and produced matching database/vault generations with `ready=true`.
+
+The reviewed zero-candidate plan `rtp_cb6234128dfa5a16fb83c387144672bb8d87fecf255bb7f09b0ef95090d28452` was approved as `rap_9611d72e24c64ab6a09168554fc1c3af`. The first Agent apply returned `replayed=false`; retrying the same plan returned `replayed=true`; both shared `appliedAt=1784296232174`, and the approval was consumed exactly once. `retention status` recorded that plan and timestamp while `doctor.ok=true` remained intact.
+
+A fresh zero-candidate plan `rtp_fd2b64c50ff188777e2d8255c2918f827a39bc867df3300845c8208c76533bdd` was approved at generation 1 but deliberately not applied. Interactive rotation advanced the operator and vault to generation 2 with `ready=true`. The unchanged plan then failed Agent apply with `operator_approval_required`; the successful retention-run count remained one, proving old-generation approval invalidation.
+
+Explicit Agent credential deletion returned `deleted=true` and `stored=false`. Interactive `operator delete-credential` returned `deleted=true`, retained database configuration at generation 2, removed the vault entry, and produced the required final `configured=true`, `stored=false`, `ready=false` state. Four consistent recovery points cover pre-operator, pre-retention, pre-rotation, and pre-cleanup states; their hashes and the full non-secret evidence inventory are recorded in `docs/operator-acceptance.md`. The verified disposable project/data directories were removed afterward while those ignored recovery artifacts were retained.
+
 ## Remaining manual acceptance
 
 1. Start two new independent Codex top-level tasks in the same initialized project and verify registration/recovery-key retention, a structured handoff plus ACK, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI.
-2. Follow `docs/operator-acceptance.md` in a disposable initialized project: use a real terminal for `operator init`, exact-plan approval, rotation, and `operator delete-credential`; use a separate Agent/MCP call for apply; verify single consumption, replay, generation invalidation, and final `ready=false` cleanup.
-3. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.
+2. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.
