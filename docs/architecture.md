@@ -12,6 +12,7 @@ flowchart LR
     B["Codex task B"] -->|MCP or CLI| X
     C["Codex task C"] -->|MCP or CLI| X
     X --> D["Project SQLite database in WAL mode"]
+    X --> V["Windows Credential Manager<br/>current-user Generic Credentials"]
     R["Repository .vibebus/project.json"] --> X
 ```
 
@@ -37,6 +38,14 @@ The database is outside the repository by default:
 ```
 
 `VIBEBUS_DATA_HOME` or `--data-home` can override the base directory for testing and controlled deployments.
+
+Bearer and recovery secrets remain outside this database. When storage is explicitly requested, Windows Credential Manager receives one current-user Generic Credential per project/Agent target:
+
+```text
+VibeBus:<project-id>:<agent-name>
+```
+
+The serialized secret pair includes a format version and token generation and stays below the Windows 2,560-byte Generic Credential BLOB limit. `CRED_PERSIST_LOCAL_MACHINE` makes it available to later local logon sessions of the same Windows user, not to other users or machines.
 
 ## Data model
 
@@ -82,10 +91,17 @@ The database is outside the repository by default:
 20. A pending subscription delivery is protected because its committed cursor cannot advance until matching ACK.
 21. Retention apply requires an unchanged preview plan; the same confirmed plan can be retried without deleting twice.
 22. Closed messages cannot expire before message idempotency responses that may still reference them.
+23. A credential target is scoped by both project ID and validated Agent name, so identities with the same name in different projects do not collide.
+24. A successful stored-secret delivery omits bearer and recovery values; a failed post-rotation write returns the only usable pair with an explicit storage error instead of stranding the identity.
+25. Explicit token input wins over environment input, which wins over current-user vault fallback; recovery-key fallback comes only from the matching vault entry.
 
 ## Recovery and retry boundaries
 
-Bearer tokens and recovery keys are generated from independent random UUID material and stored only as SHA-256 digests. Recovery is a credential rotation, not an identity recreation: task ownership, messages, subscriptions, reservations, and artifacts remain attached to the same agent row. A legacy agent can provision its first recovery key using its still-valid bearer token.
+Bearer tokens and recovery keys are generated from independent random UUID material and stored in SQLite only as SHA-256 digests. Recovery is a credential rotation, not an identity recreation: task ownership, messages, subscriptions, reservations, and artifacts remain attached to the same agent row. A legacy agent can provision its first recovery key using its still-valid bearer token.
+
+The credential-vault layer is outside the domain transaction. Register, recover, and provision first commit the authoritative digest state, then write the returned pair to the OS vault. On success, the response is redacted. If that second write fails, suppressing the secrets would make the newly committed identity unrecoverable, so the response deliberately falls back to the plaintext pair plus `credentialStorageError` and `secretsRedacted=false`. When recovery or provisioning itself used a vault secret, the rotated pair is automatically written back so the single-use recovery key cannot become stale.
+
+The Windows backend calls `CredWriteW`, `CredReadW`, `CredDeleteW`, and `CredFree` directly. Tests inject an in-memory implementation and never touch a developer's real credentials. The vault is an at-rest and accidental-disclosure boundary, not a sandbox between processes already running as the same Windows user.
 
 Externally retried writes record a canonical JSON request hash and serialized response in the same `BEGIN IMMEDIATE` transaction as the domain mutation. This prevents the common ambiguous-result retry from creating duplicate messages, leases, renewals, or artifacts. Records are deliberately scoped by operation so unrelated APIs may reuse a caller's key. After an explicitly configured idempotency retention window expires, that historical retry guarantee also expires; the cleanup plan reports how many records are affected.
 
@@ -121,7 +137,7 @@ The plugin contains:
 
 The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call.
 
-## Deliberate non-goals for 0.5
+## Deliberate non-goals for 0.6
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;
@@ -130,4 +146,5 @@ The MCP process starts from the installed plugin directory. For that reason ever
 - automatic Git merging or conflict resolution;
 - holding secrets in repository files;
 - exactly-once consumer side effects; replay-safe delivery is at-least-once until ACK;
-- automatic secure credential-vault integration or cross-device credential recovery.
+- non-Windows secure-vault backends or cross-device credential recovery;
+- protection against a malicious process already running as the same Windows user.

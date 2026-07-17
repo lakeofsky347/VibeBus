@@ -1,6 +1,6 @@
 ---
 name: vibebus-coordination
-description: Coordinate independent Codex top-level tasks in the same project with VibeBus recoverable identities, directed message lifecycles, atomic task claims, durable task/thread bindings, renewable file reservations, replay-safe event subscriptions, confirmed bounded retention, and structured handoffs. Use when several Codex tasks or worktrees must exchange durable facts without sharing full chat context.
+description: Coordinate independent Codex top-level tasks in the same project with VibeBus recoverable identities, Windows current-user credential storage, directed message lifecycles, atomic task claims, durable task/thread bindings, renewable file reservations, replay-safe event subscriptions, confirmed bounded retention, and structured handoffs. Use when several Codex tasks or worktrees must exchange durable facts without sharing full chat context.
 ---
 
 # VibeBus coordination
@@ -12,9 +12,9 @@ Use the bundled `vibebus` MCP server as the single coordination interface. VibeB
 1. Resolve the absolute project root. Use the nearest ancestor containing `.vibebus/project.json`.
 2. Pass that absolute path as `root` on every MCP call. The bundled MCP process runs from the installed plugin directory, not from the user's repository.
 3. Call `vibebus_status` to confirm the project and inspect active agents, tasks, and reservations.
-4. If this top-level Codex task has no VibeBus identity yet, call `vibebus_register` once with a short unique name and a role. Retain both returned `token` and `recoveryKey` only in private task/credential context. Never commit them, include them in a message, or print them into project files.
-5. On a resumed task with a valid token, call `vibebus_handoff_snapshot`. It combines unread messages, owned work, active task/thread bindings, active reservations, recent artifacts, and recent events. Use direct list/show calls when the bounded snapshot is insufficient.
-6. If the bearer token is lost but the private recovery key remains, call `vibebus_agent_recover` once and replace both stored secrets with the returned pair. Never register a duplicate identity to bypass authentication. A legacy identity with a working token can call `vibebus_recovery_provision`.
+4. If this top-level Codex task has no VibeBus identity yet, call `vibebus_register` once with a short unique name, role, and `storeCredentials=true`. On Windows success, `secretsRedacted=true` means both secrets are in the matching current-user credential entry and must not be requested or copied into task context. If storage fails, the response deliberately contains the only usable `token` and `recoveryKey` plus `credentialStorageError`; retain them only in private credential context and report the storage failure. Never commit them, include them in a message, or print them into project files.
+5. On a resumed task, call `vibebus_credential_status` and then `vibebus_handoff_snapshot`; authenticated MCP calls may omit `token` when the matching project/Agent vault entry exists. The snapshot combines unread messages, owned work, active task/thread bindings, active reservations, recent artifacts, and recent events. Use direct list/show calls when the bounded snapshot is insufficient.
+6. If the bearer token is rejected but the stored single-use recovery key remains, call `vibebus_agent_recover` once without a `recoveryKey`; VibeBus rotates both secrets and replaces the vault entry. If credentials were not stored, pass the private recovery key and `storeCredentials=true`. Never register a duplicate identity to bypass authentication. A legacy identity with a working token can call `vibebus_recovery_provision` with `storeCredentials=true`.
 7. Call `vibebus_inbox` at startup, after compaction or resume, before important decisions, and before the final response.
 
 ## Work protocol
@@ -36,7 +36,7 @@ Use the bundled `vibebus` MCP server as the single coordination interface. VibeB
 
 ## Conflict handling
 
-- Authentication failure: verify the task identity and token; never register a duplicate identity merely to bypass the error.
+- Authentication failure: call `vibebus_credential_status`, verify the project root and Agent name, then use the private recovery key if no matching entry exists. Never register a duplicate identity merely to bypass the error.
 - Claim conflict: stop work on that task and choose another ready task.
 - Reservation conflict: inspect `vibebus_reservations`, narrow the requested path, or coordinate with the owner by message.
 - Reservation expired: acquire a new reservation; renewal cannot revive a released or expired lease.
@@ -49,4 +49,4 @@ Use the bundled `vibebus` MCP server as the single coordination interface. VibeB
 
 ## End of turn
 
-Before handing off or stopping, check the inbox once, ACK and close fully processed directed messages, ACK only fully processed subscription deliveries, publish verified artifacts, send a structured handoff or blocker, release reservations no longer needed, and ensure owned task state reflects reality. Completing or abandoning a task automatically closes its active thread binding; when transferring unfinished work to a different native task, explicitly unbind after the handoff is durable. Never claim that VibeBus can awaken or inject text into an already-running Codex generation. Peek/ACK provides at-least-once access to a batch, not exactly-once side effects; handlers must remain idempotent.
+Before handing off or stopping, check the inbox once, ACK and close fully processed directed messages, ACK only fully processed subscription deliveries, publish verified artifacts, send a structured handoff or blocker, release reservations no longer needed, and ensure owned task state reflects reality. Do not delete a vault entry as routine cleanup; `vibebus_credential_delete` is an explicit identity-local secret removal action. Completing or abandoning a task automatically closes its active thread binding; when transferring unfinished work to a different native task, explicitly unbind after the handoff is durable. Never claim that VibeBus can awaken or inject text into an already-running Codex generation. Peek/ACK provides at-least-once access to a batch, not exactly-once side effects; handlers must remain idempotent.

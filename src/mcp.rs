@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
@@ -8,7 +8,11 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Bus, BusError, RetentionPolicy};
+use crate::{
+    Bus, BusError, CredentialVault, ResolvedSecret, RetentionPolicy, SecretSource,
+    recovery_delivery, recovery_key_delivery, registration_delivery, resolve_agent_recovery_key,
+    resolve_agent_token, system_credential_vault,
+};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +28,10 @@ pub struct RegisterRequest {
     pub root: Option<String>,
     pub name: String,
     pub role: String,
+    #[schemars(
+        description = "Store both secrets in the current-user credential vault and redact them from the response"
+    )]
+    pub store_credentials: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -32,7 +40,50 @@ pub struct AgentRecoverRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub name: String,
-    pub recovery_key: String,
+    #[schemars(
+        description = "One-time recovery key; optional when current credentials are stored in the vault"
+    )]
+    pub recovery_key: Option<String>,
+    #[schemars(
+        description = "Store the rotated secret pair in the current-user credential vault and redact it from the response"
+    )]
+    pub store_credentials: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryProvisionRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    #[schemars(
+        description = "Bearer token; optional when stored in the current-user credential vault"
+    )]
+    pub token: Option<String>,
+    #[schemars(
+        description = "Store the updated secret pair in the current-user credential vault and redact it from the response"
+    )]
+    pub store_credentials: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialDeleteRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    #[schemars(
+        description = "Must be true to acknowledge removal of the local OS credential entry"
+    )]
+    pub confirm: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -41,7 +92,7 @@ pub struct AgentAuthRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -50,7 +101,7 @@ pub struct SendRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub from: String,
-    pub token: String,
+    pub token: Option<String>,
     pub to: Vec<String>,
     pub subject: String,
     pub body: String,
@@ -67,7 +118,7 @@ pub struct InboxRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub unread_only: Option<bool>,
     pub include_closed: Option<bool>,
 }
@@ -78,7 +129,7 @@ pub struct ReceiptRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub message_id: String,
 }
 
@@ -88,7 +139,7 @@ pub struct TaskCreateRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub task_id: String,
     pub title: String,
     pub description: Option<String>,
@@ -101,7 +152,7 @@ pub struct TaskClaimRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub task_id: String,
 }
 
@@ -111,7 +162,7 @@ pub struct TaskCompleteRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub task_id: String,
     pub expected_version: i64,
 }
@@ -122,7 +173,7 @@ pub struct TaskUpdateRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub task_id: String,
     pub expected_version: i64,
     pub status: String,
@@ -143,7 +194,7 @@ pub struct ThreadBindingRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub task_id: String,
     pub thread_id: String,
 }
@@ -163,7 +214,7 @@ pub struct ReservationAddRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     #[schemars(description = "Project-relative file or directory path")]
     pub path: String,
     pub ttl_seconds: Option<i64>,
@@ -178,7 +229,7 @@ pub struct ReservationReleaseRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub reservation_id: String,
 }
 
@@ -188,7 +239,7 @@ pub struct ReservationRenewRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub reservation_id: String,
     pub ttl_seconds: Option<i64>,
     pub idempotency_key: Option<String>,
@@ -200,7 +251,7 @@ pub struct ArtifactPublishRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub kind: String,
     #[schemars(description = "Project-relative path to an existing file")]
     pub path: String,
@@ -234,7 +285,7 @@ pub struct RetentionPlanRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub event_max_age_days: Option<i64>,
     pub keep_recent_events: Option<i64>,
     pub idempotency_max_age_days: Option<i64>,
@@ -248,7 +299,7 @@ pub struct RetentionApplyRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub plan_id: String,
     pub event_max_age_days: Option<i64>,
     pub keep_recent_events: Option<i64>,
@@ -263,7 +314,7 @@ pub struct SubscriptionCreateRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub name: String,
     pub event_types: Option<Vec<String>>,
     pub from_sequence: Option<i64>,
@@ -275,7 +326,7 @@ pub struct SubscriptionPollRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub name: String,
     pub limit: Option<usize>,
 }
@@ -286,7 +337,7 @@ pub struct SubscriptionAckRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub name: String,
     pub delivery_id: String,
 }
@@ -297,7 +348,7 @@ pub struct HandoffSendRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub from: String,
-    pub token: String,
+    pub token: Option<String>,
     pub to: Vec<String>,
     pub summary: String,
     pub task_id: Option<String>,
@@ -314,7 +365,7 @@ pub struct HandoffSnapshotRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub agent: String,
-    pub token: String,
+    pub token: Option<String>,
     pub after_sequence: Option<i64>,
 }
 
@@ -327,10 +378,11 @@ pub struct BackupRequest {
     pub output: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VibeBusMcp {
     default_root: PathBuf,
     data_home: Option<PathBuf>,
+    vault: Arc<dyn CredentialVault>,
 }
 
 impl VibeBusMcp {
@@ -338,6 +390,19 @@ impl VibeBusMcp {
         Self {
             default_root,
             data_home,
+            vault: system_credential_vault(),
+        }
+    }
+
+    pub fn with_vault(
+        default_root: PathBuf,
+        data_home: Option<PathBuf>,
+        vault: Arc<dyn CredentialVault>,
+    ) -> Self {
+        Self {
+            default_root,
+            data_home,
+            vault,
         }
     }
 
@@ -346,6 +411,22 @@ impl VibeBusMcp {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_root.clone());
         Bus::open(&root, self.data_home.as_deref()).map_err(bus_error)
+    }
+
+    fn token(
+        &self,
+        bus: &Bus,
+        agent: &str,
+        provided: Option<&str>,
+    ) -> Result<ResolvedSecret, ErrorData> {
+        resolve_agent_token(
+            self.vault.as_ref(),
+            &bus.project().project_id,
+            agent,
+            provided,
+            None,
+        )
+        .map_err(bus_error)
     }
 }
 
@@ -372,16 +453,23 @@ impl VibeBusMcp {
         }))
     }
 
-    #[tool(description = "Register a VibeBus agent and return its one-time bearer token")]
+    #[tool(
+        description = "Register a VibeBus agent; optionally store its one-time secrets in the current-user credential vault"
+    )]
     fn vibebus_register(
         &self,
         Parameters(request): Parameters<RegisterRequest>,
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
-        json_text(
-            &bus.register_agent(&request.name, &request.role)
-                .map_err(bus_error)?,
-        )
+        let registration = bus
+            .register_agent(&request.name, &request.role)
+            .map_err(bus_error)?;
+        json_text(&registration_delivery(
+            self.vault.as_ref(),
+            &bus.project().project_id,
+            &registration,
+            request.store_credentials.unwrap_or(false),
+        ))
     }
 
     #[tool(
@@ -392,10 +480,24 @@ impl VibeBusMcp {
         Parameters(request): Parameters<AgentRecoverRequest>,
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
-        json_text(
-            &bus.recover_agent(&request.name, &request.recovery_key)
-                .map_err(bus_error)?,
+        let resolved = resolve_agent_recovery_key(
+            self.vault.as_ref(),
+            &bus.project().project_id,
+            &request.name,
+            request.recovery_key.as_deref(),
         )
+        .map_err(bus_error)?;
+        let store_credentials =
+            request.store_credentials.unwrap_or(false) || resolved.source == SecretSource::Vault;
+        let recovery = bus
+            .recover_agent(&request.name, &resolved.value)
+            .map_err(bus_error)?;
+        json_text(&recovery_delivery(
+            self.vault.as_ref(),
+            &bus.project().project_id,
+            &recovery,
+            store_credentials,
+        ))
     }
 
     #[tool(
@@ -403,13 +505,59 @@ impl VibeBusMcp {
     )]
     fn vibebus_recovery_provision(
         &self,
-        Parameters(request): Parameters<AgentAuthRequest>,
+        Parameters(request): Parameters<RecoveryProvisionRequest>,
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
+        let resolved = self.token(&bus, &request.agent, request.token.as_deref())?;
+        let store_credentials =
+            request.store_credentials.unwrap_or(false) || resolved.source == SecretSource::Vault;
+        let recovery = bus
+            .provision_recovery_key(&request.agent, &resolved.value)
+            .map_err(bus_error)?;
+        json_text(&recovery_key_delivery(
+            self.vault.as_ref(),
+            &bus.project().project_id,
+            &resolved.value,
+            &recovery,
+            store_credentials,
+        ))
+    }
+
+    #[tool(
+        description = "Inspect whether an agent credential pair is stored in the current-user credential vault"
+    )]
+    fn vibebus_credential_status(
+        &self,
+        Parameters(request): Parameters<CredentialRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.provision_recovery_key(&request.agent, &request.token)
+            &self
+                .vault
+                .status(&bus.project().project_id, &request.agent)
                 .map_err(bus_error)?,
         )
+    }
+
+    #[tool(description = "Delete an agent credential pair from the current-user credential vault")]
+    fn vibebus_credential_delete(
+        &self,
+        Parameters(request): Parameters<CredentialDeleteRequest>,
+    ) -> Result<String, ErrorData> {
+        if !request.confirm {
+            return Err(bus_error(BusError::Validation(
+                "credential deletion requires confirm=true".into(),
+            )));
+        }
+        let bus = self.open(request.root.as_deref())?;
+        let deleted = self
+            .vault
+            .delete(&bus.project().project_id, &request.agent)
+            .map_err(bus_error)?;
+        json_text(&serde_json::json!({
+            "deleted": deleted,
+            "credentials": self.vault.status(&bus.project().project_id, &request.agent).map_err(bus_error)?
+        }))
     }
 
     #[tool(description = "List agents registered in a VibeBus project")]
@@ -430,7 +578,9 @@ impl VibeBusMcp {
         json_text(
             &bus.send_message_idempotent(
                 &request.from,
-                &request.token,
+                &self
+                    .token(&bus, &request.from, request.token.as_deref())?
+                    .value,
                 &request.to,
                 &request.subject,
                 &request.body,
@@ -454,7 +604,9 @@ impl VibeBusMcp {
         json_text(
             &bus.inbox_with_options(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 request.unread_only.unwrap_or(true),
                 request.include_closed.unwrap_or(false),
             )
@@ -469,8 +621,14 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.mark_read(&request.agent, &request.token, &request.message_id)
-                .map_err(bus_error)?,
+            &bus.mark_read(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.message_id,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -481,8 +639,14 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.acknowledge_message(&request.agent, &request.token, &request.message_id)
-                .map_err(bus_error)?,
+            &bus.acknowledge_message(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.message_id,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -495,8 +659,14 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.close_message(&request.agent, &request.token, &request.message_id)
-                .map_err(bus_error)?,
+            &bus.close_message(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.message_id,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -509,7 +679,9 @@ impl VibeBusMcp {
         json_text(
             &bus.create_task(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.task_id,
                 &request.title,
                 request.description.as_deref(),
@@ -528,8 +700,14 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.claim_task(&request.agent, &request.token, &request.task_id)
-                .map_err(bus_error)?,
+            &bus.claim_task(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.task_id,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -542,7 +720,9 @@ impl VibeBusMcp {
         json_text(
             &bus.update_task(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.task_id,
                 request.expected_version,
                 &request.status,
@@ -561,7 +741,9 @@ impl VibeBusMcp {
         json_text(
             &bus.update_task(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.task_id,
                 request.expected_version,
                 "completed",
@@ -598,7 +780,9 @@ impl VibeBusMcp {
         json_text(
             &bus.bind_task_thread(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.task_id,
                 &request.thread_id,
             )
@@ -615,7 +799,9 @@ impl VibeBusMcp {
         json_text(
             &bus.unbind_task_thread(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.task_id,
                 &request.thread_id,
             )
@@ -647,7 +833,9 @@ impl VibeBusMcp {
         json_text(
             &bus.reserve_path_idempotent(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.path,
                 request.ttl_seconds.unwrap_or(3600),
                 request.exclusive.unwrap_or(true),
@@ -665,8 +853,14 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.release_reservation(&request.agent, &request.token, &request.reservation_id)
-                .map_err(bus_error)?,
+            &bus.release_reservation(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.reservation_id,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -679,7 +873,9 @@ impl VibeBusMcp {
         json_text(
             &bus.renew_reservation_idempotent(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.reservation_id,
                 request.ttl_seconds.unwrap_or(3600),
                 request.idempotency_key.as_deref(),
@@ -706,7 +902,9 @@ impl VibeBusMcp {
         json_text(
             &bus.publish_artifact_idempotent(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.kind,
                 &request.path,
                 &request.summary,
@@ -762,8 +960,14 @@ impl VibeBusMcp {
             request.terminal_binding_max_age_days,
         );
         json_text(
-            &bus.plan_retention(&request.agent, &request.token, &policy)
-                .map_err(bus_error)?,
+            &bus.plan_retention(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &policy,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -783,8 +987,15 @@ impl VibeBusMcp {
             request.terminal_binding_max_age_days,
         );
         json_text(
-            &bus.apply_retention(&request.agent, &request.token, &policy, &request.plan_id)
-                .map_err(bus_error)?,
+            &bus.apply_retention(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &policy,
+                &request.plan_id,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -806,7 +1017,9 @@ impl VibeBusMcp {
         json_text(
             &bus.create_subscription(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.name,
                 request.event_types.as_deref().unwrap_or(&[]),
                 request.from_sequence,
@@ -822,8 +1035,13 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.list_subscriptions(&request.agent, &request.token)
-                .map_err(bus_error)?,
+            &bus.list_subscriptions(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+            )
+            .map_err(bus_error)?,
         )
     }
 
@@ -838,7 +1056,9 @@ impl VibeBusMcp {
         json_text(
             &bus.poll_subscription(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.name,
                 request.limit.unwrap_or(100),
             )
@@ -857,7 +1077,9 @@ impl VibeBusMcp {
         json_text(
             &bus.peek_subscription(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.name,
                 request.limit.unwrap_or(100),
             )
@@ -876,7 +1098,9 @@ impl VibeBusMcp {
         json_text(
             &bus.acknowledge_subscription(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 &request.name,
                 &request.delivery_id,
             )
@@ -895,7 +1119,9 @@ impl VibeBusMcp {
         json_text(
             &bus.send_handoff(
                 &request.from,
-                &request.token,
+                &self
+                    .token(&bus, &request.from, request.token.as_deref())?
+                    .value,
                 &request.to,
                 &request.summary,
                 request.task_id.as_deref(),
@@ -920,7 +1146,9 @@ impl VibeBusMcp {
         json_text(
             &bus.handoff_snapshot(
                 &request.agent,
-                &request.token,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
                 request.after_sequence.unwrap_or(0),
             )
             .map_err(bus_error)?,
@@ -1004,8 +1232,9 @@ fn bus_error(error: BusError) -> ErrorData {
         | BusError::Unauthorized(_)
         | BusError::AgentNotFound(_)
         | BusError::ProjectNotFound(_) => ErrorData::invalid_params(message, None),
-        BusError::Io(_) | BusError::Database(_) | BusError::Json(_) => {
-            ErrorData::internal_error(message, None)
-        }
+        BusError::Io(_)
+        | BusError::Database(_)
+        | BusError::Json(_)
+        | BusError::CredentialVault(_) => ErrorData::internal_error(message, None),
     }
 }
