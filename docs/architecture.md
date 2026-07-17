@@ -51,7 +51,7 @@ Destructive maintenance uses a distinct project operator target:
 VibeBusOperator:<project-id>
 ```
 
-The operator is intentionally not an Agent role. Its CLI-only interactive capability approves a single exact retention plan for a short window; MCP can plan and apply but cannot initialize, rotate, restore, or approve the operator credential.
+The operator is intentionally not an Agent role. Its CLI-only interactive capability approves a single exact retention plan for a short window; MCP can plan and apply but cannot initialize, rotate, restore, delete, or approve the operator credential.
 
 The serialized secret pair includes a format version and token generation and stays below the Windows 2,560-byte Generic Credential BLOB limit. `CRED_PERSIST_LOCAL_MACHINE` makes it available to later local logon sessions of the same Windows user, not to other users or machines.
 
@@ -116,7 +116,7 @@ The credential-vault layer is outside the domain transaction. Register, recover,
 
 The Windows backend calls `CredWriteW`, `CredReadW`, `CredDeleteW`, and `CredFree` directly. Tests inject an in-memory implementation and never touch a developer's real credentials. The vault is an at-rest and accidental-disclosure boundary, not a sandbox between processes already running as the same Windows user.
 
-Operator initialization and rotation use the same digest-first/vault-second recovery rule as Agent credentials. Successful storage redacts the operator secret. If the vault write fails after the authoritative generation changes, the interactive response exposes the only usable secret once with an explicit error. `operator restore-credential` accepts that secret through a no-echo TTY prompt, verifies it against the database digest, and repairs the separate vault entry. An operator rotation invalidates every outstanding approval from the previous generation without deleting its audit record.
+Operator initialization and rotation use the same digest-first/vault-second recovery rule as Agent credentials. Successful storage redacts the operator secret. If the vault write fails after the authoritative generation changes, the interactive response exposes the only usable secret once with an explicit error. `operator restore-credential` accepts that secret through a no-echo TTY prompt, verifies it against the database digest, and repairs the separate vault entry. An operator rotation invalidates every outstanding approval from the previous generation without deleting its audit record. Explicit `operator delete-credential` removes only the current-user vault entry after a real-terminal `delete:<project-id>` confirmation. It deliberately preserves the database digest and generation, causing `ready=false`; this supports verifiable disposable-project cleanup without adding a remote or MCP deletion capability.
 
 Externally retried writes record a canonical JSON request hash and serialized response in the same `BEGIN IMMEDIATE` transaction as the domain mutation. This prevents the common ambiguous-result retry from creating duplicate messages, leases, renewals, or artifacts. Records are deliberately scoped by operation so unrelated APIs may reuse a caller's key. After an explicitly configured idempotency retention window expires, that historical retry guarantee also expires; the cleanup plan reports how many records are affected.
 

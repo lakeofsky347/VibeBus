@@ -16,6 +16,7 @@ All times are Unix milliseconds. CLI responses are JSON. MCP tools return format
 | Initialize operator credential | `operator init` | Deliberately unavailable |
 | Rotate operator credential | `operator rotate` | Deliberately unavailable |
 | Restore operator vault entry | `operator restore-credential` | Deliberately unavailable |
+| Delete operator vault entry | `operator delete-credential` | Deliberately unavailable |
 | List agents | `agents` | `vibebus_agents` |
 | Project snapshot | `status` | `vibebus_status` |
 | Integrity check | `doctor` | `vibebus_doctor` |
@@ -27,7 +28,7 @@ Recovery accepts an explicit recovery key or loads it from the matching vault en
 
 Mutating or private reads require an Agent identity. CLI bearer resolution is `--token`, then `VIBEBUS_AGENT_TOKEN`, then the current-user vault. MCP resolution is explicit `token`, then the vault. Token fields are therefore optional only when the correct project/Agent vault entry exists. `credential status` never returns secret material. `credential delete` removes only the OS entry; it does not remove or revoke the Agent, and later no-token calls fail until credentials are stored again. MCP deletion additionally requires `confirm=true`. Same-user processes share the Windows credential trust boundary.
 
-The project operator is a separate procedural capability for destructive maintenance, not an Agent role. Its database row contains only a SHA-256 digest and generation; the secret is stored under `VibeBusOperator:<project-id>`, which cannot collide with `VibeBus:<project-id>:<agent>`. Operator mutation commands first require a real terminal and an exact typed confirmation. They are absent from MCP. Successful vault storage redacts the secret. If a post-initialize or post-rotate vault write fails, the interactive response returns the only usable secret plus `credentialStorageError`; after securing it, the maintainer repairs the entry with `operator restore-credential`, which reads the secret without echo. `operator status` reports DB/vault generation agreement as `ready` without exposing secret material.
+The project operator is a separate procedural capability for destructive maintenance, not an Agent role. Its database row contains only a SHA-256 digest and generation; the secret is stored under `VibeBusOperator:<project-id>`, which cannot collide with `VibeBus:<project-id>:<agent>`. Operator mutation commands first require a real terminal and an exact typed confirmation. They are absent from MCP. Successful vault storage redacts the secret. If a post-initialize or post-rotate vault write fails, the interactive response returns the only usable secret plus `credentialStorageError`; after securing it, the maintainer repairs the entry with `operator restore-credential`, which reads the secret without echo. `operator status` reports DB/vault generation agreement as `ready` without exposing secret material. `operator delete-credential` requires the exact `delete:<project-id>` confirmation and removes only the OS vault entry; the database digest and generation remain configured so deletion cannot masquerade as revocation or project reset. Without another secured copy of the current secret, deletion is intentionally irreversible for that database.
 
 ## Messages
 

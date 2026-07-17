@@ -37,7 +37,7 @@ Covered behaviors:
 - replay-safe pending delivery, repeated peek identity, concurrent peek convergence, concurrent/idempotent ACK, empty filtered ranges, wrong-ID conflict, and legacy-poll exclusion;
 - retention preview/apply confirmation, pending-delivery protection, stale-plan rejection, concurrent replay-safe apply, retained-history cursor rejection, and snapshot cursor clamping;
 - separately hashed operator credentials, generation-bound plan approval, 60–3,600 second TTL validation, expiry rejection, rotation invalidation, atomic single consumption, and successful-run replay without a second approval;
-- operator vault target isolation, successful secret redaction, generation refresh, safe write-failure fallback, restoration verification, and rejection of noninteractive CLI mutations;
+- operator vault target isolation, successful secret redaction, generation refresh, safe write-failure fallback, restoration/deletion verification, and rejection of noninteractive CLI mutations including credential deletion;
 - age-bounded cleanup for idempotency records, closed message receipts, orphaned messages, and terminal task/thread history;
 - retry-safe structured handoff, ACK lifecycle, and authenticated resume snapshot;
 - CLI end-to-end subscription/handoff, message/thread lifecycle, and retention plan/apply flows;
@@ -56,8 +56,8 @@ The accepted local 0.8 package is intentionally unsigned because no production c
 - SessionStart is read-only and requires normal Codex hook trust review.
 - The Skill states the root, `storeCredentials=true`, vault-status and failure-fallback handling, snapshot, message close lifecycle, task/thread association, operator-approved retention discipline, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
 - The repository plugin manifest is version 0.8.0 and passes both the repository validator and the Codex plugin/Skill validators.
-- The development reinstall uses cachebuster version `0.8.0+codex.20260717121516`; `codex plugin list` reports it installed and enabled from `vibebus-local`.
-- The installed and packaged binaries both report `vibebus 0.8.0` and share SHA-256 `e2cb2985d8e2e1ed5b484611f0eb5cae972576853acf491451980340dde32c33`; the installed Skill contains the operator-approval rule.
+- The development reinstall uses cachebuster version `0.8.0+codex.20260717124544`; `codex plugin list` reports it installed and enabled from `vibebus-local`.
+- The installed and packaged binaries both report `vibebus 0.8.0` and share SHA-256 `f2809d9828d571a14649929cd59c348ea9babc0fa8141dece90356330f2f47e7`; the installed Skill contains the operator-approval and explicit operator-credential-deletion rules, and the installed CLI exposes `operator delete-credential`.
 
 ## Release package acceptance
 
@@ -65,9 +65,9 @@ The accepted unsigned local artifacts are:
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `VibeBus-0.8.0-windows-x64.msi` | 2,039,808 | `bffad77f99ccf22acdab5a26d4f3675c9eaa8cc9a3ff2fddf852381162f866d6` |
-| `VibeBus-0.8.0-windows-x64.zip` | 2,661,649 | `6e55ec6ba56494754fa735be500a30fecb9962e8a92977256b88479d4765e2d8` |
-| `VibeBus-Codex-plugin-0.8.0.zip` | 2,655,645 | `295af3f522a849f10585714b8a4fcfe4eca62486d2717c758652a8ae9191bb08` |
+| `VibeBus-0.8.0-windows-x64.msi` | 2,039,808 | `0cccfbffd79789f0c4349625b5020d3db340bf798d9cea6fe7198404718021e4` |
+| `VibeBus-0.8.0-windows-x64.zip` | 2,662,643 | `6c0ca1d21088377c24ce5e5f338aa6f8e80788f0e111ac2359506b1914db1220` |
+| `VibeBus-Codex-plugin-0.8.0.zip` | 2,656,496 | `144b7046775e163673befbf0ce2277fdc55ad0e16d736a3fb651c47594c65943` |
 
 The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, seven critical payload paths are present, and the extracted binary reports 0.8.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
 
@@ -96,5 +96,5 @@ Before the 0.8 live migration, the 0.7 binary created `vibebus-0.8-pre-migration
 ## Remaining manual acceptance
 
 1. Start two new independent Codex top-level tasks in the same initialized project and verify registration/recovery-key retention, a structured handoff plus ACK, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI.
-2. In a disposable initialized project and real terminal, run `operator init`, inspect `operator status`, plan a zero-candidate/default cleanup, approve the exact plan interactively, apply it through a separate Agent/MCP call, verify single consumption/replay, rotate the operator, and remove the disposable vault target afterward.
+2. Follow `docs/operator-acceptance.md` in a disposable initialized project: use a real terminal for `operator init`, exact-plan approval, rotation, and `operator delete-credential`; use a separate Agent/MCP call for apply; verify single consumption, replay, generation invalidation, and final `ready=false` cleanup.
 3. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.

@@ -310,6 +310,7 @@ enum OperatorCommand {
     Init,
     Rotate,
     RestoreCredential,
+    DeleteCredential,
     ApproveRetention {
         #[arg(long)]
         plan: String,
@@ -649,6 +650,24 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 json!({
                     "restored": true,
                     "ready": operator.generation == credential.generation,
+                    "operator": operator,
+                    "credential": credential
+                })
+            }
+            OperatorCommand::DeleteCredential => {
+                require_interactive_confirmation(
+                    "Delete the project operator credential from the OS vault. Type delete:<project-id> to continue",
+                    &format!("delete:{project_id}"),
+                )?;
+                let deleted = vault.delete_operator(&project_id)?;
+                let operator = bus.operator_status()?;
+                let credential = vault.operator_status(&project_id)?;
+                let ready = operator.configured
+                    && credential.stored
+                    && operator.generation == credential.generation;
+                json!({
+                    "deleted": deleted,
+                    "ready": ready,
                     "operator": operator,
                     "credential": credential
                 })

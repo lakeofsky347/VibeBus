@@ -40,6 +40,7 @@ The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`,
 - Remote synchronization is not implemented; retention state and confirmation plans are local to one project database.
 - The optional best-effort bridge to native Codex thread tools is not implemented.
 - Destructive retention is default-deny until a local maintainer initializes the separate operator credential in a real terminal. MCP has no operator mutation tools. Every new apply needs a short-lived approval for the exact plan and current operator generation; completed-run replay remains approval-free and cannot delete twice.
+- Operator vault cleanup is explicit and CLI-only: `operator delete-credential` requires a real terminal plus `delete:<project-id>`, removes only the Windows vault entry, and leaves the database credential configured with `ready=false`.
 - The current live project intentionally reports `operator.ready=false`. No operator credential was initialized on the user's behalf. The stored target, when explicitly initialized, is `VibeBusOperator:<project-id>` and remains inside the same-Windows-user trust boundary.
 - Pull-request CI produces unsigned acceptance packages. Production release automation requires both Windows signing Secrets and refuses unsigned publication; the repository has not been given a production certificate, tag, or real release during implementation.
 - The installer is intentionally per-user and does not mutate Codex configuration through custom actions. The installed marketplace must be registered explicitly.
@@ -49,7 +50,7 @@ The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`,
 ## Recommended next slice
 
 1. Perform the two-real-task desktop acceptance recorded in `docs/acceptance.md`; plugin installation is complete, but creating user-owned top-level tasks requires explicit user action/authorization.
-2. In a disposable project, perform the real-terminal operator initialization/approval/rotation acceptance, then decide whether to initialize the operator capability for the live project.
+2. Follow `docs/operator-acceptance.md` in the prepared disposable project and complete the real-terminal initialization/approval/rotation/deletion acceptance, then decide whether to initialize the operator capability for the live project.
 3. Configure the protected `release` environment and a real Windows code-signing certificate, then execute the tag, signed asset, disposable-profile install/uninstall, and downloaded-checksum acceptance in `docs/release.md`.
 4. Only then evaluate an optional Codex thread notification bridge; keep SQLite authoritative and treat UI delivery as best effort.
 

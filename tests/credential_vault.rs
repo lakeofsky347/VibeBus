@@ -95,6 +95,9 @@ fn operator_vault_entry_is_separate_redacted_and_generation_tracked() {
     );
     assert!(vault.delete_operator(&project_id).unwrap());
     assert!(!vault.operator_status(&project_id).unwrap().stored);
+    assert!(bus.operator_status().unwrap().configured);
+    assert_eq!(bus.operator_status().unwrap().generation, Some(2));
+    assert!(resolve_operator_secret(&vault, &project_id).is_err());
 }
 
 #[test]

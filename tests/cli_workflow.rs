@@ -491,23 +491,25 @@ fn operator_mutations_reject_redirected_noninteractive_cli_calls() {
     let project = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
     initialize_project(project.path(), "CLI operator", Some(data.path())).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_vibebus"))
-        .arg("--root")
-        .arg(project.path())
-        .arg("--data-home")
-        .arg(data.path())
-        .args(["operator", "init"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(error["kind"], "validation");
-    assert!(
-        error["error"]
-            .as_str()
-            .unwrap()
-            .contains("interactive terminal")
-    );
+    for command in ["init", "delete-credential"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_vibebus"))
+            .arg("--root")
+            .arg(project.path())
+            .arg("--data-home")
+            .arg(data.path())
+            .args(["operator", command])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["kind"], "validation");
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("interactive terminal")
+        );
+    }
     let bus = Bus::open(project.path(), Some(data.path())).unwrap();
     assert!(!bus.operator_status().unwrap().configured);
 }
