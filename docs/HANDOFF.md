@@ -6,6 +6,7 @@ VibeBus 0.8 is a working native Windows MVP. Rust core, CLI, stdio MCP, Codex Sk
 
 Local recovery copies are kept under the ignored `backups/` directory:
 
+- `vibebus-0.8-pre-desktop-acceptance.db` is the schema-v9 recovery point after creating the deterministic desktop fixture and before either user-owned top-level task exists; it is 512,000 bytes with SHA-256 `0079a09f200dd5c7210c1dbb563da3b77f29b80b17d5c2504168a1bae230611c` and is published under `DESKTOP-ACCEPTANCE-001`.
 - `vibebus-source-0.8-operator-cleanup.zip` is the committed 0.8 source after adding explicit operator-vault cleanup and its disposable acceptance runbook; SHA-256 `1c75669d8ae107ebcc71c7c0faebda0677bb96db48a258262008d288b6240dbc`.
 - `vibebus-0.8-operator-cleanup.db` is the accepted live schema-v9 coordination snapshot before disposable real-terminal acceptance; SHA-256 `db029e78e31eafe16dbc7bfad83345a9c0c9ba7d9ed74200b5ef8abd59cd0372`.
 - `vibebus-source-0.7-final.zip` is the final committed 0.7 source, CI/release workflows, installer authoring, documentation, marketplace, project marker, and packaged plugin produced with `git archive`; ignored toolchains, release outputs, runtime data, and credentials are excluded.
@@ -53,7 +54,7 @@ The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`,
 
 ## Recommended next slice
 
-1. Perform the two-real-task desktop acceptance in `docs/desktop-acceptance.md`; the deterministic fixture, evidence gates, and copy-ready A/B prompts are prepared, but creating user-owned top-level tasks still requires explicit user action/authorization.
+1. Perform the two-real-task desktop acceptance in `docs/desktop-acceptance.md`; the deterministic fixture, exact handoff evidence schema, non-destructive audit script, evidence gates, and copy-ready A/B prompts are prepared, but creating user-owned top-level tasks still requires explicit user action/authorization.
 2. Decide separately whether the live project should ever initialize its operator capability; it intentionally remains unconfigured after the disposable acceptance and must not inherit test authority.
 3. Configure the protected `release` environment and a real Windows code-signing certificate, then execute the tag, signed asset, disposable-profile install/uninstall, and downloaded-checksum acceptance in `docs/release.md`.
 4. Only then evaluate an optional Codex thread notification bridge; keep SQLite authoritative and treat UI delivery as best effort.

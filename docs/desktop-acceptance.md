@@ -42,7 +42,7 @@ Run this phase in top-level Task B before starting Task A:
 1. Confirm `desktop-b-20260717-01` does not already exist. Register it with role `desktop-acceptance-receiver` and credential storage enabled.
 2. Require the registration response to redact both secrets. Then require credential status `stored=true`, `hasRecoveryKey=true`, and `tokenGeneration=1`.
 3. Create subscription `desktop-20260717-01` filtered to `message_sent`, omitting a start sequence so it begins at the current tail.
-4. Claim `DESKTOP-B-READY-001`. If the native Codex task ID is available, bind it without inventing a value. Complete the task only after registration, credential status, and subscription creation are verified.
+4. Claim `DESKTOP-B-READY-001`, bind the real native Codex task ID without inventing a value, and complete the task only after registration, credential status, and subscription creation are verified.
 5. Check the inbox and reservations, then stop with the exact marker `READY_FOR_A`. Do not peek the subscription yet.
 
 ## Phase A1: establish ownership and send the handoff
@@ -58,7 +58,7 @@ After Task B reports `READY_FOR_A`, start top-level Task A:
 7. Send a structured handoff to Task B with:
    - task `DESKTOP-CLAIM-001`;
    - summary stating that A owns the claim and renewed reservation;
-   - decisions containing the claim owner, reservation ID, original expiry, and renewed expiry;
+   - decisions containing the exact `key=value` entries `claimOwner=<A>`, `reservationId=<id>`, `originalExpiry=<milliseconds>`, and `renewedExpiry=<milliseconds>`;
    - next actions requiring B to replay/ACK the subscription delivery, ACK/close the handoff, attempt the claim and reservation conflicts, and report results;
    - idempotency key `desktop-20260717-01-handoff-a-b`.
 8. Verify the handoff is high priority and requires ACK, retain the reservation, and stop with `WAITING_FOR_B_RESULT`.
@@ -72,14 +72,17 @@ Resume Task B with the message `继续执行第二阶段`:
 3. Read A's structured handoff from the inbox, verify its body, ACK it, and close it. Require the default inbox to hide it and closed-history inspection to retain it.
 4. Inspect `DESKTOP-CLAIM-001` immediately before and after B attempts to claim it. Both snapshots must keep A as owner with status `working`, while B's claim must fail with conflict kind `conflict` and an error reporting that the task is not claimable at `status=working`. A successful claim or changed owner is an acceptance failure.
 5. Attempt an overlapping exclusive reservation on `acceptance/desktop-20260717-01/shared-resource` with idempotency key `desktop-20260717-01-reserve-b-conflict`. This must fail with conflict kind `conflict` and an error naming A as the existing reservation owner. A successful reservation is an acceptance failure.
-6. Claim and complete `DESKTOP-B-RESULT-001`.
-7. Send a structured result handoff to Task A with task `DESKTOP-B-RESULT-001`, idempotency key `desktop-20260717-01-handoff-b-a`, and decisions that explicitly record:
-   - the replayed delivery ID;
-   - first ACK `replayed=false`;
-   - retry ACK `replayed=true`;
-   - handoff ACK and close timestamps;
-   - claim conflict kind;
-   - reservation conflict kind.
+6. Claim `DESKTOP-B-RESULT-001`, bind it to B's real native Codex task ID, and complete it after the evidence below is assembled.
+7. Send a structured result handoff to Task A with task `DESKTOP-B-RESULT-001`, idempotency key `desktop-20260717-01-handoff-b-a`, and these exact `key=value` decisions:
+   - `deliveryId=<replayed delivery ID>`;
+   - `firstAckReplayed=false`;
+   - `retryAckReplayed=true`;
+   - `subscriptionAckAt=<first/replayed shared acknowledgement timestamp>`;
+   - `aToBHandoffAckAt=<timestamp>` and `aToBHandoffClosedAt=<timestamp>`;
+   - `claimConflictKind=conflict`;
+   - `claimOwnerBefore=desktop-a-20260717-01` and `claimOwnerAfter=desktop-a-20260717-01`;
+   - `claimStatusBefore=working` and `claimStatusAfter=working`;
+   - `reservationConflictKind=conflict`.
 8. Stop with `B_RESULT_SENT`. Do not delete credentials or alter repository files.
 
 ## Phase A2: close the durable loop
@@ -91,8 +94,17 @@ Resume Task A with the message `继续执行收尾阶段`:
 3. Read B's structured result handoff, verify every evidence field, ACK it, and close it.
 4. Release A's reservation and require the active reservation list to contain no matching path.
 5. Complete `DESKTOP-CLAIM-001`, closing any active task/thread binding.
-6. Claim and complete `DESKTOP-A-FINALIZE-001`.
-7. Send a final structured handoff to `git-publisher-019f6eab` with task `DESKTOP-A-FINALIZE-001`, idempotency key `desktop-20260717-01-handoff-a-root`, the two Agent credential-status facts, claim owner, renewal evidence, B's delivery/ACK evidence, both conflict kinds, both handoff lifecycle results, and the final zero-reservation state.
+6. Claim `DESKTOP-A-FINALIZE-001`, bind it to A's real native Codex task ID, and complete it.
+7. Send a final structured handoff to `git-publisher-019f6eab` with task `DESKTOP-A-FINALIZE-001`, idempotency key `desktop-20260717-01-handoff-a-root`, and the following exact `key=value` decisions copied from authoritative results rather than re-created from memory:
+   - `agentAStored=true`, `agentAHasRecoveryKey=true`, `agentATokenGeneration=1`;
+   - `agentBStored=true`, `agentBHasRecoveryKey=true`, `agentBTokenGeneration=1`;
+   - `claimOwner=desktop-a-20260717-01`;
+   - `reservationId=<id>`, `originalExpiry=<milliseconds>`, `renewedExpiry=<milliseconds>`;
+   - `deliveryId=<id>`, `firstAckReplayed=false`, `retryAckReplayed=true`, `subscriptionAckAt=<timestamp>`;
+   - `aToBHandoffAckAt=<timestamp>`, `aToBHandoffClosedAt=<timestamp>`;
+   - `bToAHandoffAckAt=<timestamp>`, `bToAHandoffClosedAt=<timestamp>`;
+   - `claimConflictKind=conflict`, `reservationConflictKind=conflict`;
+   - `acceptanceReservations=0`, `subscriptionPendingDelivery=false`.
 8. Finish with `DESKTOP_ACCEPTANCE_READY_FOR_AUDIT`. Do not delete either Agent credential.
 
 ## Copy-ready Task B prompt
@@ -113,6 +125,7 @@ The original project task performs the final audit after A reports `DESKTOP_ACCE
 
 - both Agent vault entries are stored and retain recovery keys;
 - B readiness, B result, claim, and A finalize tasks have the expected owners and terminal states;
+- all four terminal tasks retain closed bindings; A's two bindings share one native task ID, B's two bindings share another, and the A/B IDs differ;
 - A's original and renewed reservation expiries prove owner renewal;
 - B's durable result handoff records the claim and overlapping-reservation conflicts, with before/after task snapshots proving A remained the claim owner;
 - B's subscription shows no pending delivery and preserves the acknowledged delivery ID;
@@ -122,4 +135,12 @@ The original project task performs the final audit after A reports `DESKTOP_ACCE
 - the final handoff to the root evidence recipient is present and requires ACK;
 - `doctor.ok=true`, the repository is clean, and the live Operator remains unconfigured.
 
-Only after these gates pass should the root task update `docs/acceptance.md`, publish the evidence, and optionally remove the two disposable Agent vault entries. Credential deletion is explicit and irreversible for the local vault copy; never perform it before the recovery-key-retention evidence is durable. The subscription and database Agent rows remain audit history.
+Before ACKing the final handoff or editing the repository, run the non-destructive auditor from a clean checkout:
+
+```powershell
+powershell -NoProfile -File .\scripts\audit-desktop-acceptance.ps1 -ProjectRoot D:\MyProjects\CoWork
+```
+
+Require JSON `ok=true`, `summary.failed=0`, and `summary.skipped=0`. The auditor reads VibeBus status, Agent credential metadata, tasks, closed bindings, messages, reservation events, subscription state, backup identity, Operator state, and Git state. Authenticated reads may refresh the relevant Agent `lastSeenAt`, but the auditor never receives a bearer token or recovery key and performs no ACK, close, Operator, retention, task, reservation, artifact, subscription-cursor, repository, or event-producing mutation.
+
+Only after the audit passes should the root task ACK and close the final handoff, update `docs/acceptance.md`, publish the evidence, and optionally remove the two disposable Agent vault entries. Credential deletion is explicit and irreversible for the local vault copy; never perform it before the recovery-key-retention evidence is durable. The subscription and database Agent rows remain audit history.
