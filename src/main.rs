@@ -4,7 +4,11 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
-use vibebus::{Bus, BusError, Result, RetentionPolicy, initialize_project, mcp::run_mcp};
+use vibebus::{
+    Bus, BusError, CredentialVault, Result, RetentionPolicy, SecretSource, initialize_project,
+    mcp::run_mcp, recovery_delivery, recovery_key_delivery, registration_delivery,
+    resolve_agent_recovery_key, resolve_agent_token, system_credential_vault,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,11 +38,17 @@ enum Command {
         name: String,
         #[arg(long)]
         role: String,
+        #[arg(long)]
+        store_credentials: bool,
     },
     Agents,
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
     },
     Send(SendArgs),
     Inbox(AgentAuthArgs),
@@ -262,13 +272,29 @@ enum AgentCommand {
         #[arg(long)]
         name: String,
         #[arg(long)]
-        recovery_key: String,
+        recovery_key: Option<String>,
+        #[arg(long)]
+        store_credentials: bool,
     },
     ProvisionRecovery {
         #[arg(long)]
         agent: String,
         #[arg(long)]
         token: Option<String>,
+        #[arg(long)]
+        store_credentials: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CredentialCommand {
+    Status {
+        #[arg(long)]
+        agent: String,
+    },
+    Delete {
+        #[arg(long)]
+        agent: String,
     },
 }
 
@@ -494,21 +520,71 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     }
 
     let mut bus = Bus::open(&cli.root, cli.data_home.as_deref())?;
+    let project_id = bus.project().project_id.clone();
+    let vault = system_credential_vault();
     let result = match cli.command {
         Command::Init { .. } => unreachable!(),
-        Command::Register { name, role } => json!(bus.register_agent(&name, &role)?),
+        Command::Register {
+            name,
+            role,
+            store_credentials,
+        } => {
+            let registration = bus.register_agent(&name, &role)?;
+            registration_delivery(
+                vault.as_ref(),
+                &project_id,
+                &registration,
+                store_credentials,
+            )
+        }
         Command::Agents => json!(bus.list_agents()?),
         Command::Agent { command } => match command {
-            AgentCommand::Recover { name, recovery_key } => {
-                json!(bus.recover_agent(&name, &recovery_key)?)
+            AgentCommand::Recover {
+                name,
+                recovery_key,
+                store_credentials,
+            } => {
+                let resolved = resolve_agent_recovery_key(
+                    vault.as_ref(),
+                    &project_id,
+                    &name,
+                    recovery_key.as_deref(),
+                )?;
+                let store_credentials = store_credentials || resolved.source == SecretSource::Vault;
+                let recovery = bus.recover_agent(&name, &resolved.value)?;
+                recovery_delivery(vault.as_ref(), &project_id, &recovery, store_credentials)
             }
-            AgentCommand::ProvisionRecovery { agent, token } => {
-                let token = resolve_token(token)?;
-                json!(bus.provision_recovery_key(&agent, &token)?)
+            AgentCommand::ProvisionRecovery {
+                agent,
+                token,
+                store_credentials,
+            } => {
+                let resolved = resolve_cli_secret(vault.as_ref(), &project_id, &agent, token)?;
+                let store_credentials = store_credentials || resolved.source == SecretSource::Vault;
+                let recovery = bus.provision_recovery_key(&agent, &resolved.value)?;
+                recovery_key_delivery(
+                    vault.as_ref(),
+                    &project_id,
+                    &resolved.value,
+                    &recovery,
+                    store_credentials,
+                )
+            }
+        },
+        Command::Credential { command } => match command {
+            CredentialCommand::Status { agent } => {
+                json!(vault.status(&project_id, &agent)?)
+            }
+            CredentialCommand::Delete { agent } => {
+                let deleted = vault.delete(&project_id, &agent)?;
+                json!({
+                    "deleted": deleted,
+                    "credentials": vault.status(&project_id, &agent)?
+                })
             }
         },
         Command::Send(args) => {
-            let token = resolve_token(args.token)?;
+            let token = resolve_token(vault.as_ref(), &project_id, &args.from, args.token)?;
             json!(bus.send_message_idempotent(
                 &args.from,
                 &token,
@@ -522,19 +598,19 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             )?)
         }
         Command::Inbox(args) => {
-            let token = resolve_token(args.token)?;
+            let token = resolve_token(vault.as_ref(), &project_id, &args.agent, args.token)?;
             json!(bus.inbox_with_options(&args.agent, &token, !args.all, args.include_closed,)?)
         }
         Command::Read(args) => {
-            let token = resolve_token(args.token)?;
+            let token = resolve_token(vault.as_ref(), &project_id, &args.agent, args.token)?;
             json!(bus.mark_read(&args.agent, &token, &args.message)?)
         }
         Command::Ack(args) => {
-            let token = resolve_token(args.token)?;
+            let token = resolve_token(vault.as_ref(), &project_id, &args.agent, args.token)?;
             json!(bus.acknowledge_message(&args.agent, &token, &args.message)?)
         }
         Command::Close(args) => {
-            let token = resolve_token(args.token)?;
+            let token = resolve_token(vault.as_ref(), &project_id, &args.agent, args.token)?;
             json!(bus.close_message(&args.agent, &token, &args.message)?)
         }
         Command::Task { command } => match command {
@@ -546,7 +622,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 description,
                 depends_on,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.create_task(
                     &agent,
                     &token,
@@ -557,7 +633,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 )?)
             }
             TaskCommand::Claim { agent, token, id } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.claim_task(&agent, &token, &id)?)
             }
             TaskCommand::Update {
@@ -568,7 +644,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 status,
                 blocked_reason,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.update_task(
                     &agent,
                     &token,
@@ -584,7 +660,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 id,
                 expected_version,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.update_task(&agent, &token, &id, expected_version, "completed", None,)?)
             }
             TaskCommand::Show { id } => json!(bus.get_task(&id)?),
@@ -597,7 +673,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 task,
                 thread,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.bind_task_thread(&agent, &token, &task, &thread)?)
             }
             ThreadCommand::Unbind {
@@ -606,7 +682,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 task,
                 thread,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.unbind_task_thread(&agent, &token, &task, &thread)?)
             }
             ThreadCommand::List { task, all } => {
@@ -623,7 +699,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 reason,
                 idempotency_key,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.reserve_path_idempotent(
                     &agent,
                     &token,
@@ -635,7 +711,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 )?)
             }
             ReservationCommand::Release { agent, token, id } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.release_reservation(&agent, &token, &id)?)
             }
             ReservationCommand::Renew {
@@ -645,7 +721,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 ttl,
                 idempotency_key,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.renew_reservation_idempotent(
                     &agent,
                     &token,
@@ -668,7 +744,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 metadata_file,
                 idempotency_key,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 let metadata_text = if let Some(path) = metadata_file {
                     Some(std::fs::read_to_string(path)?)
                 } else {
@@ -706,7 +782,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 event_types,
                 from_sequence,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.create_subscription(
                     &agent,
                     &token,
@@ -716,7 +792,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 )?)
             }
             SubscriptionCommand::List { agent, token } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.list_subscriptions(&agent, &token)?)
             }
             SubscriptionCommand::Poll {
@@ -725,7 +801,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 name,
                 limit,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.poll_subscription(&agent, &token, &name, limit)?)
             }
             SubscriptionCommand::Peek {
@@ -734,7 +810,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 name,
                 limit,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.peek_subscription(&agent, &token, &name, limit)?)
             }
             SubscriptionCommand::Ack {
@@ -743,7 +819,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 name,
                 delivery,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.acknowledge_subscription(&agent, &token, &name, &delivery)?)
             }
         },
@@ -753,7 +829,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 token,
                 policy,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.plan_retention(&agent, &token, &policy.into())?)
             }
             RetentionCommand::Apply {
@@ -762,7 +838,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 plan,
                 policy,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.apply_retention(&agent, &token, &policy.into(), &plan)?)
             }
             RetentionCommand::Status => json!(bus.retention_state()?),
@@ -780,7 +856,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 next_actions,
                 idempotency_key,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &from, token)?;
                 json!(bus.send_handoff(
                     &from,
                     &token,
@@ -799,7 +875,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 token,
                 after_sequence,
             } => {
-                let token = resolve_token(token)?;
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.handoff_snapshot(&agent, &token, after_sequence)?)
             }
         },
@@ -821,15 +897,29 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     Ok(json!({"ok": true, "result": result}))
 }
 
-fn resolve_token(argument: Option<String>) -> Result<String> {
-    argument
-        .or_else(|| std::env::var("VIBEBUS_AGENT_TOKEN").ok())
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
-            BusError::Validation(
-                "agent token is required via --token or VIBEBUS_AGENT_TOKEN".into(),
-            )
-        })
+fn resolve_cli_secret(
+    vault: &dyn CredentialVault,
+    project_id: &str,
+    agent: &str,
+    argument: Option<String>,
+) -> Result<vibebus::ResolvedSecret> {
+    let environment = std::env::var("VIBEBUS_AGENT_TOKEN").ok();
+    resolve_agent_token(
+        vault,
+        project_id,
+        agent,
+        argument.as_deref(),
+        environment.as_deref(),
+    )
+}
+
+fn resolve_token(
+    vault: &dyn CredentialVault,
+    project_id: &str,
+    agent: &str,
+    argument: Option<String>,
+) -> Result<String> {
+    Ok(resolve_cli_secret(vault, project_id, agent, argument)?.value)
 }
 
 fn print_json(value: &impl Serialize) {
@@ -844,6 +934,7 @@ fn error_kind(error: &BusError) -> &'static str {
         BusError::Io(_) => "io",
         BusError::Database(_) => "database",
         BusError::Json(_) => "json",
+        BusError::CredentialVault(_) => "credential_vault",
         BusError::ProjectNotFound(_) => "project_not_found",
         BusError::AgentNotFound(_) => "agent_not_found",
         BusError::Unauthorized(_) => "unauthorized",

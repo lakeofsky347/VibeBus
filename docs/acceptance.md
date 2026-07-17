@@ -28,6 +28,7 @@ Covered behaviors:
 - SQLite integrity, WAL, foreign keys, schema version, and online backup;
 - ancestor project discovery;
 - single-use recovery-key rotation, legacy-agent migration, and invalidation of old secrets;
+- project-scoped credential-vault isolation, explicit/environment/vault token precedence, successful secret redaction, rotation write-back, deletion, and safe write-failure fallback;
 - owner-only reservation renewal and retry-safe reservation operations;
 - concurrent idempotent message retries, payload-drift conflicts, and artifact content identity;
 - ordered event filtering, durable subscription cursors, and repeated empty polls;
@@ -36,18 +37,18 @@ Covered behaviors:
 - age-bounded cleanup for idempotency records, closed message receipts, orphaned messages, and terminal task/thread history;
 - retry-safe structured handoff, ACK lifecycle, and authenticated resume snapshot;
 - CLI end-to-end subscription/handoff, message/thread lifecycle, and retention plan/apply flows;
-- MCP initialize negotiation, expanded tool listing, and real status tool execution.
+- MCP initialize negotiation, expanded tool listing, stored registration, no-token inbox access, vault-backed recovery, credential deletion, and rejection after deletion.
 
-The suite contains 24 tests: 4 CLI workflows, 19 core workflows, and 1 MCP protocol workflow. All pass on the accepted 0.5 checkout together with formatting and clippy-as-error checks.
+The suite contains 27 tests: 4 CLI workflows, 19 core workflows, 3 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.6 checkout together with formatting and clippy-as-error checks.
 
 ## Plugin checks
 
 - Manifest and component paths pass the plugin validator.
 - `.mcp.json` launches `./bin/vibebus.exe mcp` from the plugin root.
 - SessionStart is read-only and requires normal Codex hook trust review.
-- The Skill states the root, private bearer/recovery handling, snapshot, message close lifecycle, task/thread association, retention preview/backup/confirmation discipline, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
-- `vibebus@vibebus-local` is installed and enabled as version 0.5.0 in the local Codex plugin cache.
-- The installed binary reports `vibebus 0.5.0` and matches the packaged SHA-256 `b0cd4c9284d5d92af32fe6677bcbb7e6f7436b53e0b51304c1f4b7ec83553a70`.
+- The Skill states the root, `storeCredentials=true`, vault-status and failure-fallback handling, snapshot, message close lifecycle, task/thread association, retention preview/backup/confirmation discipline, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
+- `vibebus@vibebus-local` is installed and enabled as version 0.6.0 in the local Codex plugin cache.
+- The installed binary reports `vibebus 0.6.0` and matches the packaged SHA-256 `05285bc945e1b597d14e81ad1535d189a47f6587a3a8e1582f8417bfb2786b3b`.
 
 ## Live project migration
 
@@ -60,6 +61,12 @@ The live `MESSAGE-LIFECYCLE-001` task was moved to `working` and bound to the cu
 The 0.5 release binary then migrated the same live project from schema 7 to schema 8. Before any retention apply, SQLite online backup created `vibebus-0.5-pre-retention.db` with SHA-256 `f3035b043f44a8e11893f2f44e963ce875e0450d1ce1484296ddaaae5b1020ed`.
 
 The default live retention preview reported latest event sequence 91, one subscription with slowest safe cursor 37, no pending delivery, retained floor 0, and zero candidates in all five cleanup domains. Applying that exact plan deleted nothing, appended one `retention_applied` audit event, and left `doctor.ok=true`; retrying the same plan returned the original timestamp with `replayed=true`. The accepted post-run backup `vibebus-0.5-final.db` has SHA-256 `4e100e59647f54428716744336fddb5728e5b165b264551fa34ed8c1a631a4c3`.
+
+The 0.6 release binary then completed a real Windows Credential Manager acceptance against a disposable project. Stored registration returned `secretsRedacted=true` with neither secret field; an inbox read succeeded without a token; recovery omitted the recovery key, advanced the generation to 2, and remained redacted; recovery-key provisioning also used and refreshed the vault; `doctor.ok=true`; explicit deletion removed the entry; and the next no-token inbox call failed with exit code 1. The disposable OS credential and its verified workspace-local test directory were removed afterward.
+
+The existing live coordination identity was also migrated with stored recovery-key provisioning. `vibebus_credential_status` reports backend `windows-credential-manager`, target `VibeBus:prj_51ac137e4aa342a7a80bda77d94cfbc5:git-publisher-019f6eab`, `stored=true`, and no secret was exposed during migration.
+
+The accepted post-migration online backup `vibebus-0.6-final.db` is 290,816 bytes with SHA-256 `86a77a9e07bf4d0246223c912fe7bc54d3d97c7568ad307086749f9f7233fe2f`.
 
 ## Remaining manual acceptance
 

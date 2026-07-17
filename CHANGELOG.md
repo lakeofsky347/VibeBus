@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 - 2026-07-17
+
+- Added project-and-agent-scoped secret storage in Windows Credential Manager using current-user Generic Credentials.
+- Added explicit credential storage and redacted delivery for registration, recovery, and recovery-key provisioning.
+- Added CLI and MCP bearer-token fallback from the vault, with explicit argument and CLI environment precedence preserved.
+- Added credential status and explicit delete operations without writing secrets to the repository or SQLite database.
+- Added safe fallback delivery when a post-rotation vault write fails, preventing irreversible identity loss.
+- Added an injectable in-memory vault plus core and MCP coverage for isolation, precedence, redaction, rotation, deletion, and failure recovery.
+
 ## 0.5.0 - 2026-07-17
 
 - Added authenticated retention planning with explicit, state-bound confirmation IDs.

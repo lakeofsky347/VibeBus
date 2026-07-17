@@ -11,6 +11,9 @@ pub enum BusError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("credential vault error: {0}")]
+    CredentialVault(String),
+
     #[error("VibeBus project not found from {0}")]
     ProjectNotFound(String),
 

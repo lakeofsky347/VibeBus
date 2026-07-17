@@ -10,12 +10,18 @@ All times are Unix milliseconds. CLI responses are JSON. MCP tools return format
 | Register agent | `register` | `vibebus_register` |
 | Recover agent | `agent recover` | `vibebus_agent_recover` |
 | Rotate/provision recovery key | `agent provision-recovery` | `vibebus_recovery_provision` |
+| Inspect credential vault | `credential status` | `vibebus_credential_status` |
+| Delete credential entry | `credential delete` | `vibebus_credential_delete` |
 | List agents | `agents` | `vibebus_agents` |
 | Project snapshot | `status` | `vibebus_status` |
 | Integrity check | `doctor` | `vibebus_doctor` |
 | Consistent backup | `backup` | `vibebus_backup` |
 
-Registration returns both a bearer token and a recovery key in plaintext once. Store both outside the repository and never send either through VibeBus. Recovery accepts the current recovery key, revokes both old secrets, increments `tokenGeneration`, and returns a fresh pair. Provisioning a recovery key requires the current bearer token and revokes the previous recovery key without changing the bearer token. Mutating or private reads require `agent` and `token`.
+Registration returns both a bearer token and a recovery key in plaintext once by default. CLI `--store-credentials` or MCP `storeCredentials=true` writes the pair to the current Windows user's Generic Credential and, on success, returns metadata with `secretsRedacted=true` instead of either secret. The target is `VibeBus:<project-id>:<agent>` and never enters the repository or SQLite database.
+
+Recovery accepts an explicit recovery key or loads it from the matching vault entry, revokes both old secrets, increments `tokenGeneration`, and produces a fresh pair. Provisioning requires a current bearer token and revokes the previous recovery key without changing the bearer token. If recovery or provisioning used a vault secret, VibeBus automatically replaces the stored pair; callers can also request storage explicitly. A post-rotation vault-write failure returns the new pair with `secretsRedacted=false` and `credentialStorageError`, because hiding it would permanently strand the identity.
+
+Mutating or private reads require an Agent identity. CLI bearer resolution is `--token`, then `VIBEBUS_AGENT_TOKEN`, then the current-user vault. MCP resolution is explicit `token`, then the vault. Token fields are therefore optional only when the correct project/Agent vault entry exists. `credential status` never returns secret material. `credential delete` removes only the OS entry; it does not remove or revoke the Agent, and later no-token calls fail until credentials are stored again. MCP deletion additionally requires `confirm=true`. Same-user processes share the Windows credential trust boundary.
 
 ## Messages
 
