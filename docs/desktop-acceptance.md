@@ -35,6 +35,24 @@ The four VibeBus tasks must already exist and be `ready` or dependency-gated as 
 
 Each new task must load the `vibebus-coordination` Skill before acting. Prefer the VibeBus MCP tools. If those tools are not exposed in that task, use the installed CLI at `D:\MyProjects\CoWork\plugins\vibebus\bin\vibebus.exe` with the absolute project root on every call.
 
+## Preflight before creating either task
+
+From the original project task, run the read-only preflight from a clean checkout before creating Task B or Task A:
+
+```powershell
+powershell -NoProfile -File .\scripts\preflight-desktop-acceptance.ps1 -ProjectRoot D:\MyProjects\CoWork
+```
+
+Require JSON `ok=true`, `summary.failed=0`, and `summary.skipped=0`. The preflight fails closed unless all of the following remain true:
+
+- the run ID, Agent names, controller identity, four task IDs, dependencies, initial states, owners, versions, and authorization gate match this fixed fixture;
+- both disposable Agents and both Windows credential entries are absent;
+- none of the four fixture tasks has binding history and no matching reservation is active;
+- schema 9 health, the live Operator default-deny state, the published backup path, its 512,000-byte size, and SHA-256 `0079a09f200dd5c7210c1dbb563da3b77f29b80b17d5c2504168a1bae230611c` match;
+- Git is clean and `HEAD` equals its configured upstream.
+
+The script performs no Agent registration or authentication, inbox read, task/reservation mutation, Operator/retention operation, or repository write. `-SkipGit` exists only for script development and isolated fixture checks; never use it for the real desktop run. If preflight fails, preserve its JSON evidence and stop instead of repairing or renaming fixture state ad hoc.
+
 ## Phase B1: establish the receiver
 
 Run this phase in top-level Task B before starting Task A:

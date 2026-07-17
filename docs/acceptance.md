@@ -103,7 +103,13 @@ A fresh zero-candidate plan `rtp_fd2b64c50ff188777e2d8255c2918f827a39bc867df3300
 
 Explicit Agent credential deletion returned `deleted=true` and `stored=false`. Interactive `operator delete-credential` returned `deleted=true`, retained database configuration at generation 2, removed the vault entry, and produced the required final `configured=true`, `stored=false`, `ready=false` state. Four consistent recovery points cover pre-operator, pre-retention, pre-rotation, and pre-cleanup states; their hashes and the full non-secret evidence inventory are recorded in `docs/operator-acceptance.md`. The verified disposable project/data directories were removed afterward while those ignored recovery artifacts were retained.
 
+## Desktop start-state preflight
+
+`scripts/preflight-desktop-acceptance.ps1` now verifies the fixed two-real-task fixture before either user-owned top-level task is created. It is read-only and fails closed on fixture identity drift, Agent or vault residue, task state/version/dependency drift, binding history, a live acceptance reservation, schema or Operator drift, backup size/hash drift, a dirty checkout, or a `HEAD`/upstream mismatch.
+
+Windows PowerShell 5.1 accepted the pristine live fixture with `-SkipGit` during development: 68 checks, 66 passed, 0 failed, and 2 explicitly skipped Git gates. A deliberate wrong run ID exited 1 with one failed fixture-identity check. The real desktop run must execute the script again without `-SkipGit` from a clean pushed checkout and require zero failed or skipped checks.
+
 ## Remaining manual acceptance
 
-1. Follow `docs/desktop-acceptance.md` with two new independent, user-owned Codex top-level tasks in the same initialized project; verify registration/recovery-key retention, a structured handoff plus ACK/close, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI. The deterministic fixture, copy-ready A/B prompts, and non-destructive `scripts/audit-desktop-acceptance.ps1` evidence verifier are prepared, but the two user-owned tasks have not yet been created.
+1. Run `scripts/preflight-desktop-acceptance.ps1` without `-SkipGit`, then follow `docs/desktop-acceptance.md` with two new independent, user-owned Codex top-level tasks in the same initialized project; verify registration/recovery-key retention, a structured handoff plus ACK/close, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI. The deterministic fixture, start-state preflight, copy-ready A/B prompts, and non-destructive `scripts/audit-desktop-acceptance.ps1` evidence verifier are prepared, but the two user-owned tasks have not yet been created.
 2. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.
