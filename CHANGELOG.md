@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0 - 2026-07-17
+
+- Added Windows GitHub Actions CI for formatting, locked tests, Clippy-as-error, plugin packaging, MSI validation, administrative extraction, and short-lived workflow artifacts.
+- Added a pinned Rust 1.97.1 toolchain and WiX 4.0.6 local tool manifest.
+- Added a per-user x64 MSI that installs the complete local marketplace under `%LOCALAPPDATA%\Programs\VibeBus` and updates the current-user PATH without custom actions.
+- Added portable marketplace and standalone Codex plugin ZIPs, SHA-256 checksums, and a machine-readable release manifest.
+- Added SignTool-based SHA-256 Authenticode signing and verification for the executable and MSI using ephemeral PFX material and RFC 3161 timestamps.
+- Added fail-closed tag publishing: production GitHub Releases require both signing secrets, an existing matching semantic-version tag, passing release gates, and verified assets.
+- Added repository-owned plugin and MSI acceptance scripts compatible with Windows PowerShell 5.1 and pwsh.
+
 ## 0.6.0 - 2026-07-17
 
 - Added project-and-agent-scoped secret storage in Windows Credential Manager using current-user Generic Credentials.

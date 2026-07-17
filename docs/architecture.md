@@ -137,7 +137,15 @@ The plugin contains:
 
 The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call.
 
-## Deliberate non-goals for 0.6
+## Release supply chain
+
+Rust 1.97.1 and Cargo.lock define the native build inputs. A repository-owned PowerShell path packages the release binary into the plugin, validates its manifest/MCP/Hook/Skill contract, stages one marketplace-shaped payload, and uses pinned WiX 4.0.6 to produce a per-user x64 MSI. The same staged payload feeds the portable and plugin archives, so the three distribution formats share one binary and plugin tree.
+
+Pull-request CI has read-only repository permission and produces explicitly unsigned, short-lived acceptance artifacts. It runs stock MSI validation except the irrelevant per-machine-only ICE91 rule, creates an administrative image, verifies the expected payload and binary version, and cleans the image.
+
+Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z` tag must match Cargo and plugin versions. SignTool signs and verifies the binary before staging and the MSI after construction using SHA-256 and an RFC 3161 timestamp. Checksums are calculated only after signing. A job-scoped `GITHUB_TOKEN` with `contents: write` publishes assets; signing material remains only in repository or protected-environment Secrets.
+
+## Deliberate non-goals for 0.7
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;
@@ -147,4 +155,7 @@ The MCP process starts from the installed plugin directory. For that reason ever
 - holding secrets in repository files;
 - exactly-once consumer side effects; replay-safe delivery is at-least-once until ACK;
 - non-Windows secure-vault backends or cross-device credential recovery;
-- protection against a malicious process already running as the same Windows user.
+- protection against a malicious process already running as the same Windows user;
+- automatic creation of release tags or unsigned production releases;
+- installer custom actions that silently mutate Codex plugin configuration;
+- bit-for-bit reproducible MSI/ZIP output or private-repository attestations on an ineligible GitHub plan.

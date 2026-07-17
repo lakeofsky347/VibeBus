@@ -2,7 +2,7 @@
 
 VibeBus 是一个面向独立 Codex 顶层任务的本地结构化事实总线。它保留 Codex 原生的任务与 worktree 隔离，只共享明确登记的消息、ACK、任务状态、依赖、文件租约和产物，不共享整段聊天上下文。
 
-当前版本 0.6 是可运行的 Windows MVP：一个 Rust 单文件程序同时提供 CLI 和 stdio MCP，状态写入项目级 SQLite WAL 数据库，Agent 秘密可写入 Windows 当前用户凭据管理器，并打包为 Codex 插件。
+当前版本 0.7 是可运行的 Windows MVP：一个 Rust 单文件程序同时提供 CLI 和 stdio MCP，状态写入项目级 SQLite WAL 数据库，Agent 秘密可写入 Windows 当前用户凭据管理器，并通过 Windows CI、当前用户级 MSI、便携包及可选本地 Authenticode 签名脚本交付为 Codex 插件。正式 tag 发布缺少签名凭据时会直接失败。
 
 ## 已实现
 
@@ -28,11 +28,15 @@ VibeBus 不承诺中断或唤醒正在生成中的模型。收件箱检查发生
 需要 Rust 2024 edition 兼容工具链。
 
 ```powershell
-cargo test --all-targets
-powershell -File .\scripts\package-plugin.ps1
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+./scripts/build-release.ps1
+$msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
+./scripts/test-installer.ps1 -MsiPath $msi.FullName
 ```
 
-第二条命令生成 `plugins\vibebus\bin\vibebus.exe`，插件的 `.mcp.json` 会从该路径启动 stdio MCP 服务。
+发布脚本会生成 `plugins\vibebus\bin\vibebus.exe`、当前用户级 MSI、便携 marketplace 包、独立插件包、SHA-256 校验和与发布清单。插件的 `.mcp.json` 从打包后的二进制路径启动 stdio MCP 服务。单独更新插件二进制仍可运行 `powershell -File .\scripts\package-plugin.ps1`。
 
 ## 初始化项目
 
@@ -85,12 +89,15 @@ codex plugin add vibebus@vibebus-local
 
 安装或更新后启动一个新任务，使 Skill、MCP 和 Hook 重新加载。SessionStart Hook 首次使用前需要在 Codex 中审查并信任；它只向上寻找并读取 `.vibebus/project.json`。
 
+MSI 安装到 `%LOCALAPPDATA%\Programs\VibeBus`，并将其中的 `plugins\vibebus\bin` 写入当前用户 PATH。安装器不会通过自定义操作修改 Codex 配置；安装后仍需对该目录显式执行 marketplace add 与 plugin add。详见[发布工程](docs/release.md)。
+
 ## 文档
 
 - [架构](docs/architecture.md)
 - [CLI 与 MCP 协议](docs/protocol.md)
 - [方案对比与取舍](docs/design-research.md)
 - [验收记录](docs/acceptance.md)
+- [发布工程](docs/release.md)
 - [后续接手](docs/HANDOFF.md)
 
 ## 安全边界
@@ -106,5 +113,6 @@ codex plugin add vibebus@vibebus-local
 - 备份拒绝覆盖已有目标文件。
 - 幂等键按项目、Agent 与操作域隔离；同键重试必须使用完全相同的有效载荷。
 - 清理执行需要已认证 Agent 和未过时的确认计划；执行重试返回原报告，不会重复删除。
+- 生产 tag 发布必须同时具备 PFX Base64 与密码 Secret；普通 PR 只产出明确标记为未签名的验收包。
 
 许可证：MIT。

@@ -35,3 +35,18 @@ This combination keeps the strongest properties from the references:
 ## Compatibility direction
 
 Future network or A2A bridges should translate from the event and artifact model. They must remain adapters; the local SQLite facts stay authoritative for a VibeBus project.
+
+## Release engineering decision
+
+The 0.7 release slice compared four Windows distribution shapes:
+
+| Approach | Strength | Decision |
+| --- | --- | --- |
+| Portable ZIP only | No installer dependency and easy inspection | Kept as a fallback, but insufficient for PATH and uninstall lifecycle |
+| MSIX | Strong platform identity and signing model | Deferred because local/private distribution requires certificate identity and deployment policy that would complicate the MVP |
+| Inno Setup or NSIS EXE | Flexible UI and scripting | Rejected for now because custom scripting increases the installer attack and maintenance surface |
+| WiX MSI | Native Windows Installer upgrade/uninstall semantics and stock ICE validation | Selected, with an explicitly per-user, no-custom-action package |
+
+WiX 7.0.0 was tested first because it is current, but its command-line tool requires explicit OSMF EULA acceptance. VibeBus does not automate legal acceptance on behalf of a maintainer, so the repository pins WiX 4.0.6 under its published MS-RL license. The v4 schema and command-line flow cover the required MSI without extensions.
+
+For signing, the chosen baseline is SignTool with a CA-issued PFX stored only as GitHub Secrets. It is provider-neutral and available on GitHub-hosted Windows runners. The production workflow signs the executable before MSI construction, signs the MSI afterward, and verifies both. Cloud or hardware-backed signing remains a replaceable adapter when certificate operations justify it.

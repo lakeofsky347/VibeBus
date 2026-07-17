@@ -8,8 +8,10 @@ The repository is accepted with:
 
 ```powershell
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+./scripts/build-release.ps1
+./scripts/test-installer.ps1 -MsiPath ./dist/VibeBus-0.7.0-windows-x64.msi -ExpectedVersion 0.7.0
 python C:\Users\17430\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py D:\MyProjects\CoWork\plugins\vibebus
 ```
 
@@ -39,7 +41,11 @@ Covered behaviors:
 - CLI end-to-end subscription/handoff, message/thread lifecycle, and retention plan/apply flows;
 - MCP initialize negotiation, expanded tool listing, stored registration, no-token inbox access, vault-backed recovery, credential deletion, and rejection after deletion.
 
-The suite contains 27 tests: 4 CLI workflows, 19 core workflows, 3 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.6 checkout together with formatting and clippy-as-error checks.
+The suite contains 27 tests: 4 CLI workflows, 19 core workflows, 3 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.7 checkout together with formatting and clippy-as-error checks.
+
+The 0.7 release layer additionally covers Cargo/plugin version agreement, repository-owned plugin validation, pinned release tools, per-user MSI ICE validation, administrative extraction, required payload presence, extracted binary execution/version, portable/plugin archives, post-build SHA-256 checksums, and a machine-readable signed-state manifest. Production publishing is configured to fail before packaging when either signing Secret is absent.
+
+The accepted local 0.7 package is intentionally unsigned because no production certificate was placed in the workspace or process environment. Its MSI reports `NotSigned`; this verifies the PR/CI acceptance state, not the production signing path. Real certificate timestamping and final install/uninstall on a disposable Windows user profile remain maintainer release acceptance items.
 
 ## Plugin checks
 
@@ -47,8 +53,20 @@ The suite contains 27 tests: 4 CLI workflows, 19 core workflows, 3 credential-va
 - `.mcp.json` launches `./bin/vibebus.exe mcp` from the plugin root.
 - SessionStart is read-only and requires normal Codex hook trust review.
 - The Skill states the root, `storeCredentials=true`, vault-status and failure-fallback handling, snapshot, message close lifecycle, task/thread association, retention preview/backup/confirmation discipline, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
-- `vibebus@vibebus-local` is installed and enabled as version 0.6.0 in the local Codex plugin cache.
-- The installed binary reports `vibebus 0.6.0` and matches the packaged SHA-256 `05285bc945e1b597d14e81ad1535d189a47f6587a3a8e1582f8417bfb2786b3b`.
+- `vibebus@vibebus-local` is installed and enabled as version 0.7.0 in the local Codex plugin cache.
+- The installed binary reports `vibebus 0.7.0` and matches the packaged SHA-256 `1b88dcfd25b0ee1d28f6356aace4b75138d97b4ed060fab9a22490c8c5e24c0a`.
+
+## Release package acceptance
+
+The accepted unsigned local artifacts are:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `VibeBus-0.7.0-windows-x64.msi` | 2,007,040 | `012078439077732439ed064a804b9f6fe7cd98fc60761f9acf2dcaf433c15901` |
+| `VibeBus-0.7.0-windows-x64.zip` | 2,622,201 | `a749d2cde07be7de96456820fdb30ae02bd76415877b3a564abe9536505b553e` |
+| `VibeBus-Codex-plugin-0.7.0.zip` | 2,616,579 | `11ad799e3ed17046192fd47dcf763bb769c2b5ccce963a56bcf30ec474d0491a` |
+
+The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, seven critical payload paths are present, and the extracted binary reports 0.7.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
 
 ## Live project migration
 

@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+    timeout-minutes: 40
+    environment: release
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      VIBEBUS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+      VIBEBUS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+      VIBEBUS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup show active-toolchain
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 6.0.x
+
+      - name: Verify tag and source versions
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw "Release tag must match vX.Y.Z."
+          }
+          $version = $Matches.version
+          $cargoText = Get-Content -Raw -LiteralPath Cargo.toml
+          $cargoVersion = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"').Groups['version'].Value
+          $pluginVersion = (Get-Content -Raw -LiteralPath plugins/vibebus/.codex-plugin/plugin.json | ConvertFrom-Json).version
+          if ($version -ne $cargoVersion -or $version -ne $pluginVersion) {
+            throw "Tag, Cargo, and plugin versions must match (tag=$version cargo=$cargoVersion plugin=$pluginVersion)."
+          }
+          "VIBEBUS_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run release gates
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Build release assets
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VIBEBUS_SIGNING_CERTIFICATE_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:VIBEBUS_SIGNING_CERTIFICATE_PASSWORD)) {
+            throw "Production releases require both Windows signing secrets. CI remains available for unsigned package validation."
+          }
+          ./scripts/build-release.ps1 -Version $env:VIBEBUS_VERSION -Sign
+
+      - name: Validate MSI and extracted payload
+        shell: pwsh
+        run: |
+          $msiFiles = @(Get-ChildItem -LiteralPath dist -Filter "VibeBus-*-windows-x64.msi")
+          if ($msiFiles.Count -ne 1) {
+            throw "Expected exactly one MSI, found $($msiFiles.Count)."
+          }
+          $msi = $msiFiles[0]
+          ./scripts/test-installer.ps1 -MsiPath $msi.FullName -ExpectedVersion $env:VIBEBUS_VERSION
+
+      - name: Upload workflow assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: vibebus-${{ env.VIBEBUS_VERSION }}-windows
+          path: |
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
+            dist/release-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $assets = Get-ChildItem -LiteralPath dist -File | Where-Object {
+            $_.Extension -in @('.msi', '.zip') -or $_.Name -in @('SHA256SUMS.txt', 'release-manifest.json')
+          }
+          if ($assets.Count -lt 5) {
+            throw "Expected five release assets, found $($assets.Count)."
+          }
+          $releaseArguments = @("release", "create", $env:RELEASE_TAG)
+          $releaseArguments += $assets.FullName
+          $releaseArguments += @("--verify-tag", "--generate-notes", "--title", "VibeBus $env:VIBEBUS_VERSION")
+          & gh @releaseArguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub release publication failed with exit code $LASTEXITCODE."
+          }

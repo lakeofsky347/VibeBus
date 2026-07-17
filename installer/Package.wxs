@@ -1,0 +1,116 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="VibeBus"
+    Manufacturer="VibeBus Contributors"
+    Version="$(var.Version)"
+    Language="1033"
+    Scope="perUser"
+    InstallerVersion="500"
+    Compressed="yes"
+    UpgradeCode="{08BC19E4-1338-4A55-B3D5-F4D9D8B5968C}">
+
+    <SummaryInformation Description="VibeBus local coordination bus and Codex plugin" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of VibeBus is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPHELPLINK" Value="https://github.com/lakeofsky347/VibeBus" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/lakeofsky347/VibeBus" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="VibeBus">
+          <Directory Id="MarketplaceMetadataFolder" Name=".agents">
+            <Directory Id="MarketplacePluginsFolder" Name="plugins" />
+          </Directory>
+          <Directory Id="PluginsFolder" Name="plugins">
+            <Directory Id="PluginFolder" Name="vibebus">
+              <Directory Id="PluginManifestFolder" Name=".codex-plugin" />
+              <Directory Id="PluginBinFolder" Name="bin" />
+              <Directory Id="PluginHooksFolder" Name="hooks" />
+              <Directory Id="PluginScriptsFolder" Name="scripts" />
+              <Directory Id="PluginSkillsFolder" Name="skills">
+                <Directory Id="CoordinationSkillFolder" Name="vibebus-coordination" />
+              </Directory>
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="VibeBus" Level="1">
+      <ComponentRef Id="RootLicenseFile" />
+      <ComponentRef Id="RootReadmeFile" />
+      <ComponentRef Id="MarketplaceFiles" />
+      <ComponentRef Id="PluginMcpFile" />
+      <ComponentRef Id="PluginReadmeFile" />
+      <ComponentRef Id="PluginManifestFiles" />
+      <ComponentRef Id="PluginBinaryFiles" />
+      <ComponentRef Id="PluginHookFiles" />
+      <ComponentRef Id="PluginScriptFiles" />
+      <ComponentRef Id="PluginSkillFiles" />
+    </Feature>
+
+    <Component Id="RootLicenseFile" Directory="INSTALLFOLDER" Guid="{4BE87F66-F952-4CAA-B0E6-F4D47E784AC6}">
+      <File Id="RootLicense" Source="$(var.PayloadRoot)\LICENSE" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="RootLicense" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+      <RemoveFolder Id="RemoveCoordinationSkillFolder" Directory="CoordinationSkillFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginSkillsFolder" Directory="PluginSkillsFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginScriptsFolder" Directory="PluginScriptsFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginHooksFolder" Directory="PluginHooksFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginBinFolder" Directory="PluginBinFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginManifestFolder" Directory="PluginManifestFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginFolder" Directory="PluginFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginsFolder" Directory="PluginsFolder" On="uninstall" />
+      <RemoveFolder Id="RemoveMarketplacePluginsFolder" Directory="MarketplacePluginsFolder" On="uninstall" />
+      <RemoveFolder Id="RemoveMarketplaceMetadataFolder" Directory="MarketplaceMetadataFolder" On="uninstall" />
+      <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+    </Component>
+
+    <Component Id="RootReadmeFile" Directory="INSTALLFOLDER" Guid="{674248DC-E1DE-4538-AAD3-33C964510A98}">
+      <File Id="RootReadme" Source="$(var.PayloadRoot)\README.md" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="RootReadme" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="MarketplaceFiles" Directory="MarketplacePluginsFolder" Guid="{2FDD2480-5817-4B5F-B684-D6BAC06FE12D}">
+      <File Id="MarketplaceManifest" Source="$(var.PayloadRoot)\.agents\plugins\marketplace.json" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="MarketplaceManifest" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginMcpFile" Directory="PluginFolder" Guid="{47EE769B-EDFF-4388-97BD-1135BFAC9903}">
+      <File Id="PluginMcpConfiguration" Source="$(var.PayloadRoot)\plugins\vibebus\.mcp.json" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="PluginMcpConfiguration" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginReadmeFile" Directory="PluginFolder" Guid="{98B47D05-2FE6-4DA2-8A73-3903EBA80007}">
+      <File Id="PluginReadme" Source="$(var.PayloadRoot)\plugins\vibebus\README.md" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="PluginReadme" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginManifestFiles" Directory="PluginManifestFolder" Guid="{243D84B5-AEC1-4A1F-A5BF-08E49891E226}">
+      <File Id="PluginManifest" Source="$(var.PayloadRoot)\plugins\vibebus\.codex-plugin\plugin.json" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="PluginManifest" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginBinaryFiles" Directory="PluginBinFolder" Guid="{BF34AEE2-74F5-4A83-A7B9-7550F89FA85F}">
+      <File Id="VibeBusExecutable" Source="$(var.PayloadRoot)\plugins\vibebus\bin\vibebus.exe" />
+      <Environment Id="VibeBusPath" Name="PATH" Value="[PluginBinFolder]" Action="set" Part="last" System="no" Permanent="no" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="PluginBinary" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginHookFiles" Directory="PluginHooksFolder" Guid="{DF81CE84-1D50-488F-9F4D-9B5051F46D58}">
+      <File Id="PluginHooks" Source="$(var.PayloadRoot)\plugins\vibebus\hooks\hooks.json" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="PluginHooks" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginScriptFiles" Directory="PluginScriptsFolder" Guid="{B2259671-5E49-4291-A024-050895714A4F}">
+      <File Id="SessionStartScript" Source="$(var.PayloadRoot)\plugins\vibebus\scripts\session-start.ps1" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="SessionStartScript" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginSkillFiles" Directory="CoordinationSkillFolder" Guid="{EC0BBC06-8632-450F-A998-6B4F9522AC8C}">
+      <File Id="CoordinationSkill" Source="$(var.PayloadRoot)\plugins\vibebus\skills\vibebus-coordination\SKILL.md" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="CoordinationSkill" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>
