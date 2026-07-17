@@ -1,0 +1,25 @@
+{
+  "name": "vibebus",
+  "version": "0.2.0",
+  "description": "Project-scoped coordination for independent Codex tasks.",
+  "author": {
+    "name": "VibeBus Contributors"
+  },
+  "license": "MIT",
+  "keywords": ["codex", "coordination", "tasks", "sqlite"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "VibeBus",
+    "shortDescription": "Coordinate independent Codex tasks",
+    "longDescription": "Use a local SQLite fact bus for recoverable agents, directed messages, acknowledgements, atomically claimed tasks, renewable file reservations, event subscriptions, and structured handoffs across independent Codex tasks.",
+    "developerName": "VibeBus Contributors",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Register this task with VibeBus and check its inbox.",
+      "Use VibeBus to coordinate this work with the other project tasks."
+    ],
+    "brandColor": "#4F7CAC"
+  },
+  "mcpServers": "./.mcp.json"
+}

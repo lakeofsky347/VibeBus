@@ -1,0 +1,7 @@
+/.tools/
+/target/
+/.vibebus-local/
+/backups/
+*.db
+*.db-shm
+*.db-wal

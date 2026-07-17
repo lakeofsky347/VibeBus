@@ -1,0 +1,20 @@
+{
+  "name": "vibebus-local",
+  "interface": {
+    "displayName": "VibeBus Local"
+  },
+  "plugins": [
+    {
+      "name": "vibebus",
+      "source": {
+        "source": "local",
+        "path": "./plugins/vibebus"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
