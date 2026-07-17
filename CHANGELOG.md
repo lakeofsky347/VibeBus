@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 - 2026-07-17
+
+- Added recipient-owned message closing with an ACK-before-close rule for acknowledgement-required messages.
+- Hid closed messages from normal inbox reads while retaining explicit history access.
+- Added owner-scoped, retry-safe task-to-Codex-thread bindings with active-binding uniqueness.
+- Automatically unbound active task/thread associations when tasks become completed or abandoned.
+- Added schema-v7 binding history and message receipt lifecycle fields.
+- Expanded CLI, MCP, status, handoff snapshot, migration, concurrency, and terminal-state coverage.
+
 ## 0.3.0 - 2026-07-17
 
 - Added replay-safe subscription peek with one persistent pending delivery per subscription.

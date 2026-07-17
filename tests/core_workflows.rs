@@ -88,6 +88,103 @@ fn directed_messages_are_isolated_and_acknowledged() {
 }
 
 #[test]
+fn messages_require_ack_before_close_and_closed_items_are_hidden_by_default() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let sender = bus.register_agent("closer-sender", "coordination").unwrap();
+    let recipient = bus
+        .register_agent("closer-recipient", "implementation")
+        .unwrap();
+    let unrelated = bus.register_agent("closer-other", "review").unwrap();
+
+    let required = bus
+        .send_message(
+            "closer-sender",
+            &sender.token,
+            std::slice::from_ref(&recipient.name),
+            "Approval needed",
+            "Acknowledge before closing",
+            Some("close/001"),
+            "high",
+            true,
+        )
+        .unwrap();
+    assert!(matches!(
+        bus.close_message("closer-recipient", &recipient.token, &required.message_id),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.close_message("closer-other", &unrelated.token, &required.message_id),
+        Err(BusError::Unauthorized(_))
+    ));
+
+    let acknowledged = bus
+        .acknowledge_message("closer-recipient", &recipient.token, &required.message_id)
+        .unwrap();
+    assert!(acknowledged.ack_at.is_some());
+    let closed = bus
+        .close_message("closer-recipient", &recipient.token, &required.message_id)
+        .unwrap();
+    assert!(closed.closed_at.is_some());
+    let closed_retry = bus
+        .close_message("closer-recipient", &recipient.token, &required.message_id)
+        .unwrap();
+    assert_eq!(closed.closed_at, closed_retry.closed_at);
+    assert!(matches!(
+        bus.mark_read("closer-recipient", &recipient.token, &required.message_id),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.acknowledge_message("closer-recipient", &recipient.token, &required.message_id),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(
+        bus.inbox("closer-recipient", &recipient.token, false)
+            .unwrap()
+            .is_empty()
+    );
+    let including_closed = bus
+        .inbox_with_options("closer-recipient", &recipient.token, false, true)
+        .unwrap();
+    assert_eq!(including_closed.len(), 1);
+    assert_eq!(including_closed[0].closed_at, closed.closed_at);
+
+    let informational = bus
+        .send_message(
+            "closer-sender",
+            &sender.token,
+            std::slice::from_ref(&recipient.name),
+            "For information",
+            "No acknowledgement required",
+            None,
+            "normal",
+            false,
+        )
+        .unwrap();
+    let informational_closed = bus
+        .close_message(
+            "closer-recipient",
+            &recipient.token,
+            &informational.message_id,
+        )
+        .unwrap();
+    assert!(informational_closed.closed_at.is_some());
+    assert_eq!(
+        informational_closed.read_at,
+        informational_closed.closed_at.unwrap()
+    );
+
+    let closed_events = bus
+        .list_events(0, 100, &["message_closed".to_owned()])
+        .unwrap();
+    assert_eq!(
+        closed_events.len(),
+        2,
+        "close retries must not duplicate events"
+    );
+}
+
+#[test]
 fn task_dependencies_versions_and_unlocking_are_enforced() {
     let harness = Harness::new();
     let mut bus = harness.bus();
@@ -171,6 +268,143 @@ fn task_dependencies_versions_and_unlocking_are_enforced() {
         None,
     );
     assert!(matches!(stale, Err(BusError::Conflict(_))));
+}
+
+#[test]
+fn task_thread_bindings_are_owner_scoped_idempotent_and_terminal_safe() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let owner = bus
+        .register_agent("thread-owner", "implementation")
+        .unwrap();
+    let other = bus.register_agent("thread-other", "review").unwrap();
+    bus.create_task(
+        "thread-owner",
+        &owner.token,
+        "THREAD-001",
+        "Exercise thread binding",
+        None,
+        &[],
+    )
+    .unwrap();
+    let claimed = bus
+        .claim_task("thread-owner", &owner.token, "THREAD-001")
+        .unwrap();
+
+    assert!(matches!(
+        bus.bind_task_thread("thread-other", &other.token, "THREAD-001", "codex:other"),
+        Err(BusError::Unauthorized(_))
+    ));
+    assert!(matches!(
+        bus.bind_task_thread("thread-owner", &owner.token, "THREAD-001", "bad thread id"),
+        Err(BusError::Validation(_))
+    ));
+    let first = bus
+        .bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    let first_retry = bus
+        .bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    assert_eq!(first.binding_id, first_retry.binding_id);
+    assert!(matches!(
+        bus.bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-2"),
+        Err(BusError::Conflict(_))
+    ));
+    let snapshot = bus
+        .handoff_snapshot("thread-owner", &owner.token, 0)
+        .unwrap();
+    assert_eq!(snapshot.task_thread_bindings.len(), 1);
+
+    let unbound = bus
+        .unbind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    let unbound_retry = bus
+        .unbind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    assert_eq!(unbound.binding_id, unbound_retry.binding_id);
+    assert_eq!(unbound.unbound_at, unbound_retry.unbound_at);
+    let second = bus
+        .bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-2")
+        .unwrap();
+    assert_ne!(first.binding_id, second.binding_id);
+
+    let working = bus
+        .update_task(
+            "thread-owner",
+            &owner.token,
+            "THREAD-001",
+            claimed.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    bus.update_task(
+        "thread-owner",
+        &owner.token,
+        "THREAD-001",
+        working.version,
+        "completed",
+        None,
+    )
+    .unwrap();
+    assert!(
+        bus.list_task_thread_bindings(None, true)
+            .unwrap()
+            .is_empty()
+    );
+    let history = bus
+        .list_task_thread_bindings(Some("THREAD-001"), false)
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|binding| binding.unbound_at.is_some()));
+    assert!(matches!(
+        bus.bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-3"),
+        Err(BusError::Conflict(_))
+    ));
+}
+
+#[test]
+fn concurrent_thread_binding_allows_exactly_one_winner() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let owner = bus
+        .register_agent("thread-racer", "implementation")
+        .unwrap();
+    bus.create_task(
+        "thread-racer",
+        &owner.token,
+        "THREAD-RACE",
+        "Bind once",
+        None,
+        &[],
+    )
+    .unwrap();
+    bus.claim_task("thread-racer", &owner.token, "THREAD-RACE")
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = ["codex:race-a", "codex:race-b"]
+        .into_iter()
+        .map(|thread_id| {
+            let root = harness.project.path().to_path_buf();
+            let data = harness.data.path().to_path_buf();
+            let token = owner.token.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.bind_task_thread("thread-racer", &token, "THREAD-RACE", thread_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(bus.list_task_thread_bindings(None, true).unwrap().len(), 1);
 }
 
 #[test]
@@ -397,7 +631,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 6);
+    assert_eq!(doctor.schema_version, 7);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -496,6 +730,14 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
                 created_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL,
                 UNIQUE(project_id, name)
+             );
+             CREATE TABLE message_receipts (
+                message_id TEXT NOT NULL,
+                recipient_agent_id TEXT NOT NULL,
+                delivered_at INTEGER NOT NULL,
+                read_at INTEGER,
+                ack_at INTEGER,
+                PRIMARY KEY(message_id, recipient_agent_id)
              );",
         )
         .unwrap();
@@ -512,6 +754,14 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
         .unwrap();
     assert!(columns.contains(&"recovery_hash".to_owned()));
     assert!(columns.contains(&"token_generation".to_owned()));
+    let receipt_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(message_receipts)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(receipt_columns.contains(&"closed_at".to_owned()));
     let subscription_columns: Vec<String> = connection
         .prepare("PRAGMA table_info(subscriptions)")
         .unwrap()
@@ -526,6 +776,15 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
     assert!(subscription_columns.contains(&"last_acked_delivery_id".to_owned()));
     assert!(subscription_columns.contains(&"last_acked_through_sequence".to_owned()));
     assert!(subscription_columns.contains(&"last_acked_at".to_owned()));
+    let thread_binding_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(task_thread_bindings)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(thread_binding_columns.contains(&"thread_id".to_owned()));
+    assert!(thread_binding_columns.contains(&"unbound_at".to_owned()));
 }
 
 #[test]

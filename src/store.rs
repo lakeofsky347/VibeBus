@@ -17,11 +17,11 @@ use crate::models::{
     AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, DoctorReport, EventView,
     HandoffSnapshot, MessageReceipt, MessageView, ProjectMetadata, RecoveryKeyView, ReleaseResult,
     ReservationView, SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll,
-    SubscriptionView, TaskView,
+    SubscriptionView, TaskThreadBindingView, TaskView,
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const TASK_STATUSES: &[&str] = &[
     "pending",
     "ready",
@@ -37,6 +37,13 @@ const TASK_STATUSES: &[&str] = &[
 struct AuthenticatedAgent {
     id: String,
     name: String,
+}
+
+struct ReceiptLifecycle {
+    requires_ack: bool,
+    read_at: Option<i64>,
+    ack_at: Option<i64>,
+    closed_at: Option<i64>,
 }
 
 struct TaskRecord {
@@ -371,6 +378,9 @@ impl Bus {
                 "unsupported priority '{priority}'"
             )));
         }
+        if let Some(thread_id) = thread_id {
+            validate_thread_id(thread_id)?;
+        }
         let request_hash = idempotency_key
             .map(|key| {
                 validate_idempotency_key(key)?;
@@ -462,6 +472,7 @@ impl Bus {
             created_at: now,
             read_at: None,
             ack_at: None,
+            closed_at: None,
         };
         if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
             store_idempotent(
@@ -493,28 +504,34 @@ impl Bus {
     }
 
     pub fn inbox(&self, agent: &str, token: &str, unread_only: bool) -> Result<Vec<MessageView>> {
+        self.inbox_with_options(agent, token, unread_only, false)
+    }
+
+    pub fn inbox_with_options(
+        &self,
+        agent: &str,
+        token: &str,
+        unread_only: bool,
+        include_closed: bool,
+    ) -> Result<Vec<MessageView>> {
         let recipient = self.authenticate(agent, token)?;
-        let sql = if unread_only {
+        let mut statement = self.conn.prepare(
             "SELECT m.id, sender.name, recipient.name, m.thread_id, m.priority,
-                    m.subject, m.body, m.requires_ack, m.created_at, r.read_at, r.ack_at
-             FROM message_receipts r
-             JOIN messages m ON m.id = r.message_id
-             JOIN agents sender ON sender.id = m.sender_agent_id
-             JOIN agents recipient ON recipient.id = r.recipient_agent_id
-             WHERE r.recipient_agent_id = ?1 AND r.read_at IS NULL
-             ORDER BY m.created_at DESC"
-        } else {
-            "SELECT m.id, sender.name, recipient.name, m.thread_id, m.priority,
-                    m.subject, m.body, m.requires_ack, m.created_at, r.read_at, r.ack_at
+                    m.subject, m.body, m.requires_ack, m.created_at, r.read_at, r.ack_at,
+                    r.closed_at
              FROM message_receipts r
              JOIN messages m ON m.id = r.message_id
              JOIN agents sender ON sender.id = m.sender_agent_id
              JOIN agents recipient ON recipient.id = r.recipient_agent_id
              WHERE r.recipient_agent_id = ?1
-             ORDER BY m.created_at DESC"
-        };
-        let mut statement = self.conn.prepare(sql)?;
-        let rows = statement.query_map(params![recipient.id], map_message)?;
+               AND (?2 = 0 OR r.read_at IS NULL)
+               AND (?3 = 1 OR r.closed_at IS NULL)
+             ORDER BY m.created_at DESC",
+        )?;
+        let rows = statement.query_map(
+            params![recipient.id, unread_only as i64, include_closed as i64],
+            map_message,
+        )?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -534,6 +551,85 @@ impl Bus {
         message_id: &str,
     ) -> Result<MessageReceipt> {
         self.update_receipt(agent, token, message_id, true)
+    }
+
+    pub fn close_message(
+        &mut self,
+        agent: &str,
+        token: &str,
+        message_id: &str,
+    ) -> Result<MessageReceipt> {
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<ReceiptLifecycle> = tx
+            .query_row(
+                "SELECT m.requires_ack, r.read_at, r.ack_at, r.closed_at
+                 FROM message_receipts r
+                 JOIN messages m ON m.id = r.message_id
+                 WHERE r.message_id = ?1 AND r.recipient_agent_id = ?2",
+                params![message_id, actor.id],
+                |row| {
+                    Ok(ReceiptLifecycle {
+                        requires_ack: row.get(0)?,
+                        read_at: row.get(1)?,
+                        ack_at: row.get(2)?,
+                        closed_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        let current = current.ok_or_else(|| {
+            BusError::Unauthorized(format!(
+                "message '{message_id}' is not addressed to agent '{}'",
+                actor.name
+            ))
+        })?;
+        if let Some(closed_at) = current.closed_at {
+            tx.commit()?;
+            return Ok(MessageReceipt {
+                message_id: message_id.to_owned(),
+                recipient: actor.name,
+                read_at: current.read_at.unwrap_or(closed_at),
+                ack_at: current.ack_at,
+                closed_at: Some(closed_at),
+            });
+        }
+        if current.requires_ack && current.ack_at.is_none() {
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' requires ACK before it can be closed"
+            )));
+        }
+        let changed = tx.execute(
+            "UPDATE message_receipts
+             SET read_at = COALESCE(read_at, ?1), closed_at = ?1
+             WHERE message_id = ?2 AND recipient_agent_id = ?3 AND closed_at IS NULL",
+            params![now, message_id, actor.id],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' was closed concurrently"
+            )));
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "message_closed",
+            "message",
+            message_id,
+            json!({"agent": actor.name, "at": now}),
+        )?;
+        tx.commit()?;
+        Ok(MessageReceipt {
+            message_id: message_id.to_owned(),
+            recipient: actor.name,
+            read_at: current.read_at.unwrap_or(now),
+            ack_at: current.ack_at,
+            closed_at: Some(now),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -740,6 +836,15 @@ impl Bus {
         if status == "completed" {
             unlock_ready_tasks(&tx, &self.project.project_id, now)?;
         }
+        let thread_bindings_closed = if matches!(status, "completed" | "abandoned") {
+            tx.execute(
+                "UPDATE task_thread_bindings SET unbound_at = ?1
+                 WHERE project_id = ?2 AND task_id = ?3 AND unbound_at IS NULL",
+                params![now, self.project.project_id, task_id],
+            )?
+        } else {
+            0
+        };
         append_event(
             &tx,
             &self.project.project_id,
@@ -754,7 +859,8 @@ impl Bus {
             json!({
                 "status": status,
                 "blockedReason": blocked_reason,
-                "previousVersion": expected_version
+                "previousVersion": expected_version,
+                "threadBindingsClosed": thread_bindings_closed
             }),
         )?;
         tx.commit()?;
@@ -813,6 +919,169 @@ impl Bus {
             .iter()
             .map(|task_id| self.get_task(task_id))
             .collect()
+    }
+
+    pub fn bind_task_thread(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        thread_id: &str,
+    ) -> Result<TaskThreadBindingView> {
+        validate_task_id(task_id)?;
+        validate_thread_id(thread_id)?;
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_task_owner(&tx, &self.project.project_id, task_id, &actor, false)?;
+        let existing: Option<TaskThreadBindingView> = tx
+            .query_row(
+                "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+                 FROM task_thread_bindings b
+                 JOIN agents owner ON owner.id = b.agent_id
+                 WHERE b.project_id = ?1 AND b.task_id = ?2 AND b.unbound_at IS NULL",
+                params![self.project.project_id, task_id],
+                map_task_thread_binding,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.thread_id == thread_id {
+                tx.commit()?;
+                return Ok(existing);
+            }
+            return Err(BusError::Conflict(format!(
+                "task '{task_id}' is already bound to thread '{}'",
+                existing.thread_id
+            )));
+        }
+        let binding = TaskThreadBindingView {
+            binding_id: format!("tbd_{}", Uuid::new_v4().simple()),
+            task_id: task_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            agent: actor.name.clone(),
+            bound_at: now,
+            unbound_at: None,
+        };
+        tx.execute(
+            "INSERT INTO task_thread_bindings
+             (id, project_id, task_id, thread_id, agent_id, bound_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                binding.binding_id,
+                self.project.project_id,
+                task_id,
+                thread_id,
+                actor.id,
+                now
+            ],
+        )?;
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "task_thread_bound",
+            "task_thread_binding",
+            &binding.binding_id,
+            json!({"taskId": task_id, "threadId": thread_id}),
+        )?;
+        tx.commit()?;
+        Ok(binding)
+    }
+
+    pub fn unbind_task_thread(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        thread_id: &str,
+    ) -> Result<TaskThreadBindingView> {
+        validate_task_id(task_id)?;
+        validate_thread_id(thread_id)?;
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_task_owner(&tx, &self.project.project_id, task_id, &actor, true)?;
+        let active: Option<TaskThreadBindingView> = tx
+            .query_row(
+                "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+                 FROM task_thread_bindings b
+                 JOIN agents owner ON owner.id = b.agent_id
+                 WHERE b.project_id = ?1 AND b.task_id = ?2 AND b.thread_id = ?3
+                   AND b.unbound_at IS NULL",
+                params![self.project.project_id, task_id, thread_id],
+                map_task_thread_binding,
+            )
+            .optional()?;
+        let Some(mut binding) = active else {
+            let previous = tx
+                .query_row(
+                    "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+                     FROM task_thread_bindings b
+                     JOIN agents owner ON owner.id = b.agent_id
+                     WHERE b.project_id = ?1 AND b.task_id = ?2 AND b.thread_id = ?3
+                       AND b.agent_id = ?4 AND b.unbound_at IS NOT NULL
+                     ORDER BY b.unbound_at DESC LIMIT 1",
+                    params![self.project.project_id, task_id, thread_id, actor.id],
+                    map_task_thread_binding,
+                )
+                .optional()?;
+            tx.commit()?;
+            return previous.ok_or_else(|| {
+                BusError::Conflict(format!(
+                    "task '{task_id}' has no active binding to thread '{thread_id}'"
+                ))
+            });
+        };
+        let changed = tx.execute(
+            "UPDATE task_thread_bindings SET unbound_at = ?1
+             WHERE project_id = ?2 AND id = ?3 AND unbound_at IS NULL",
+            params![now, self.project.project_id, binding.binding_id],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(format!(
+                "task '{task_id}' thread binding changed concurrently"
+            )));
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "task_thread_unbound",
+            "task_thread_binding",
+            &binding.binding_id,
+            json!({"taskId": task_id, "threadId": thread_id}),
+        )?;
+        tx.commit()?;
+        binding.unbound_at = Some(now);
+        Ok(binding)
+    }
+
+    pub fn list_task_thread_bindings(
+        &self,
+        task_id: Option<&str>,
+        active_only: bool,
+    ) -> Result<Vec<TaskThreadBindingView>> {
+        if let Some(task_id) = task_id {
+            validate_task_id(task_id)?;
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+             FROM task_thread_bindings b
+             JOIN agents owner ON owner.id = b.agent_id
+             WHERE b.project_id = ?1
+               AND (?2 IS NULL OR b.task_id = ?2)
+               AND (?3 = 0 OR b.unbound_at IS NULL)
+             ORDER BY b.bound_at DESC, b.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, task_id, active_only as i64],
+            map_task_thread_binding,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn reserve_path(
@@ -1754,6 +2023,11 @@ impl Bus {
             .into_iter()
             .filter(|reservation| reservation.owner == agent)
             .collect();
+        let task_thread_bindings = self
+            .list_task_thread_bindings(None, true)?
+            .into_iter()
+            .filter(|binding| binding.agent == agent)
+            .collect();
         let recent_artifacts = self
             .list_artifacts(None)?
             .into_iter()
@@ -1767,6 +2041,7 @@ impl Bus {
             unread_messages,
             owned_tasks,
             active_reservations,
+            task_thread_bindings,
             recent_artifacts,
             recent_events,
             latest_event_sequence,
@@ -1872,6 +2147,37 @@ impl Bus {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(Option<i64>, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT read_at, ack_at, closed_at FROM message_receipts
+                 WHERE message_id = ?1 AND recipient_agent_id = ?2",
+                params![message_id, actor.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (read_at, ack_at, closed_at) = current.ok_or_else(|| {
+            BusError::Unauthorized(format!(
+                "message '{message_id}' is not addressed to agent '{}'",
+                actor.name
+            ))
+        })?;
+        if closed_at.is_some() {
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' is already closed"
+            )));
+        }
+        if acknowledge && ack_at.is_some() || !acknowledge && read_at.is_some() {
+            tx.commit()?;
+            return Ok(MessageReceipt {
+                message_id: message_id.to_owned(),
+                recipient: actor.name,
+                read_at: read_at
+                    .or(ack_at)
+                    .expect("receipt operation has a timestamp"),
+                ack_at,
+                closed_at: None,
+            });
+        }
         let changed = if acknowledge {
             tx.execute(
                 "UPDATE message_receipts SET read_at = COALESCE(read_at, ?1), ack_at = COALESCE(ack_at, ?1)
@@ -1886,9 +2192,8 @@ impl Bus {
             )?
         };
         if changed != 1 {
-            return Err(BusError::Unauthorized(format!(
-                "message '{message_id}' is not addressed to agent '{}'",
-                actor.name
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' receipt changed concurrently"
             )));
         }
         append_event(
@@ -1904,11 +2209,11 @@ impl Bus {
             message_id,
             json!({"agent": actor.name, "at": now}),
         )?;
-        let (read_at, ack_at): (i64, Option<i64>) = tx.query_row(
-            "SELECT read_at, ack_at FROM message_receipts
+        let (read_at, ack_at, closed_at): (i64, Option<i64>, Option<i64>) = tx.query_row(
+            "SELECT read_at, ack_at, closed_at FROM message_receipts
              WHERE message_id = ?1 AND recipient_agent_id = ?2",
             params![message_id, actor.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         tx.commit()?;
         Ok(MessageReceipt {
@@ -1916,6 +2221,7 @@ impl Bus {
             recipient: actor.name,
             read_at,
             ack_at,
+            closed_at,
         })
     }
 
@@ -2027,6 +2333,17 @@ impl Bus {
                 FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
                 FOREIGN KEY(project_id, depends_on_task_id) REFERENCES tasks(project_id, id)
              );
+             CREATE TABLE IF NOT EXISTS task_thread_bindings (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                bound_at INTEGER NOT NULL,
+                unbound_at INTEGER,
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(agent_id) REFERENCES agents(id)
+             );
              CREATE TABLE IF NOT EXISTS reservations (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -2107,6 +2424,10 @@ impl Bus {
                 ON message_receipts(recipient_agent_id, read_at);
              CREATE INDEX IF NOT EXISTS idx_tasks_status
                 ON tasks(project_id, status);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_task_thread_binding_active
+                ON task_thread_bindings(project_id, task_id) WHERE unbound_at IS NULL;
+             CREATE INDEX IF NOT EXISTS idx_task_thread_binding_history
+                ON task_thread_bindings(project_id, thread_id, bound_at);
              CREATE INDEX IF NOT EXISTS idx_reservations_active
                 ON reservations(project_id, released_at, expires_at);
              CREATE INDEX IF NOT EXISTS idx_artifacts_task
@@ -2123,6 +2444,7 @@ impl Bus {
             "token_generation",
             "INTEGER NOT NULL DEFAULT 1",
         )?;
+        ensure_column(&self.conn, "message_receipts", "closed_at", "INTEGER")?;
         ensure_column(&self.conn, "subscriptions", "pending_delivery_id", "TEXT")?;
         ensure_column(
             &self.conn,
@@ -2182,6 +2504,18 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         created_at: row.get(8)?,
         read_at: row.get(9)?,
         ack_at: row.get(10)?,
+        closed_at: row.get(11)?,
+    })
+}
+
+fn map_task_thread_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskThreadBindingView> {
+    Ok(TaskThreadBindingView {
+        binding_id: row.get(0)?,
+        task_id: row.get(1)?,
+        thread_id: row.get(2)?,
+        agent: row.get(3)?,
+        bound_at: row.get(4)?,
+        unbound_at: row.get(5)?,
     })
 }
 
@@ -2510,6 +2844,36 @@ fn dependencies_complete(
     Ok(true)
 }
 
+fn require_task_owner(
+    connection: &Connection,
+    project_id: &str,
+    task_id: &str,
+    actor: &AuthenticatedAgent,
+    allow_terminal: bool,
+) -> Result<String> {
+    let current: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT status, owner_agent_id FROM tasks WHERE project_id = ?1 AND id = ?2",
+            params![project_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (status, owner_agent_id) =
+        current.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+    if owner_agent_id.as_deref() != Some(actor.id.as_str()) {
+        return Err(BusError::Unauthorized(format!(
+            "agent '{}' must own task '{task_id}' to manage its thread binding",
+            actor.name
+        )));
+    }
+    if !allow_terminal && matches!(status.as_str(), "completed" | "abandoned") {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot be bound to a thread"
+        )));
+    }
+    Ok(status)
+}
+
 fn unlock_ready_tasks(tx: &Transaction<'_>, project_id: &str, now: i64) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET status = 'ready', version = version + 1, updated_at = ?1
@@ -2552,6 +2916,21 @@ fn validate_task_id(task_id: &str) -> Result<()> {
     } else {
         Err(BusError::Validation(
             "task id must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
+        ))
+    }
+}
+
+fn validate_thread_id(thread_id: &str) -> Result<()> {
+    let valid = !thread_id.is_empty()
+        && thread_id.len() <= 128
+        && thread_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "thread id must be 1-128 ASCII letters, digits, '-', '_', '.', ':' or '/'".into(),
         ))
     }
 }

@@ -11,7 +11,7 @@ try {
             $context = @(
                 "VibeBus project '$($project.name)' is active at '$cursor'."
                 "For every VibeBus MCP call, pass root='$cursor'."
-                "Register this independent task once, retain its returned token and recovery key privately, then use a handoff snapshot or inbox check at turn boundaries. Atomically claim tasks before work, reserve precise project-relative paths before editing, use idempotency keys for retried writes, and prefer replay-safe subscription peek/ack over legacy consume-on-poll."
+                "Register this independent task once, retain its returned token and recovery key privately, then use a handoff snapshot or inbox check at turn boundaries. Atomically claim tasks before work, bind a claimed task to the real Codex task ID when available, reserve precise project-relative paths before editing, close processed messages, use idempotency keys for retried writes, and prefer replay-safe subscription peek/ack over legacy consume-on-poll."
                 "VibeBus is a durable fact bus; it does not interrupt a model that is already generating."
             ) -join " "
             @{
