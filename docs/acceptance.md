@@ -105,5 +105,5 @@ Explicit Agent credential deletion returned `deleted=true` and `stored=false`. I
 
 ## Remaining manual acceptance
 
-1. Start two new independent Codex top-level tasks in the same initialized project and verify registration/recovery-key retention, a structured handoff plus ACK, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI.
+1. Follow `docs/desktop-acceptance.md` with two new independent, user-owned Codex top-level tasks in the same initialized project; verify registration/recovery-key retention, a structured handoff plus ACK/close, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI. The deterministic fixture and copy-ready A/B prompts are prepared, but the two user-owned tasks have not yet been created.
 2. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.

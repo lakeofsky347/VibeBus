@@ -53,7 +53,7 @@ The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`,
 
 ## Recommended next slice
 
-1. Perform the two-real-task desktop acceptance recorded in `docs/acceptance.md`; plugin installation is complete, but creating user-owned top-level tasks requires explicit user action/authorization.
+1. Perform the two-real-task desktop acceptance in `docs/desktop-acceptance.md`; the deterministic fixture, evidence gates, and copy-ready A/B prompts are prepared, but creating user-owned top-level tasks still requires explicit user action/authorization.
 2. Decide separately whether the live project should ever initialize its operator capability; it intentionally remains unconfigured after the disposable acceptance and must not inherit test authority.
 3. Configure the protected `release` environment and a real Windows code-signing certificate, then execute the tag, signed asset, disposable-profile install/uninstall, and downloaded-checksum acceptance in `docs/release.md`.
 4. Only then evaluate an optional Codex thread notification bridge; keep SQLite authoritative and treat UI delivery as best effort.

@@ -105,6 +105,7 @@ MSI 安装到 `%LOCALAPPDATA%\Programs\VibeBus`，并将其中的 `plugins\vibeb
 - [方案对比与取舍](docs/design-research.md)
 - [验收记录](docs/acceptance.md)
 - [Operator 真实终端验收](docs/operator-acceptance.md)
+- [双顶层任务桌面验收](docs/desktop-acceptance.md)
 - [发布工程](docs/release.md)
 - [后续接手](docs/HANDOFF.md)
 
