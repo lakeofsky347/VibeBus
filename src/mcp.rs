@@ -448,6 +448,7 @@ impl VibeBusMcp {
             "tasks": bus.list_tasks().map_err(bus_error)?,
             "threadBindings": bus.list_task_thread_bindings(None, true).map_err(bus_error)?,
             "retention": bus.retention_state().map_err(bus_error)?,
+            "operator": bus.operator_status().map_err(bus_error)?,
             "reservations": bus.list_active_reservations().map_err(bus_error)?,
             "artifacts": bus.list_artifacts(None).map_err(bus_error)?
         }))
@@ -972,7 +973,7 @@ impl VibeBusMcp {
     }
 
     #[tool(
-        description = "Apply an unchanged retention plan; stale confirmation IDs conflict and retries are replay-safe"
+        description = "Apply an unchanged retention plan after a separate interactive CLI operator approval; stale confirmations conflict and successful retries are replay-safe"
     )]
     fn vibebus_retention_apply(
         &self,
@@ -1230,6 +1231,8 @@ fn bus_error(error: BusError) -> ErrorData {
         BusError::Validation(_)
         | BusError::Conflict(_)
         | BusError::Unauthorized(_)
+        | BusError::OperatorUnauthorized
+        | BusError::OperatorApprovalRequired(_)
         | BusError::AgentNotFound(_)
         | BusError::ProjectNotFound(_) => ErrorData::invalid_params(message, None),
         BusError::Io(_)

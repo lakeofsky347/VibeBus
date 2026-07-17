@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -5,9 +6,10 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use vibebus::{
-    Bus, BusError, CredentialVault, Result, RetentionPolicy, SecretSource, initialize_project,
-    mcp::run_mcp, recovery_delivery, recovery_key_delivery, registration_delivery,
-    resolve_agent_recovery_key, resolve_agent_token, system_credential_vault,
+    Bus, BusError, CredentialVault, Result, RetentionPolicy, SecretSource,
+    StoredOperatorCredential, initialize_project, mcp::run_mcp, operator_credential_delivery,
+    recovery_delivery, recovery_key_delivery, registration_delivery, resolve_agent_recovery_key,
+    resolve_agent_token, resolve_operator_secret, system_credential_vault,
 };
 
 #[derive(Debug, Parser)]
@@ -49,6 +51,10 @@ enum Command {
     Credential {
         #[command(subcommand)]
         command: CredentialCommand,
+    },
+    Operator {
+        #[command(subcommand)]
+        command: OperatorCommand,
     },
     Send(SendArgs),
     Inbox(AgentAuthArgs),
@@ -295,6 +301,22 @@ enum CredentialCommand {
     Delete {
         #[arg(long)]
         agent: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperatorCommand {
+    Status,
+    Init,
+    Rotate,
+    RestoreCredential,
+    ApproveRetention {
+        #[arg(long)]
+        plan: String,
+        #[arg(long, default_value_t = 600)]
+        ttl: i64,
+        #[command(flatten)]
+        policy: RetentionPolicyArgs,
     },
 }
 
@@ -581,6 +603,75 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     "deleted": deleted,
                     "credentials": vault.status(&project_id, &agent)?
                 })
+            }
+        },
+        Command::Operator { command } => match command {
+            OperatorCommand::Status => {
+                let operator = bus.operator_status()?;
+                let credential = vault.operator_status(&project_id)?;
+                let ready = operator.configured
+                    && credential.stored
+                    && operator.generation == credential.generation;
+                json!({
+                    "ready": ready,
+                    "operator": operator,
+                    "credential": credential
+                })
+            }
+            OperatorCommand::Init => {
+                require_interactive_confirmation(
+                    "Initialize the project operator credential. Type the full project ID to continue",
+                    &project_id,
+                )?;
+                let credential = bus.initialize_operator()?;
+                operator_credential_delivery(vault.as_ref(), &project_id, &credential)
+            }
+            OperatorCommand::Rotate => {
+                require_interactive_confirmation(
+                    "Rotate the project operator credential. Type rotate:<project-id> to continue",
+                    &format!("rotate:{project_id}"),
+                )?;
+                let current = resolve_operator_secret(vault.as_ref(), &project_id)?;
+                let credential = bus.rotate_operator(&current)?;
+                operator_credential_delivery(vault.as_ref(), &project_id, &credential)
+            }
+            OperatorCommand::RestoreCredential => {
+                require_interactive_confirmation(
+                    "Restore the current operator secret to the OS vault. Type restore:<project-id> to continue",
+                    &format!("restore:{project_id}"),
+                )?;
+                let secret = rpassword::prompt_password("Current operator secret: ")?;
+                let generation = bus.verify_operator_secret(&secret)?;
+                let credential = StoredOperatorCredential::new(secret, generation);
+                vault.store_operator(&project_id, &credential)?;
+                let operator = bus.operator_status()?;
+                let credential = vault.operator_status(&project_id)?;
+                json!({
+                    "restored": true,
+                    "ready": operator.generation == credential.generation,
+                    "operator": operator,
+                    "credential": credential
+                })
+            }
+            OperatorCommand::ApproveRetention { plan, ttl, policy } => {
+                let policy: RetentionPolicy = policy.into();
+                let current = bus.preview_retention_for_operator(&policy)?;
+                if current.plan_id != plan {
+                    return Err(BusError::Conflict(format!(
+                        "retention plan is stale: confirmed '{plan}', current '{}'",
+                        current.plan_id
+                    )));
+                }
+                eprintln!(
+                    "Retention candidates: {}",
+                    serde_json::to_string_pretty(&current)?
+                );
+                require_interactive_confirmation(
+                    "Approve this retention plan. Type the full plan ID to continue",
+                    &plan,
+                )?;
+                let secret = resolve_operator_secret(vault.as_ref(), &project_id)?;
+                json!(bus.approve_retention(&secret, &policy, &plan, ttl)?)
             }
         },
         Command::Send(args) => {
@@ -887,6 +978,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             "tasks": bus.list_tasks()?,
             "threadBindings": bus.list_task_thread_bindings(None, true)?,
             "retention": bus.retention_state()?,
+            "operator": bus.operator_status()?,
             "reservations": bus.list_active_reservations()?,
             "artifacts": bus.list_artifacts(None)?
         }),
@@ -929,6 +1021,28 @@ fn print_json(value: &impl Serialize) {
     );
 }
 
+fn require_interactive_confirmation(prompt: &str, expected: &str) -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(BusError::Validation(
+            "operator mutations require an interactive terminal and are unavailable through redirected input, MCP, or automation"
+                .into(),
+        ));
+    }
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "{prompt}:")?;
+    write!(stderr, "> ")?;
+    stderr.flush()?;
+    drop(stderr);
+    let mut confirmation = String::new();
+    io::stdin().read_line(&mut confirmation)?;
+    if confirmation.trim() != expected {
+        return Err(BusError::Validation(
+            "operator confirmation did not match; no mutation was performed".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn error_kind(error: &BusError) -> &'static str {
     match error {
         BusError::Io(_) => "io",
@@ -938,6 +1052,8 @@ fn error_kind(error: &BusError) -> &'static str {
         BusError::ProjectNotFound(_) => "project_not_found",
         BusError::AgentNotFound(_) => "agent_not_found",
         BusError::Unauthorized(_) => "unauthorized",
+        BusError::OperatorUnauthorized => "operator_unauthorized",
+        BusError::OperatorApprovalRequired(_) => "operator_approval_required",
         BusError::Conflict(_) => "conflict",
         BusError::Validation(_) => "validation",
     }

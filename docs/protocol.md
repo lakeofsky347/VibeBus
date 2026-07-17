@@ -12,6 +12,10 @@ All times are Unix milliseconds. CLI responses are JSON. MCP tools return format
 | Rotate/provision recovery key | `agent provision-recovery` | `vibebus_recovery_provision` |
 | Inspect credential vault | `credential status` | `vibebus_credential_status` |
 | Delete credential entry | `credential delete` | `vibebus_credential_delete` |
+| Inspect operator readiness | `operator status` | Project status only |
+| Initialize operator credential | `operator init` | Deliberately unavailable |
+| Rotate operator credential | `operator rotate` | Deliberately unavailable |
+| Restore operator vault entry | `operator restore-credential` | Deliberately unavailable |
 | List agents | `agents` | `vibebus_agents` |
 | Project snapshot | `status` | `vibebus_status` |
 | Integrity check | `doctor` | `vibebus_doctor` |
@@ -22,6 +26,8 @@ Registration returns both a bearer token and a recovery key in plaintext once by
 Recovery accepts an explicit recovery key or loads it from the matching vault entry, revokes both old secrets, increments `tokenGeneration`, and produces a fresh pair. Provisioning requires a current bearer token and revokes the previous recovery key without changing the bearer token. If recovery or provisioning used a vault secret, VibeBus automatically replaces the stored pair; callers can also request storage explicitly. A post-rotation vault-write failure returns the new pair with `secretsRedacted=false` and `credentialStorageError`, because hiding it would permanently strand the identity.
 
 Mutating or private reads require an Agent identity. CLI bearer resolution is `--token`, then `VIBEBUS_AGENT_TOKEN`, then the current-user vault. MCP resolution is explicit `token`, then the vault. Token fields are therefore optional only when the correct project/Agent vault entry exists. `credential status` never returns secret material. `credential delete` removes only the OS entry; it does not remove or revoke the Agent, and later no-token calls fail until credentials are stored again. MCP deletion additionally requires `confirm=true`. Same-user processes share the Windows credential trust boundary.
+
+The project operator is a separate procedural capability for destructive maintenance, not an Agent role. Its database row contains only a SHA-256 digest and generation; the secret is stored under `VibeBusOperator:<project-id>`, which cannot collide with `VibeBus:<project-id>:<agent>`. Operator mutation commands first require a real terminal and an exact typed confirmation. They are absent from MCP. Successful vault storage redacts the secret. If a post-initialize or post-rotate vault write fails, the interactive response returns the only usable secret plus `credentialStorageError`; after securing it, the maintainer repairs the entry with `operator restore-credential`, which reads the secret without echo. `operator status` reports DB/vault generation agreement as `ready` without exposing secret material.
 
 ## Messages
 
@@ -126,12 +132,15 @@ Legacy `poll` remains available for compatibility. It returns up to 500 events a
 | Capability | CLI | MCP |
 | --- | --- | --- |
 | Preview candidates | `retention plan` | `vibebus_retention_plan` |
+| Approve exact plan | `operator approve-retention` | Deliberately unavailable |
 | Apply confirmed plan | `retention apply` | `vibebus_retention_apply` |
 | Inspect history floor | `retention status` | `vibebus_retention_status` |
 
-Both preview and apply require an authenticated Agent. Defaults are 90 days for events, 1,000 recent events always retained, 30 days for idempotency records and closed messages, and 90 days for terminal task/thread binding history. Each age accepts 1–3,650 days; the recent tail accepts 1–1,000,000 events. `closedMessageMaxAgeDays` must be at least `idempotencyMaxAgeDays` so a cached send retry cannot reference a deleted message.
+Both preview and apply require an authenticated Agent. Apply additionally requires a separately authenticated operator approval. Defaults are 90 days for events, 1,000 recent events always retained, 30 days for idempotency records and closed messages, and 90 days for terminal task/thread binding history. Each age accepts 1–3,650 days; the recent tail accepts 1–1,000,000 events. `closedMessageMaxAgeDays` must be at least `idempotencyMaxAgeDays` so a cached send retry cannot reference a deleted message.
 
-Preview is read-only and returns policy, subscription protection details, exact candidate counts, and a `planId`. Apply must repeat the same custom policy values and provide that ID. Any intervening domain event, cursor change, prior cleanup, or candidate change produces a new plan ID and makes the old confirmation conflict before deletion. Concurrent or repeated application of the same successful plan returns its stored report with `replayed=true`.
+Preview is read-only and returns policy, subscription protection details, exact candidate counts, and a `planId`. A local maintainer then runs `operator approve-retention`, repeats any custom policy flags, reviews the full current plan printed to the terminal, and types the full plan ID. The approval defaults to 600 seconds, accepts 60–3,600 seconds, and is bound to the exact plan and current operator generation. It is recorded in `retention_approvals` without appending a domain event, so approval does not invalidate the plan it authorizes.
+
+Apply must repeat the same custom policy values and provide that ID. In one `BEGIN IMMEDIATE` transaction it recomputes the plan, selects one unexpired/unconsumed approval from the current operator generation, performs the bounded deletions, consumes that approval, appends the audit event, and stores the report. Any intervening domain event, cursor change, prior cleanup, candidate change, approval expiry, or operator rotation prevents a new apply. Concurrent attempts can consume the approval only once; the winner completes normally and the loser returns the stored report with `replayed=true`. A later retry of an already successful run does not require a new approval and cannot delete twice.
 
 Event candidates form one contiguous prefix that is old enough, at or below the slowest subscription cursor, and outside the recent tail. A pending replay-safe delivery keeps its committed cursor unchanged, so its complete range remains protected. Apply also removes expired idempotency records, old closed receipts, resulting receipt-less messages, and old unbound history belonging to terminal tasks. It preserves active state and appends `retention_applied` as a new audit event. The operation does not run `VACUUM`.
 

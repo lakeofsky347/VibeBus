@@ -53,6 +53,23 @@ pub struct RecoveryKeyView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OperatorCredentialView {
+    pub operator_secret: String,
+    pub generation: i64,
+    pub issued_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorStatusView {
+    pub configured: bool,
+    pub generation: Option<i64>,
+    pub configured_at: Option<i64>,
+    pub rotated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentView {
     pub agent_id: String,
     pub name: String,
@@ -231,10 +248,25 @@ pub struct RetentionPlan {
 #[serde(rename_all = "camelCase")]
 pub struct RetentionReport {
     pub plan_id: String,
+    #[serde(default)]
+    pub operator_approval_id: Option<String>,
     pub applied_at: i64,
     pub deleted: RetentionCounts,
     pub events_pruned_through_sequence: i64,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionApprovalView {
+    pub approval_id: String,
+    pub plan_id: String,
+    pub operator_generation: i64,
+    pub approved_at: i64,
+    pub expires_at: i64,
+    pub consumed_at: Option<i64>,
+    pub consumed_by: Option<String>,
+    pub plan: RetentionPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

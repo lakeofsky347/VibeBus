@@ -11,7 +11,7 @@ cargo fmt --all -- --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ./scripts/build-release.ps1
-./scripts/test-installer.ps1 -MsiPath ./dist/VibeBus-0.7.0-windows-x64.msi -ExpectedVersion 0.7.0
+./scripts/test-installer.ps1 -MsiPath ./dist/VibeBus-0.8.0-windows-x64.msi -ExpectedVersion 0.8.0
 python C:\Users\17430\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py D:\MyProjects\CoWork\plugins\vibebus
 ```
 
@@ -36,25 +36,28 @@ Covered behaviors:
 - ordered event filtering, durable subscription cursors, and repeated empty polls;
 - replay-safe pending delivery, repeated peek identity, concurrent peek convergence, concurrent/idempotent ACK, empty filtered ranges, wrong-ID conflict, and legacy-poll exclusion;
 - retention preview/apply confirmation, pending-delivery protection, stale-plan rejection, concurrent replay-safe apply, retained-history cursor rejection, and snapshot cursor clamping;
+- separately hashed operator credentials, generation-bound plan approval, 60–3,600 second TTL validation, expiry rejection, rotation invalidation, atomic single consumption, and successful-run replay without a second approval;
+- operator vault target isolation, successful secret redaction, generation refresh, safe write-failure fallback, restoration verification, and rejection of noninteractive CLI mutations;
 - age-bounded cleanup for idempotency records, closed message receipts, orphaned messages, and terminal task/thread history;
 - retry-safe structured handoff, ACK lifecycle, and authenticated resume snapshot;
 - CLI end-to-end subscription/handoff, message/thread lifecycle, and retention plan/apply flows;
-- MCP initialize negotiation, expanded tool listing, stored registration, no-token inbox access, vault-backed recovery, credential deletion, and rejection after deletion.
+- MCP initialize negotiation, expanded tool listing, explicit absence of operator mutation tools, stored registration, no-token inbox access, vault-backed recovery, unapproved retention rejection, credential deletion, and rejection after deletion.
 
-The suite contains 27 tests: 4 CLI workflows, 19 core workflows, 3 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.7 checkout together with formatting and clippy-as-error checks.
+The suite contains 30 tests: 5 CLI workflows, 20 core workflows, 4 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.8 checkout together with formatting and clippy-as-error checks.
 
-The 0.7 release layer additionally covers Cargo/plugin version agreement, repository-owned plugin validation, pinned release tools, per-user MSI ICE validation, administrative extraction, required payload presence, extracted binary execution/version, portable/plugin archives, post-build SHA-256 checksums, and a machine-readable signed-state manifest. Production publishing is configured to fail before packaging when either signing Secret is absent.
+The 0.8 release layer additionally covers Cargo/plugin version agreement, repository-owned and Codex plugin validation, pinned release tools, per-user MSI ICE validation, administrative extraction, required payload presence, extracted binary execution/version, portable/plugin archives, post-build SHA-256 checksums, and a machine-readable signed-state manifest. Production publishing remains configured to fail before packaging when either signing Secret is absent.
 
-The accepted local 0.7 package is intentionally unsigned because no production certificate was placed in the workspace or process environment. Its MSI reports `NotSigned`; this verifies the PR/CI acceptance state, not the production signing path. Real certificate timestamping and final install/uninstall on a disposable Windows user profile remain maintainer release acceptance items.
+The accepted local 0.8 package is intentionally unsigned because no production certificate was placed in the workspace or process environment. Its MSI reports `NotSigned`; this verifies the PR/CI acceptance state, not the production signing path. Real certificate timestamping and final install/uninstall on a disposable Windows user profile remain maintainer release acceptance items.
 
 ## Plugin checks
 
 - Manifest and component paths pass the plugin validator.
 - `.mcp.json` launches `./bin/vibebus.exe mcp` from the plugin root.
 - SessionStart is read-only and requires normal Codex hook trust review.
-- The Skill states the root, `storeCredentials=true`, vault-status and failure-fallback handling, snapshot, message close lifecycle, task/thread association, retention preview/backup/confirmation discipline, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
-- `vibebus@vibebus-local` is installed and enabled as version 0.7.0 in the local Codex plugin cache.
-- The installed binary reports `vibebus 0.7.0` and matches the packaged SHA-256 `1b88dcfd25b0ee1d28f6356aace4b75138d97b4ed060fab9a22490c8c5e24c0a`.
+- The Skill states the root, `storeCredentials=true`, vault-status and failure-fallback handling, snapshot, message close lifecycle, task/thread association, operator-approved retention discipline, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
+- The repository plugin manifest is version 0.8.0 and passes both the repository validator and the Codex plugin/Skill validators.
+- The development reinstall uses cachebuster version `0.8.0+codex.20260717121516`; `codex plugin list` reports it installed and enabled from `vibebus-local`.
+- The installed and packaged binaries both report `vibebus 0.8.0` and share SHA-256 `e2cb2985d8e2e1ed5b484611f0eb5cae972576853acf491451980340dde32c33`; the installed Skill contains the operator-approval rule.
 
 ## Release package acceptance
 
@@ -62,11 +65,11 @@ The accepted unsigned local artifacts are:
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `VibeBus-0.7.0-windows-x64.msi` | 2,007,040 | `012078439077732439ed064a804b9f6fe7cd98fc60761f9acf2dcaf433c15901` |
-| `VibeBus-0.7.0-windows-x64.zip` | 2,622,201 | `a749d2cde07be7de96456820fdb30ae02bd76415877b3a564abe9536505b553e` |
-| `VibeBus-Codex-plugin-0.7.0.zip` | 2,616,579 | `11ad799e3ed17046192fd47dcf763bb769c2b5ccce963a56bcf30ec474d0491a` |
+| `VibeBus-0.8.0-windows-x64.msi` | 2,039,808 | `bffad77f99ccf22acdab5a26d4f3675c9eaa8cc9a3ff2fddf852381162f866d6` |
+| `VibeBus-0.8.0-windows-x64.zip` | 2,661,649 | `6e55ec6ba56494754fa735be500a30fecb9962e8a92977256b88479d4765e2d8` |
+| `VibeBus-Codex-plugin-0.8.0.zip` | 2,655,645 | `295af3f522a849f10585714b8a4fcfe4eca62486d2717c758652a8ae9191bb08` |
 
-The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, seven critical payload paths are present, and the extracted binary reports 0.7.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
+The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, seven critical payload paths are present, and the extracted binary reports 0.8.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
 
 ## Live project migration
 
@@ -86,6 +89,12 @@ The existing live coordination identity was also migrated with stored recovery-k
 
 The accepted post-migration online backup `vibebus-0.6-final.db` is 290,816 bytes with SHA-256 `86a77a9e07bf4d0246223c912fe7bc54d3d97c7568ad307086749f9f7233fe2f`.
 
+Before the 0.8 live migration, the 0.7 binary created `vibebus-0.8-pre-migration.db` (372,736 bytes, SHA-256 `78d9479ec2b394cc247e6078aac89beea7fe615942aa367e6b1d848ea4a58ee5`). The packaged 0.8 binary then opened the same project in place. `doctor` reports schema version 9, integrity `ok`, WAL, foreign keys enabled, and `ok=true`; all eight tasks, five Agents, existing artifacts, the current task/thread binding, and active reservations remained present.
+
+`operator status` on the live project reports DB configuration `false`, vault storage `false`, and `ready=false` with the isolated target `VibeBusOperator:prj_51ac137e4aa342a7a80bda77d94cfbc5`. No operator credential was initialized on the user's behalf. This proves the safe migration/default-deny state; interactive initialization, rotation, restoration, and a real operator-approved live cleanup remain explicit maintainer actions.
+
 ## Remaining manual acceptance
 
-Start two new independent Codex top-level tasks in the same initialized project and verify registration/recovery-key retention, a structured handoff plus ACK, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI. Local plugin installation and CLI/MCP protocol acceptance are complete; creation of user-owned Codex tasks is intentionally not inferred from a general implementation request and remains the only manual UI acceptance item.
+1. Start two new independent Codex top-level tasks in the same initialized project and verify registration/recovery-key retention, a structured handoff plus ACK, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI.
+2. In a disposable initialized project and real terminal, run `operator init`, inspect `operator status`, plan a zero-candidate/default cleanup, approve the exact plan interactively, apply it through a separate Agent/MCP call, verify single consumption/replay, rotate the operator, and remove the disposable vault target afterward.
+3. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.

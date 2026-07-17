@@ -89,6 +89,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     assert!(names.contains(&"vibebus_retention_status"));
     assert!(names.contains(&"vibebus_credential_status"));
     assert!(names.contains(&"vibebus_credential_delete"));
+    assert!(names.iter().all(|name| !name.contains("operator")));
 
     send(
         &mut writer,
@@ -111,6 +112,8 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
             .unwrap()
             .contains("MCP test")
     );
+    let status = tool_text(&called);
+    assert_eq!(status["operator"]["configured"], false);
 
     send(
         &mut writer,
@@ -184,6 +187,51 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
             "id": 7,
             "method": "tools/call",
             "params": {
+                "name": "vibebus_retention_plan",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    let plan = tool_text(&response(&mut lines, 7).await);
+    let plan_id = plan["planId"].as_str().unwrap();
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_retention_apply",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "planId": plan_id
+                }
+            }
+        }),
+    )
+    .await;
+    let unapproved = response(&mut lines, 8).await;
+    assert!(unapproved["error"].is_object());
+    assert!(
+        unapproved["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("operator approval required")
+    );
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
                 "name": "vibebus_credential_delete",
                 "arguments": {
                     "root": path_text(project.path()),
@@ -194,7 +242,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         }),
     )
     .await;
-    let deleted = tool_text(&response(&mut lines, 7).await);
+    let deleted = tool_text(&response(&mut lines, 9).await);
     assert_eq!(deleted["deleted"], true);
     assert_eq!(deleted["credentials"]["stored"], false);
 
@@ -202,7 +250,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         &mut writer,
         json!({
             "jsonrpc": "2.0",
-            "id": 8,
+            "id": 10,
             "method": "tools/call",
             "params": {
                 "name": "vibebus_inbox",
@@ -214,7 +262,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         }),
     )
     .await;
-    let missing = response(&mut lines, 8).await;
+    let missing = response(&mut lines, 10).await;
     assert!(missing["error"].is_object());
     assert!(
         missing["error"]["message"]

@@ -5,7 +5,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentRecovery, AgentRegistration, BusError, RecoveryKeyView, Result};
+use crate::{
+    AgentRecovery, AgentRegistration, BusError, OperatorCredentialView, RecoveryKeyView, Result,
+};
 
 const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 #[cfg(windows)]
@@ -19,6 +21,39 @@ pub struct StoredAgentCredentials {
     pub token: String,
     pub recovery_key: String,
     pub token_generation: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredOperatorCredential {
+    pub format_version: u32,
+    pub operator_secret: String,
+    pub generation: i64,
+}
+
+impl StoredOperatorCredential {
+    pub fn new(operator_secret: String, generation: i64) -> Self {
+        Self {
+            format_version: CREDENTIAL_FORMAT_VERSION,
+            operator_secret,
+            generation,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format_version != CREDENTIAL_FORMAT_VERSION {
+            return Err(BusError::CredentialVault(format!(
+                "unsupported stored operator credential format version {}",
+                self.format_version
+            )));
+        }
+        if self.operator_secret.is_empty() || self.generation < 1 {
+            return Err(BusError::CredentialVault(
+                "stored operator secret must be non-empty with a positive generation".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl StoredAgentCredentials {
@@ -63,6 +98,16 @@ pub struct VaultCredentialStatus {
     pub token_generation: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultOperatorStatus {
+    pub backend: String,
+    pub target: String,
+    pub supported: bool,
+    pub stored: bool,
+    pub generation: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretSource {
     Argument,
@@ -91,6 +136,24 @@ pub trait CredentialVault: Send + Sync {
 
     fn delete(&self, project_id: &str, agent: &str) -> Result<bool>;
 
+    fn store_operator(
+        &self,
+        _project_id: &str,
+        _credential: &StoredOperatorCredential,
+    ) -> Result<()> {
+        Err(BusError::CredentialVault(
+            "operator credentials are not supported by this vault".into(),
+        ))
+    }
+
+    fn load_operator(&self, _project_id: &str) -> Result<Option<StoredOperatorCredential>> {
+        Ok(None)
+    }
+
+    fn delete_operator(&self, _project_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     fn status(&self, project_id: &str, agent: &str) -> Result<VaultCredentialStatus> {
         let target = credential_target(project_id, agent)?;
         if !self.supported() {
@@ -114,6 +177,27 @@ pub trait CredentialVault: Send + Sync {
             token_generation: credentials.map(|value| value.token_generation),
         })
     }
+
+    fn operator_status(&self, project_id: &str) -> Result<VaultOperatorStatus> {
+        let target = operator_credential_target(project_id)?;
+        if !self.supported() {
+            return Ok(VaultOperatorStatus {
+                backend: self.backend().into(),
+                target,
+                supported: false,
+                stored: false,
+                generation: None,
+            });
+        }
+        let credential = self.load_operator(project_id)?;
+        Ok(VaultOperatorStatus {
+            backend: self.backend().into(),
+            target,
+            supported: true,
+            stored: credential.is_some(),
+            generation: credential.map(|value| value.generation),
+        })
+    }
 }
 
 pub fn credential_target(project_id: &str, agent: &str) -> Result<String> {
@@ -134,6 +218,32 @@ pub fn credential_target(project_id: &str, agent: &str) -> Result<String> {
         ));
     }
     Ok(format!("VibeBus:{project_id}:{agent}"))
+}
+
+pub fn operator_credential_target(project_id: &str) -> Result<String> {
+    let valid = !project_id.is_empty()
+        && project_id.len() <= 128
+        && project_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    if !valid {
+        return Err(BusError::Validation(
+            "operator credential project identifier must use bounded ASCII letters, digits, '-' or '_'"
+                .into(),
+        ));
+    }
+    Ok(format!("VibeBusOperator:{project_id}"))
+}
+
+pub fn resolve_operator_secret(vault: &dyn CredentialVault, project_id: &str) -> Result<String> {
+    vault
+        .load_operator(project_id)?
+        .map(|credential| credential.operator_secret)
+        .ok_or_else(|| {
+            BusError::Validation(
+                "operator credential is not stored in the current-user credential vault".into(),
+            )
+        })
 }
 
 pub fn resolve_agent_token(
@@ -322,9 +432,56 @@ fn storage_failure(
     plain
 }
 
+pub fn operator_credential_delivery(
+    vault: &dyn CredentialVault,
+    project_id: &str,
+    credential: &OperatorCredentialView,
+) -> serde_json::Value {
+    let mut plain = serde_json::json!(credential);
+    let stored =
+        StoredOperatorCredential::new(credential.operator_secret.clone(), credential.generation);
+    match vault.store_operator(project_id, &stored) {
+        Ok(()) => serde_json::json!({
+            "generation": credential.generation,
+            "issuedAt": credential.issued_at,
+            "credential": {
+                "backend": vault.backend(),
+                "target": operator_credential_target(project_id)
+                    .unwrap_or_else(|_| "VibeBusOperator:invalid-target".into()),
+                "supported": vault.supported(),
+                "stored": true,
+                "generation": credential.generation
+            },
+            "secretRedacted": true
+        }),
+        Err(error) => {
+            if let Some(object) = plain.as_object_mut() {
+                object.insert(
+                    "credential".into(),
+                    serde_json::json!({
+                        "backend": vault.backend(),
+                        "target": operator_credential_target(project_id)
+                            .unwrap_or_else(|_| "VibeBusOperator:invalid-target".into()),
+                        "supported": vault.supported(),
+                        "stored": false,
+                        "generation": null
+                    }),
+                );
+                object.insert("secretRedacted".into(), serde_json::Value::Bool(false));
+                object.insert(
+                    "credentialStorageError".into(),
+                    serde_json::Value::String(error.to_string()),
+                );
+            }
+            plain
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct MemoryCredentialVault {
     entries: Mutex<HashMap<String, StoredAgentCredentials>>,
+    operator_entries: Mutex<HashMap<String, StoredOperatorCredential>>,
 }
 
 impl CredentialVault for MemoryCredentialVault {
@@ -369,6 +526,44 @@ impl CredentialVault for MemoryCredentialVault {
         let target = credential_target(project_id, agent)?;
         Ok(self
             .entries
+            .lock()
+            .map_err(|_| BusError::CredentialVault("memory vault lock poisoned".into()))?
+            .remove(&target)
+            .is_some())
+    }
+
+    fn store_operator(
+        &self,
+        project_id: &str,
+        credential: &StoredOperatorCredential,
+    ) -> Result<()> {
+        credential.validate()?;
+        let target = operator_credential_target(project_id)?;
+        self.operator_entries
+            .lock()
+            .map_err(|_| BusError::CredentialVault("memory vault lock poisoned".into()))?
+            .insert(target, credential.clone());
+        Ok(())
+    }
+
+    fn load_operator(&self, project_id: &str) -> Result<Option<StoredOperatorCredential>> {
+        let target = operator_credential_target(project_id)?;
+        let value = self
+            .operator_entries
+            .lock()
+            .map_err(|_| BusError::CredentialVault("memory vault lock poisoned".into()))?
+            .get(&target)
+            .cloned();
+        if let Some(credential) = &value {
+            credential.validate()?;
+        }
+        Ok(value)
+    }
+
+    fn delete_operator(&self, project_id: &str) -> Result<bool> {
+        let target = operator_credential_target(project_id)?;
+        Ok(self
+            .operator_entries
             .lock()
             .map_err(|_| BusError::CredentialVault("memory vault lock poisoned".into()))?
             .remove(&target)
@@ -499,6 +694,128 @@ impl CredentialVault for PlatformCredentialVault {
         use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
 
         let target = credential_target(project_id, agent)?;
+        let target_wide = std::ffi::OsStr::new(&target)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let deleted = unsafe { CredDeleteW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0) };
+        if deleted != 0 {
+            return Ok(true);
+        }
+        let code = unsafe { GetLastError() };
+        if code == ERROR_NOT_FOUND {
+            return Ok(false);
+        }
+        Err(win32_error("CredDeleteW", code))
+    }
+
+    fn store_operator(
+        &self,
+        project_id: &str,
+        credential: &StoredOperatorCredential,
+    ) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::Security::Credentials::{
+            CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
+        };
+
+        credential.validate()?;
+        let target = operator_credential_target(project_id)?;
+        let mut target_wide = std::ffi::OsStr::new(&target)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut blob = serde_json::to_vec(credential)?;
+        if blob.len() > MAX_CREDENTIAL_BLOB_BYTES {
+            blob.fill(0);
+            return Err(BusError::CredentialVault(format!(
+                "serialized operator credential is larger than {MAX_CREDENTIAL_BLOB_BYTES} bytes"
+            )));
+        }
+        let raw = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target_wide.as_mut_ptr(),
+            CredentialBlobSize: blob.len() as u32,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            ..Default::default()
+        };
+        let written = unsafe { CredWriteW(&raw, 0) };
+        let error = if written == 0 {
+            Some(unsafe { GetLastError() })
+        } else {
+            None
+        };
+        blob.fill(0);
+        if let Some(code) = error {
+            return Err(win32_error("CredWriteW", code));
+        }
+        Ok(())
+    }
+
+    fn load_operator(&self, project_id: &str) -> Result<Option<StoredOperatorCredential>> {
+        use std::{os::windows::ffi::OsStrExt, ptr::null_mut, slice};
+
+        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+        use windows_sys::Win32::Security::Credentials::{
+            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+        };
+
+        let target = operator_credential_target(project_id)?;
+        let target_wide = std::ffi::OsStr::new(&target)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut raw: *mut CREDENTIALW = null_mut();
+        let read = unsafe { CredReadW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut raw) };
+        if read == 0 {
+            let code = unsafe { GetLastError() };
+            if code == ERROR_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(win32_error("CredReadW", code));
+        }
+        struct CredentialBuffer(*mut CREDENTIALW);
+        impl Drop for CredentialBuffer {
+            fn drop(&mut self) {
+                unsafe { CredFree(self.0.cast()) };
+            }
+        }
+        let buffer = CredentialBuffer(raw);
+        let credential = unsafe { &*buffer.0 };
+        let blob_len = credential.CredentialBlobSize as usize;
+        if blob_len > MAX_CREDENTIAL_BLOB_BYTES
+            || (blob_len > 0 && credential.CredentialBlob.is_null())
+        {
+            return Err(BusError::CredentialVault(
+                "Windows returned an invalid operator credential blob".into(),
+            ));
+        }
+        let mut blob =
+            unsafe { slice::from_raw_parts(credential.CredentialBlob, blob_len).to_vec() };
+        if blob_len > 0 {
+            unsafe { std::ptr::write_bytes(credential.CredentialBlob, 0, blob_len) };
+        }
+        let parsed = serde_json::from_slice::<StoredOperatorCredential>(&blob);
+        blob.fill(0);
+        let credential = parsed.map_err(|error| {
+            BusError::CredentialVault(format!(
+                "stored operator credential is not valid JSON: {error}"
+            ))
+        })?;
+        credential.validate()?;
+        Ok(Some(credential))
+    }
+
+    fn delete_operator(&self, project_id: &str) -> Result<bool> {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+        use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
+
+        let target = operator_credential_target(project_id)?;
         let target_wide = std::ffi::OsStr::new(&target)
             .encode_wide()
             .chain(std::iter::once(0))

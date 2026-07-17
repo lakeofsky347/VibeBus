@@ -1,8 +1,9 @@
 use tempfile::TempDir;
 use vibebus::{
     Bus, BusError, CredentialVault, MemoryCredentialVault, SecretSource, StoredAgentCredentials,
-    credential_target, initialize_project, recovery_delivery, registration_delivery,
-    resolve_agent_recovery_key, resolve_agent_token,
+    credential_target, initialize_project, operator_credential_delivery,
+    operator_credential_target, recovery_delivery, registration_delivery,
+    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret,
 };
 
 #[test]
@@ -49,6 +50,51 @@ fn memory_vault_is_project_scoped_and_respects_resolution_precedence() {
     assert_eq!(status.token_generation, Some(3));
     assert!(vault.delete("prj_one", "worker").unwrap());
     assert!(!vault.delete("prj_one", "worker").unwrap());
+}
+
+#[test]
+fn operator_vault_entry_is_separate_redacted_and_generation_tracked() {
+    let project = TempDir::new().unwrap();
+    let data_home = TempDir::new().unwrap();
+    initialize_project(project.path(), "Operator vault", Some(data_home.path())).unwrap();
+    let mut bus = Bus::open(project.path(), Some(data_home.path())).unwrap();
+    let project_id = bus.project().project_id.clone();
+    let vault = MemoryCredentialVault::default();
+
+    let first = bus.initialize_operator().unwrap();
+    let delivered = operator_credential_delivery(&vault, &project_id, &first);
+    assert_eq!(delivered["secretRedacted"], true);
+    assert!(delivered.get("operatorSecret").is_none());
+    assert_eq!(
+        operator_credential_target(&project_id).unwrap(),
+        format!("VibeBusOperator:{project_id}")
+    );
+    assert_ne!(
+        operator_credential_target(&project_id).unwrap(),
+        credential_target(&project_id, "operator").unwrap()
+    );
+    assert_eq!(
+        resolve_operator_secret(&vault, &project_id).unwrap(),
+        first.operator_secret
+    );
+    assert_eq!(
+        vault.operator_status(&project_id).unwrap().generation,
+        Some(1)
+    );
+
+    let second = bus.rotate_operator(&first.operator_secret).unwrap();
+    let delivered = operator_credential_delivery(&vault, &project_id, &second);
+    assert_eq!(delivered["secretRedacted"], true);
+    assert_eq!(
+        vault.operator_status(&project_id).unwrap().generation,
+        Some(2)
+    );
+    assert_eq!(
+        resolve_operator_secret(&vault, &project_id).unwrap(),
+        second.operator_secret
+    );
+    assert!(vault.delete_operator(&project_id).unwrap());
+    assert!(!vault.operator_status(&project_id).unwrap().stored);
 }
 
 #[test]
@@ -128,6 +174,27 @@ fn storage_failure_returns_the_only_usable_secret_pair_with_an_error_marker() {
     );
     assert_eq!(delivered["token"], registration.token);
     assert_eq!(delivered["recoveryKey"], registration.recovery_key);
+
+    let operator = bus.initialize_operator().unwrap();
+    let operator_delivery =
+        operator_credential_delivery(&FailingVault, &bus.project().project_id, &operator);
+    assert_eq!(operator_delivery["secretRedacted"], false);
+    assert_eq!(operator_delivery["credential"]["stored"], false);
+    assert_eq!(
+        operator_delivery["operatorSecret"],
+        operator.operator_secret
+    );
+    assert!(
+        operator_delivery["credentialStorageError"]
+            .as_str()
+            .unwrap()
+            .contains("not supported")
+    );
+    assert_eq!(
+        bus.verify_operator_secret(operator_delivery["operatorSecret"].as_str().unwrap())
+            .unwrap(),
+        1
+    );
 }
 
 struct FailingVault;
