@@ -17,9 +17,11 @@ Covered behaviors:
 
 - directed inbox isolation and token rejection;
 - read/ACK receipt state;
+- recipient-only message closing, ACK-before-close, hidden-by-default history, and retry-stable close events;
 - dependency locking and automatic unlock;
 - optimistic task versions and owner-only updates;
 - exactly one winner under concurrent claim;
+- owner-only task/thread binding, idempotent bind/unbind, terminal auto-unbind, and exactly one concurrent binding winner;
 - overlapping reservation conflict and release;
 - absolute-path rejection and task transition rules;
 - artifact project scope, SHA-256, metadata, and task filtering;
@@ -31,25 +33,27 @@ Covered behaviors:
 - ordered event filtering, durable subscription cursors, and repeated empty polls;
 - replay-safe pending delivery, repeated peek identity, concurrent peek convergence, concurrent/idempotent ACK, empty filtered ranges, wrong-ID conflict, and legacy-poll exclusion;
 - retry-safe structured handoff, ACK lifecycle, and authenticated resume snapshot;
-- CLI end-to-end subscription/handoff flow;
+- CLI end-to-end subscription/handoff and message/thread lifecycle flows;
 - MCP initialize negotiation, expanded tool listing, and real status tool execution.
 
-The suite contains 18 tests: 2 CLI workflows, 15 core workflows, and 1 MCP protocol workflow. All pass on the accepted 0.3 checkout together with formatting and clippy-as-error checks.
+The suite contains 22 tests: 3 CLI workflows, 18 core workflows, and 1 MCP protocol workflow. All pass on the accepted 0.4 checkout together with formatting and clippy-as-error checks.
 
 ## Plugin checks
 
 - Manifest and component paths pass the plugin validator.
 - `.mcp.json` launches `./bin/vibebus.exe mcp` from the plugin root.
 - SessionStart is read-only and requires normal Codex hook trust review.
-- The Skill states the root, private bearer/recovery handling, snapshot, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
-- `vibebus@vibebus-local` is installed and enabled as version 0.3.0 in the local Codex plugin cache.
-- The installed binary reports `vibebus 0.3.0` and matches the packaged SHA-256 `1be2050ddefc8c4527e69964bd2c30a2609e4935ef00dd69289d42ec6b1c609f`.
+- The Skill states the root, private bearer/recovery handling, snapshot, message close lifecycle, task/thread association, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
+- `vibebus@vibebus-local` is installed and enabled as version 0.4.0 in the local Codex plugin cache.
+- The installed binary reports `vibebus 0.4.0` and matches the packaged SHA-256 `e0eebe3d11dd90e8458a42bccba19c171cb4884ab6d4c4f920b45d753e870940`.
 
 ## Live project migration
 
-The existing project database was opened by the 0.3 release binary and migrated in place to schema version 6. `doctor` reports integrity `ok`, WAL journal mode, foreign keys enabled, and overall `ok=true`.
+The existing project database was opened by the 0.4 release binary and migrated in place from schema 6 to schema version 7. `doctor` reports integrity `ok`, WAL journal mode, foreign keys enabled, and overall `ok=true`. The migration explicitly adds `message_receipts.closed_at`, creates task/thread binding history, and preserves the existing project identity and records.
 
 A live project subscription then received a real `task_updated` event. Two peeks returned the same delivery ID without advancing the committed cursor; the first ACK advanced it, the repeated ACK returned `replayed=true`, and the listed subscription had no remaining pending delivery.
+
+The live `MESSAGE-LIFECYCLE-001` task was moved to `working` and bound to the current native Codex task ID. The authenticated handoff snapshot returned that binding. A self-directed `requiresAck` message rejected an early close, accepted ACK then close, returned the same `closedAt` on retry, disappeared from the default inbox, and remained visible only when closed history was explicitly requested.
 
 ## Remaining manual acceptance
 

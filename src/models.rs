@@ -75,6 +75,7 @@ pub struct MessageView {
     pub created_at: i64,
     pub read_at: Option<i64>,
     pub ack_at: Option<i64>,
+    pub closed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +85,7 @@ pub struct MessageReceipt {
     pub recipient: String,
     pub read_at: i64,
     pub ack_at: Option<i64>,
+    pub closed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +101,17 @@ pub struct TaskView {
     pub depends_on: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskThreadBindingView {
+    pub binding_id: String,
+    pub task_id: String,
+    pub thread_id: String,
+    pub agent: String,
+    pub bound_at: i64,
+    pub unbound_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +245,7 @@ pub struct HandoffSnapshot {
     pub unread_messages: Vec<MessageView>,
     pub owned_tasks: Vec<TaskView>,
     pub active_reservations: Vec<ReservationView>,
+    pub task_thread_bindings: Vec<TaskThreadBindingView>,
     pub recent_artifacts: Vec<ArtifactView>,
     pub recent_events: Vec<EventView>,
     pub latest_event_sequence: i64,

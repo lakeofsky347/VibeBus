@@ -204,6 +204,177 @@ fn cli_exposes_subscription_and_structured_handoff_workflows() {
     );
 }
 
+#[test]
+fn cli_exposes_message_close_and_task_thread_bindings() {
+    let project = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    initialize_project(project.path(), "CLI lifecycle", Some(data.path())).unwrap();
+
+    let sender = run_cli(
+        project.path(),
+        data.path(),
+        &["register", "--name", "lifecycle-sender", "--role", "lead"],
+    );
+    let owner = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "register",
+            "--name",
+            "lifecycle-owner",
+            "--role",
+            "implementation",
+        ],
+    );
+    let sender_token = sender["result"]["token"].as_str().unwrap();
+    let owner_token = owner["result"]["token"].as_str().unwrap();
+
+    run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "task",
+            "create",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--id",
+            "CLI-THREAD",
+            "--title",
+            "Bind this task",
+        ],
+    );
+    run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "task",
+            "claim",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--id",
+            "CLI-THREAD",
+        ],
+    );
+    let bound = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "thread",
+            "bind",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--task",
+            "CLI-THREAD",
+            "--thread",
+            "codex:cli-thread",
+        ],
+    );
+    assert_eq!(bound["result"]["threadId"], "codex:cli-thread");
+    let status = run_cli(project.path(), data.path(), &["status"]);
+    assert_eq!(
+        status["result"]["threadBindings"].as_array().unwrap().len(),
+        1
+    );
+
+    let sent = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "send",
+            "--from",
+            "lifecycle-sender",
+            "--token",
+            sender_token,
+            "--to",
+            "lifecycle-owner",
+            "--subject",
+            "Close me",
+            "--body",
+            "ACK then close",
+            "--requires-ack",
+        ],
+    );
+    let message_id = sent["result"]["messageId"].as_str().unwrap();
+    run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "ack",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--message",
+            message_id,
+        ],
+    );
+    let closed = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "close",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--message",
+            message_id,
+        ],
+    );
+    assert!(closed["result"]["closedAt"].as_i64().is_some());
+    let default_inbox = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "inbox",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--all",
+        ],
+    );
+    assert!(default_inbox["result"].as_array().unwrap().is_empty());
+    let closed_inbox = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "inbox",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--all",
+            "--include-closed",
+        ],
+    );
+    assert_eq!(closed_inbox["result"].as_array().unwrap().len(), 1);
+
+    let unbound = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "thread",
+            "unbind",
+            "--agent",
+            "lifecycle-owner",
+            "--token",
+            owner_token,
+            "--task",
+            "CLI-THREAD",
+            "--thread",
+            "codex:cli-thread",
+        ],
+    );
+    assert!(unbound["result"]["unboundAt"].as_i64().is_some());
+}
+
 fn run_cli(project: &std::path::Path, data: &std::path::Path, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_vibebus"))
         .arg("--root")

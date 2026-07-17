@@ -69,6 +69,7 @@ pub struct InboxRequest {
     pub agent: String,
     pub token: String,
     pub unread_only: Option<bool>,
+    pub include_closed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -134,6 +135,26 @@ pub struct TaskShowRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
     pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadBindingRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: String,
+    pub task_id: String,
+    pub thread_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub task_id: Option<String>,
+    pub active_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -315,6 +336,7 @@ impl VibeBusMcp {
             "databasePath": bus.database_path().to_string_lossy(),
             "agents": bus.list_agents().map_err(bus_error)?,
             "tasks": bus.list_tasks().map_err(bus_error)?,
+            "threadBindings": bus.list_task_thread_bindings(None, true).map_err(bus_error)?,
             "reservations": bus.list_active_reservations().map_err(bus_error)?,
             "artifacts": bus.list_artifacts(None).map_err(bus_error)?
         }))
@@ -400,10 +422,11 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.inbox(
+            &bus.inbox_with_options(
                 &request.agent,
                 &request.token,
                 request.unread_only.unwrap_or(true),
+                request.include_closed.unwrap_or(false),
             )
             .map_err(bus_error)?,
         )
@@ -429,6 +452,20 @@ impl VibeBusMcp {
         let mut bus = self.open(request.root.as_deref())?;
         json_text(
             &bus.acknowledge_message(&request.agent, &request.token, &request.message_id)
+                .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Close one inbox message; acknowledgement-required messages must be acknowledged first"
+    )]
+    fn vibebus_close(
+        &self,
+        Parameters(request): Parameters<ReceiptRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.close_message(&request.agent, &request.token, &request.message_id)
                 .map_err(bus_error)?,
         )
     }
@@ -520,6 +557,55 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let bus = self.open(request.root.as_deref())?;
         json_text(&bus.list_tasks().map_err(bus_error)?)
+    }
+
+    #[tool(description = "Bind an owned active VibeBus task to one Codex thread identifier")]
+    fn vibebus_thread_bind(
+        &self,
+        Parameters(request): Parameters<ThreadBindingRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.bind_task_thread(
+                &request.agent,
+                &request.token,
+                &request.task_id,
+                &request.thread_id,
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(description = "Unbind an owned VibeBus task from its active Codex thread identifier")]
+    fn vibebus_thread_unbind(
+        &self,
+        Parameters(request): Parameters<ThreadBindingRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.unbind_task_thread(
+                &request.agent,
+                &request.token,
+                &request.task_id,
+                &request.thread_id,
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(description = "List task-to-Codex-thread bindings, optionally including history")]
+    fn vibebus_thread_list(
+        &self,
+        Parameters(request): Parameters<ThreadListRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.list_task_thread_bindings(
+                request.task_id.as_deref(),
+                request.active_only.unwrap_or(true),
+            )
+            .map_err(bus_error)?,
+        )
     }
 
     #[tool(description = "Acquire a TTL-backed project-relative file or directory reservation")]

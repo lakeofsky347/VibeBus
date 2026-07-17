@@ -2,7 +2,7 @@
 
 ## Goal
 
-VibeBus coordinates independent Codex top-level tasks without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, dependencies, reservations, artifacts, subscriptions, and audit events.
+VibeBus coordinates independent Codex top-level tasks without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, task/thread associations, dependencies, reservations, artifacts, subscriptions, and audit events.
 
 ## Runtime shape
 
@@ -45,9 +45,10 @@ The database is outside the repository by default:
 | `projects` | Resolved project identity and root |
 | `agents` | Names, roles, bearer/recovery hashes, token generation, liveness timestamps |
 | `messages` | Directed structured facts |
-| `message_receipts` | Per-recipient delivered/read/ACK state |
+| `message_receipts` | Per-recipient delivered/read/ACK/closed state |
 | `tasks` | Owner, state, version, blocker, timestamps |
 | `task_dependencies` | Prerequisite edges |
+| `task_thread_bindings` | Historical task-to-Codex-thread associations and unbind time |
 | `reservations` | TTL-backed path intent |
 | `artifacts` | File path, hash, summary, task relation, metadata |
 | `idempotency_records` | Operation-scoped request hashes and cached responses |
@@ -71,6 +72,10 @@ The database is outside the repository by default:
 12. A subscription has at most one pending replay-safe delivery; its committed cursor moves only after matching ACK.
 13. Structured handoffs are directed, high-priority, and marked as requiring acknowledgement.
 14. Legacy consume-on-poll cannot advance through an unacknowledged replay-safe delivery.
+15. A message requiring acknowledgement cannot be closed before the recipient ACKs it.
+16. Closed messages are immutable receipt history and are hidden from the normal inbox.
+17. A task has at most one active Codex-thread binding, managed only by its task owner.
+18. Completed or abandoned tasks have no active thread binding; terminal transition ends it atomically.
 
 ## Recovery and retry boundaries
 
@@ -86,6 +91,12 @@ Named subscriptions keep an authenticated agent-owned committed cursor in SQLite
 
 Legacy polling still consumes and commits in one call, but it conflicts whenever pending delivery state exists. Future retention must never delete events inside any pending delivery range. Critical payloads such as handoffs remain independently durable in the directed inbox, so event delivery is notification/indexing state rather than the sole copy of work instructions.
 
+## Message and task/thread lifecycles
+
+Message closing is a recipient-owned terminal receipt action. Closing also records read state. Messages marked `requiresAck` must have an ACK first; a successful close is retry-safe and appends exactly one `message_closed` event. The default inbox excludes closed messages, while explicit history reads can include them.
+
+A task owner may bind a non-terminal task to one caller-supplied Codex task/thread identifier. Repeating the same bind or unbind returns the original binding state; attempting a second active identifier conflicts. VibeBus stores only the association—it does not invoke Codex thread APIs. Moving a task to `completed` or `abandoned` atomically closes its active binding, so resume snapshots cannot advertise stale execution ownership.
+
 ## Codex plugin lifecycle
 
 The plugin contains:
@@ -96,7 +107,7 @@ The plugin contains:
 
 The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call.
 
-## Deliberate non-goals for 0.2
+## Deliberate non-goals for 0.4
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;

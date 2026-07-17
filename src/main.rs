@@ -44,9 +44,14 @@ enum Command {
     Inbox(AgentAuthArgs),
     Read(MessageAuthArgs),
     Ack(MessageAuthArgs),
+    Close(MessageAuthArgs),
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommand,
     },
     Reserve {
         #[command(subcommand)]
@@ -107,6 +112,8 @@ struct AgentAuthArgs {
     token: Option<String>,
     #[arg(long)]
     all: bool,
+    #[arg(long)]
+    include_closed: bool,
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +179,36 @@ enum TaskCommand {
         id: String,
     },
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ThreadCommand {
+    Bind {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        thread: String,
+    },
+    Unbind {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        thread: String,
+    },
+    List {
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -433,7 +470,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }
         Command::Inbox(args) => {
             let token = resolve_token(args.token)?;
-            json!(bus.inbox(&args.agent, &token, !args.all)?)
+            json!(bus.inbox_with_options(&args.agent, &token, !args.all, args.include_closed,)?)
         }
         Command::Read(args) => {
             let token = resolve_token(args.token)?;
@@ -442,6 +479,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Command::Ack(args) => {
             let token = resolve_token(args.token)?;
             json!(bus.acknowledge_message(&args.agent, &token, &args.message)?)
+        }
+        Command::Close(args) => {
+            let token = resolve_token(args.token)?;
+            json!(bus.close_message(&args.agent, &token, &args.message)?)
         }
         Command::Task { command } => match command {
             TaskCommand::Create {
@@ -495,6 +536,29 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
             TaskCommand::Show { id } => json!(bus.get_task(&id)?),
             TaskCommand::List => json!(bus.list_tasks()?),
+        },
+        Command::Thread { command } => match command {
+            ThreadCommand::Bind {
+                agent,
+                token,
+                task,
+                thread,
+            } => {
+                let token = resolve_token(token)?;
+                json!(bus.bind_task_thread(&agent, &token, &task, &thread)?)
+            }
+            ThreadCommand::Unbind {
+                agent,
+                token,
+                task,
+                thread,
+            } => {
+                let token = resolve_token(token)?;
+                json!(bus.unbind_task_thread(&agent, &token, &task, &thread)?)
+            }
+            ThreadCommand::List { task, all } => {
+                json!(bus.list_task_thread_bindings(task.as_deref(), !all)?)
+            }
         },
         Command::Reserve { command } => match command {
             ReservationCommand::Add {
@@ -672,6 +736,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             "databasePath": bus.database_path().to_string_lossy(),
             "agents": bus.list_agents()?,
             "tasks": bus.list_tasks()?,
+            "threadBindings": bus.list_task_thread_bindings(None, true)?,
             "reservations": bus.list_active_reservations()?,
             "artifacts": bus.list_artifacts(None)?
         }),

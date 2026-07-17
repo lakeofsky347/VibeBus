@@ -1,6 +1,6 @@
 {
   "name": "vibebus",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Project-scoped coordination for independent Codex tasks.",
   "author": {
     "name": "VibeBus Contributors"
@@ -11,7 +11,7 @@
   "interface": {
     "displayName": "VibeBus",
     "shortDescription": "Coordinate independent Codex tasks",
-    "longDescription": "Use a local SQLite fact bus for recoverable agents, directed messages, acknowledgements, atomically claimed tasks, renewable file reservations, replay-safe event subscriptions, and structured handoffs across independent Codex tasks.",
+    "longDescription": "Use a local SQLite fact bus for recoverable agents, directed message lifecycles, atomically claimed tasks, Codex thread bindings, renewable file reservations, replay-safe event subscriptions, and structured handoffs across independent Codex tasks.",
     "developerName": "VibeBus Contributors",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],

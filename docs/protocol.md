@@ -25,8 +25,11 @@ Registration returns both a bearer token and a recovery key in plaintext once. S
 | Inbox | `inbox` | `vibebus_inbox` |
 | Mark read | `read` | `vibebus_read` |
 | ACK | `ack` | `vibebus_ack` |
+| Close | `close` | `vibebus_close` |
 
 Priorities are `low`, `normal`, `high`, and `urgent`. `requiresAck` records sender intent; receipt state is still explicitly updated by the recipient.
+
+Normal inbox reads hide closed messages. CLI callers may combine `inbox --all --include-closed`; MCP callers set `unreadOnly=false` and `includeClosed=true` to inspect receipt history. Closing is recipient-only, marks the message read, and is a retry-safe terminal action. A message with `requiresAck=true` must be ACKed before close. After close, read and ACK mutations conflict.
 
 `send --idempotency-key <key>` / `idempotencyKey` makes an external retry return the original message. Reusing the same key with a different request is a conflict.
 
@@ -53,6 +56,18 @@ completed, abandoned --> terminal
 ```
 
 Every update includes `expectedVersion`. A conflict requires a fresh read and reconciliation.
+
+## Task/thread bindings
+
+| Capability | CLI | MCP |
+| --- | --- | --- |
+| Bind active task | `thread bind` | `vibebus_thread_bind` |
+| Unbind task | `thread unbind` | `vibebus_thread_unbind` |
+| List active/history | `thread list` | `vibebus_thread_list` |
+
+Only the current task owner may bind or unbind. The task must be non-terminal when binding, and only one active binding may exist per task. Repeating the same bind or unbind returns the existing record; a different active thread conflicts. `thread list` returns active bindings by default; CLI `--all` or MCP `activeOnly=false` includes history. Completing or abandoning a task automatically timestamps its active binding as unbound.
+
+The thread ID is an opaque caller-provided identifier of 1-128 ASCII letters, digits, `-`, `_`, `.`, `:`, or `/`. VibeBus records this association but does not create, navigate, awaken, or archive a native Codex task.
 
 ## Reservations
 
@@ -109,7 +124,7 @@ Legacy `poll` remains available for compatibility. It returns up to 500 events a
 
 A handoff is a directed message with a JSON body containing `summary`, optional `taskId`, `decisions`, `artifacts`, `blockers`, and `nextActions`. VibeBus forces `high` priority and `requiresAck=true`, verifies referenced tasks and artifacts, and supports retry deduplication with an idempotency key. The recipient should read the body, act on it, and call `ack`.
 
-The authenticated snapshot combines unread messages, non-terminal owned tasks, active owned reservations, the agent's recent artifacts, recent events after a supplied sequence, and the latest event sequence. It is a compact resume view, not a replacement for direct task/message reads when more than the bounded recent window is needed.
+The authenticated snapshot combines unread messages, non-terminal owned tasks, their active task/thread bindings, active owned reservations, the agent's recent artifacts, recent events after a supplied sequence, and the latest event sequence. It is a compact resume view, not a replacement for direct task/message reads when more than the bounded recent window is needed.
 
 ## Idempotency rules
 

@@ -2,14 +2,15 @@
 
 VibeBus 是一个面向独立 Codex 顶层任务的本地结构化事实总线。它保留 Codex 原生的任务与 worktree 隔离，只共享明确登记的消息、ACK、任务状态、依赖、文件租约和产物，不共享整段聊天上下文。
 
-当前版本 0.3 是可运行的 Windows MVP：一个 Rust 单文件程序同时提供 CLI 和 stdio MCP，状态写入项目级 SQLite WAL 数据库，并打包为 Codex 插件。
+当前版本 0.4 是可运行的 Windows MVP：一个 Rust 单文件程序同时提供 CLI 和 stdio MCP，状态写入项目级 SQLite WAL 数据库，并打包为 Codex 插件。
 
 ## 已实现
 
 - 项目身份：仓库内 `.vibebus/project.json`，数据默认位于 `%LOCALAPPDATA%\VibeBus\projects\<project-id>\vibebus.db`。
 - Agent 注册、单次恢复密钥、bearer token 轮换与哈希存储。
-- 定向消息、未读收件箱、read/ACK 回执隔离。
+- 定向消息、未读收件箱、read/ACK/close 回执隔离；需 ACK 的消息必须先确认再关闭。
 - 带依赖的任务、原子领取、所有者约束、状态机和乐观版本冲突。
+- 任务所有者可将活动任务绑定到一个 Codex 任务 ID；任务完成或放弃时自动解绑并保留历史。
 - 项目相对路径租约、重叠检测、TTL、所有者续期和显式释放。
 - 产物登记、项目边界验证和 SHA-256 校验。
 - 可重试写操作的幂等键与“同键异载荷”冲突语义。
@@ -49,6 +50,7 @@ $env:VIBEBUS_AGENT_TOKEN = $registration.result.token
 
 .\target\release\vibebus.exe task create --root D:\path\to\repo --agent api --id TASK-101 --title "Implement API"
 .\target\release\vibebus.exe task claim --root D:\path\to\repo --agent api --id TASK-101
+.\target\release\vibebus.exe thread bind --root D:\path\to\repo --agent api --task TASK-101 --thread 019f-example-codex-task
 .\target\release\vibebus.exe reserve add --root D:\path\to\repo --agent api --path src/api --reason "TASK-101"
 .\target\release\vibebus.exe inbox --root D:\path\to\repo --agent api
 .\target\release\vibebus.exe subscription create --root D:\path\to\repo --agent api --name coordination --event-types message_sent,task_updated --from-sequence 0
@@ -56,6 +58,8 @@ $delivery = .\target\release\vibebus.exe subscription peek --root D:\path\to\rep
 .\target\release\vibebus.exe subscription ack --root D:\path\to\repo --agent api --name coordination --delivery $delivery.result.delivery.deliveryId
 .\target\release\vibebus.exe handoff snapshot --root D:\path\to\repo --agent api
 ```
+
+处理完一条消息后使用 `ack`（若发送方要求）和 `close`；普通 `inbox` 不返回已关闭消息，审计时可加 `--all --include-closed`。线程绑定只是把 VibeBus 任务与调用方提供的 Codex 任务 ID 建立持久关联，不会创建、打开、唤醒或控制 Codex 任务。
 
 CLI 总是输出 JSON。也可以逐条传入 `--token`，避免设置进程环境变量。
 
@@ -88,6 +92,7 @@ codex plugin add vibebus@vibebus-local
 - token 与恢复密钥仅在注册、恢复或轮换时返回明文，数据库只保留 SHA-256 摘要；成功恢复会同时撤销旧 token 与旧恢复密钥。
 - 收件箱必须使用收件人身份认证，不能读取其他 Agent 的消息。
 - 任务更新要求当前所有者和最新版本。
+- 每个任务同时最多有一个活动线程绑定，绑定/解绑只允许任务所有者；任务终态自动结束活动绑定。
 - 租约路径必须是无 `..`、无盘符、非绝对的项目相对路径。
 - 产物路径 canonicalize 后必须仍在项目根目录内。
 - 备份拒绝覆盖已有目标文件。
