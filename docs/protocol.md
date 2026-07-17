@@ -105,15 +105,29 @@ Artifact publication accepts an idempotency key. The request identity includes t
 | ACK replay-safe delivery | `subscription ack` | `vibebus_subscription_ack` |
 | Poll and advance (legacy) | `subscription poll` | `vibebus_subscription_poll` |
 
-Events use a project-wide monotonically increasing `sequence`. Query with `afterSequence`/`--after` and retain the last returned sequence. An empty event-type filter means all types; a non-empty filter accepts up to 32 exact event names. Message events contain routing metadata, not message subjects or bodies.
+Events use a project-wide monotonically increasing `sequence`. Query with `afterSequence`/`--after` and retain the last returned sequence. An empty event-type filter means all types; a non-empty filter accepts up to 32 exact event names. Message events contain routing metadata, not message subjects or bodies. After retention has advanced the history floor, an older cursor conflicts instead of silently returning a partial history; inspect `retention status` and resume from `eventsPrunedThroughSequence`.
 
-Subscriptions belong to one authenticated agent and are unique by agent and name. Omitting `fromSequence` starts at the current project tail; `0` replays matching history. Subscription views expose the committed cursor, an optional pending delivery, and the most recently acknowledged delivery ID.
+Subscriptions belong to one authenticated agent and are unique by agent and name. Omitting `fromSequence` starts at the current project tail; `0` replays matching history only while the retained-history floor is still zero. An explicit cursor older than that floor conflicts. Subscription views expose the committed cursor, an optional pending delivery, and the most recently acknowledged delivery ID.
 
 `peek` creates at most one pending delivery containing up to 500 matching events without advancing the committed cursor. Repeating peek returns that same delivery and full batch, even if the new request specifies a smaller limit or newer events have arrived. A delivery may contain zero matching events when it represents a scanned range of non-matching project events; it must still be acknowledged to advance over that range.
 
 `ack` accepts the pending `deliveryId`, advances the committed cursor through the delivery range, and clears the pending state. Retrying the most recent successful ACK returns the original cursor and timestamp with `replayed=true`. A wrong or stale ID conflicts. This provides at-least-once access to the batch, not exactly-once processing; consumers must make side effects idempotent and ACK only after the complete batch succeeds.
 
 Legacy `poll` remains available for compatibility. It returns up to 500 events and commits immediately, so a response lost after commit is not replayed. It refuses to run while a replay-safe delivery is pending and therefore cannot silently cross an unacknowledged batch.
+
+## Bounded retention
+
+| Capability | CLI | MCP |
+| --- | --- | --- |
+| Preview candidates | `retention plan` | `vibebus_retention_plan` |
+| Apply confirmed plan | `retention apply` | `vibebus_retention_apply` |
+| Inspect history floor | `retention status` | `vibebus_retention_status` |
+
+Both preview and apply require an authenticated Agent. Defaults are 90 days for events, 1,000 recent events always retained, 30 days for idempotency records and closed messages, and 90 days for terminal task/thread binding history. Each age accepts 1–3,650 days; the recent tail accepts 1–1,000,000 events. `closedMessageMaxAgeDays` must be at least `idempotencyMaxAgeDays` so a cached send retry cannot reference a deleted message.
+
+Preview is read-only and returns policy, subscription protection details, exact candidate counts, and a `planId`. Apply must repeat the same custom policy values and provide that ID. Any intervening domain event, cursor change, prior cleanup, or candidate change produces a new plan ID and makes the old confirmation conflict before deletion. Concurrent or repeated application of the same successful plan returns its stored report with `replayed=true`.
+
+Event candidates form one contiguous prefix that is old enough, at or below the slowest subscription cursor, and outside the recent tail. A pending replay-safe delivery keeps its committed cursor unchanged, so its complete range remains protected. Apply also removes expired idempotency records, old closed receipts, resulting receipt-less messages, and old unbound history belonging to terminal tasks. It preserves active state and appends `retention_applied` as a new audit event. The operation does not run `VACUUM`.
 
 ## Structured handoff
 
@@ -124,11 +138,11 @@ Legacy `poll` remains available for compatibility. It returns up to 500 events a
 
 A handoff is a directed message with a JSON body containing `summary`, optional `taskId`, `decisions`, `artifacts`, `blockers`, and `nextActions`. VibeBus forces `high` priority and `requiresAck=true`, verifies referenced tasks and artifacts, and supports retry deduplication with an idempotency key. The recipient should read the body, act on it, and call `ack`.
 
-The authenticated snapshot combines unread messages, non-terminal owned tasks, their active task/thread bindings, active owned reservations, the agent's recent artifacts, recent events after a supplied sequence, and the latest event sequence. It is a compact resume view, not a replacement for direct task/message reads when more than the bounded recent window is needed.
+The authenticated snapshot combines unread messages, non-terminal owned tasks, their active task/thread bindings, active owned reservations, the agent's recent artifacts, recent available events after a supplied sequence, the latest event sequence, and retention state. It clamps an obsolete supplied sequence to the retained-history floor so recovery remains available. It is a compact resume view, not a replacement for direct task/message reads when more than the bounded recent window is needed.
 
 ## Idempotency rules
 
-Idempotency keys are scoped by project, authenticated agent, and operation. Valid keys are 1-128 ASCII letters, digits, `-`, `_`, `.`, or `:`. They are available on message/handoff send, reservation acquire/renew, and artifact publish. Same key plus same effective request returns the stored response; same key plus different request returns a conflict. Task creation already has a stable caller-selected task ID, while task claim and update rely on atomic state/version checks.
+Idempotency keys are scoped by project, authenticated agent, and operation. Valid keys are 1-128 ASCII letters, digits, `-`, `_`, `.`, or `:`. They are available on message/handoff send, reservation acquire/renew, and artifact publish. Same key plus same effective request returns the stored response; same key plus different request returns a conflict while the record remains inside the configured retention window. Task creation already has a stable caller-selected task ID, while task claim and update rely on atomic state/version checks.
 
 ## MCP root rule
 

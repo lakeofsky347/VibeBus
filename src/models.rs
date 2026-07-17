@@ -186,6 +186,66 @@ pub struct EventView {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionPolicy {
+    pub event_max_age_days: i64,
+    pub keep_recent_events: i64,
+    pub idempotency_max_age_days: i64,
+    pub closed_message_max_age_days: i64,
+    pub terminal_binding_max_age_days: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionCounts {
+    pub events: i64,
+    pub idempotency_records: i64,
+    pub message_receipts: i64,
+    pub messages: i64,
+    pub task_thread_bindings: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionProtectionView {
+    pub latest_event_sequence: i64,
+    pub events_pruned_through_sequence: i64,
+    pub safe_event_sequence: i64,
+    pub event_prune_through_sequence: i64,
+    pub subscription_count: i64,
+    pub pending_delivery_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionPlan {
+    pub plan_id: String,
+    pub generated_at: i64,
+    pub policy: RetentionPolicy,
+    pub protection: RetentionProtectionView,
+    pub candidates: RetentionCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionReport {
+    pub plan_id: String,
+    pub applied_at: i64,
+    pub deleted: RetentionCounts,
+    pub events_pruned_through_sequence: i64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionStateView {
+    pub events_pruned_through_sequence: i64,
+    pub earliest_available_event_sequence: i64,
+    pub last_applied_at: Option<i64>,
+    pub last_plan_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionView {
@@ -249,4 +309,5 @@ pub struct HandoffSnapshot {
     pub recent_artifacts: Vec<ArtifactView>,
     pub recent_events: Vec<EventView>,
     pub latest_event_sequence: i64,
+    pub retention_state: RetentionStateView,
 }

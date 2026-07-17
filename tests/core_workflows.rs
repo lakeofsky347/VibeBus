@@ -4,7 +4,7 @@ use std::thread;
 
 use rusqlite::Connection;
 use tempfile::TempDir;
-use vibebus::{Bus, BusError, initialize_project};
+use vibebus::{Bus, BusError, RetentionPolicy, initialize_project};
 
 struct Harness {
     project: TempDir,
@@ -408,6 +408,235 @@ fn concurrent_thread_binding_allows_exactly_one_winner() {
 }
 
 #[test]
+fn retention_is_previewed_subscription_safe_stale_checked_and_replayable() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let owner = bus.register_agent("retention-owner", "operations").unwrap();
+    bus.create_subscription(
+        "retention-owner",
+        &owner.token,
+        "protect-history",
+        &[],
+        Some(0),
+    )
+    .unwrap();
+
+    let message = bus
+        .send_message_idempotent(
+            "retention-owner",
+            &owner.token,
+            std::slice::from_ref(&owner.name),
+            "Old closed message",
+            "Eligible after the retention window",
+            None,
+            "normal",
+            false,
+            Some("retention-message:001"),
+        )
+        .unwrap();
+    bus.close_message("retention-owner", &owner.token, &message.message_id)
+        .unwrap();
+    bus.create_task(
+        "retention-owner",
+        &owner.token,
+        "RETENTION-HISTORY",
+        "Produce terminal binding history",
+        None,
+        &[],
+    )
+    .unwrap();
+    let claimed = bus
+        .claim_task("retention-owner", &owner.token, "RETENTION-HISTORY")
+        .unwrap();
+    bus.bind_task_thread(
+        "retention-owner",
+        &owner.token,
+        "RETENTION-HISTORY",
+        "codex:retention-history",
+    )
+    .unwrap();
+    let working = bus
+        .update_task(
+            "retention-owner",
+            &owner.token,
+            "RETENTION-HISTORY",
+            claimed.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    bus.update_task(
+        "retention-owner",
+        &owner.token,
+        "RETENTION-HISTORY",
+        working.version,
+        "completed",
+        None,
+    )
+    .unwrap();
+
+    let peeked = bus
+        .peek_subscription("retention-owner", &owner.token, "protect-history", 500)
+        .unwrap();
+    let delivery = peeked.delivery.clone().expect("pending delivery");
+    let database = Connection::open(bus.database_path()).unwrap();
+    database
+        .execute(
+            "UPDATE events SET created_at = 0 WHERE project_id = ?1",
+            [bus.project().project_id.as_str()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE idempotency_records SET created_at = 0 WHERE project_id = ?1",
+            [bus.project().project_id.as_str()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE message_receipts SET closed_at = 0 WHERE message_id = ?1",
+            [message.message_id.as_str()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE task_thread_bindings SET unbound_at = 0
+             WHERE project_id = ?1 AND task_id = 'RETENTION-HISTORY'",
+            [bus.project().project_id.as_str()],
+        )
+        .unwrap();
+    drop(database);
+
+    let policy = RetentionPolicy {
+        event_max_age_days: 1,
+        keep_recent_events: 1,
+        idempotency_max_age_days: 1,
+        closed_message_max_age_days: 1,
+        terminal_binding_max_age_days: 1,
+    };
+    let unsafe_policy = RetentionPolicy {
+        idempotency_max_age_days: 2,
+        ..policy.clone()
+    };
+    assert!(matches!(
+        bus.plan_retention("retention-owner", &owner.token, &unsafe_policy),
+        Err(BusError::Validation(_))
+    ));
+    let protected = bus
+        .plan_retention("retention-owner", &owner.token, &policy)
+        .unwrap();
+    assert_eq!(protected.protection.safe_event_sequence, 0);
+    assert_eq!(protected.protection.pending_delivery_count, 1);
+    assert_eq!(protected.candidates.events, 0);
+    assert_eq!(protected.candidates.idempotency_records, 1);
+    assert_eq!(protected.candidates.message_receipts, 1);
+    assert_eq!(protected.candidates.messages, 1);
+    assert_eq!(protected.candidates.task_thread_bindings, 1);
+
+    bus.acknowledge_subscription(
+        "retention-owner",
+        &owner.token,
+        "protect-history",
+        &delivery.delivery_id,
+    )
+    .unwrap();
+    assert!(matches!(
+        bus.apply_retention("retention-owner", &owner.token, &policy, &protected.plan_id,),
+        Err(BusError::Conflict(_))
+    ));
+    let applicable = bus
+        .plan_retention("retention-owner", &owner.token, &policy)
+        .unwrap();
+    assert!(applicable.candidates.events > 0);
+    assert_eq!(applicable.protection.pending_delivery_count, 0);
+    assert!(
+        applicable.protection.event_prune_through_sequence
+            <= applicable.protection.safe_event_sequence
+    );
+
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = (0..2)
+        .map(|_| {
+            let root = harness.project.path().to_path_buf();
+            let data = harness.data.path().to_path_buf();
+            let token = owner.token.clone();
+            let policy = policy.clone();
+            let plan_id = applicable.plan_id.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.apply_retention("retention-owner", &token, &policy, &plan_id)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let reports = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(reports.iter().filter(|report| report.replayed).count(), 1);
+    assert_eq!(reports.iter().filter(|report| !report.replayed).count(), 1);
+    let applied = reports.iter().find(|report| !report.replayed).unwrap();
+    assert_eq!(applied.deleted, applicable.candidates);
+    let changed_retry_policy = RetentionPolicy {
+        event_max_age_days: 2,
+        ..policy.clone()
+    };
+    assert!(matches!(
+        bus.apply_retention(
+            "retention-owner",
+            &owner.token,
+            &changed_retry_policy,
+            &applicable.plan_id,
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let state = bus.retention_state().unwrap();
+    assert_eq!(
+        state.events_pruned_through_sequence,
+        applicable.protection.event_prune_through_sequence
+    );
+    assert_eq!(
+        state.last_plan_id.as_deref(),
+        Some(applicable.plan_id.as_str())
+    );
+    assert!(matches!(
+        bus.list_events(0, 100, &[]),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.create_subscription("retention-owner", &owner.token, "too-old", &[], Some(0),),
+        Err(BusError::Conflict(_))
+    ));
+    let snapshot = bus
+        .handoff_snapshot("retention-owner", &owner.token, 0)
+        .unwrap();
+    assert_eq!(
+        snapshot.retention_state.events_pruned_through_sequence,
+        state.events_pruned_through_sequence
+    );
+    assert!(
+        snapshot
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "retention_applied")
+    );
+    assert!(
+        bus.inbox_with_options("retention-owner", &owner.token, false, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bus.list_task_thread_bindings(Some("RETENTION-HISTORY"), false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn concurrent_claim_allows_exactly_one_winner() {
     let harness = Harness::new();
     let mut bus = harness.bus();
@@ -631,7 +860,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 7);
+    assert_eq!(doctor.schema_version, 8);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -785,6 +1014,22 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
         .unwrap();
     assert!(thread_binding_columns.contains(&"thread_id".to_owned()));
     assert!(thread_binding_columns.contains(&"unbound_at".to_owned()));
+    let retention_state_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(retention_state)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(retention_state_columns.contains(&"events_pruned_through_sequence".to_owned()));
+    let retention_run_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(retention_runs)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(retention_run_columns.contains(&"report_json".to_owned()));
 }
 
 #[test]

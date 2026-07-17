@@ -54,6 +54,8 @@ The database is outside the repository by default:
 | `idempotency_records` | Operation-scoped request hashes and cached responses |
 | `subscriptions` | Agent-owned filters, committed cursors, pending deliveries, and last-ACK state |
 | `events` | Append-only audit facts |
+| `retention_state` | Retained event-history floor and latest applied plan |
+| `retention_runs` | Retry-safe immutable cleanup reports keyed by confirmation plan |
 | `schema_migrations` | Applied database schema versions |
 
 ## Invariants
@@ -76,12 +78,16 @@ The database is outside the repository by default:
 16. Closed messages are immutable receipt history and are hidden from the normal inbox.
 17. A task has at most one active Codex-thread binding, managed only by its task owner.
 18. Completed or abandoned tasks have no active thread binding; terminal transition ends it atomically.
+19. Event retention deletes only a contiguous prefix older than policy, below the slowest subscription cursor, and outside the configured recent tail.
+20. A pending subscription delivery is protected because its committed cursor cannot advance until matching ACK.
+21. Retention apply requires an unchanged preview plan; the same confirmed plan can be retried without deleting twice.
+22. Closed messages cannot expire before message idempotency responses that may still reference them.
 
 ## Recovery and retry boundaries
 
 Bearer tokens and recovery keys are generated from independent random UUID material and stored only as SHA-256 digests. Recovery is a credential rotation, not an identity recreation: task ownership, messages, subscriptions, reservations, and artifacts remain attached to the same agent row. A legacy agent can provision its first recovery key using its still-valid bearer token.
 
-Externally retried writes record a canonical JSON request hash and serialized response in the same `BEGIN IMMEDIATE` transaction as the domain mutation. This prevents the common ambiguous-result retry from creating duplicate messages, leases, renewals, or artifacts. Records are deliberately scoped by operation so unrelated APIs may reuse a caller's key.
+Externally retried writes record a canonical JSON request hash and serialized response in the same `BEGIN IMMEDIATE` transaction as the domain mutation. This prevents the common ambiguous-result retry from creating duplicate messages, leases, renewals, or artifacts. Records are deliberately scoped by operation so unrelated APIs may reuse a caller's key. After an explicitly configured idempotency retention window expires, that historical retry guarantee also expires; the cleanup plan reports how many records are affected.
 
 ## Event consumption
 
@@ -97,6 +103,14 @@ Message closing is a recipient-owned terminal receipt action. Closing also recor
 
 A task owner may bind a non-terminal task to one caller-supplied Codex task/thread identifier. Repeating the same bind or unbind returns the original binding state; attempting a second active identifier conflicts. VibeBus stores only the association—it does not invoke Codex thread APIs. Moving a task to `completed` or `abandoned` atomically closes its active binding, so resume snapshots cannot advertise stale execution ownership.
 
+## Bounded retention
+
+Retention is an explicit authenticated two-phase operation. Preview calculates cutoffs and exact candidate counts, then hashes the policy, current event tail, subscription protection boundary, retained-history floor, and candidates into a `planId`. Apply opens `BEGIN IMMEDIATE`, recomputes that plan, and refuses a stale ID before deleting anything. A completed run is stored separately so an ambiguous external retry returns the original report with `replayed=true`.
+
+Events are pruned only as a contiguous prefix. The planned boundary is the minimum of the age boundary, the slowest committed subscription cursor, and the sequence immediately before the configured recent-event tail. A subscription with cursor `0` therefore blocks event deletion; an unacknowledged pending delivery keeps the same protection until ACK. Each successful cleanup appends a new `retention_applied` audit event after deletion and advances a persistent history floor. Event queries or deliberate subscription replays older than that floor conflict instead of silently returning incomplete history; compact handoff snapshots clamp to the available floor.
+
+Other cleanup domains are independent and age-bounded: idempotency records, closed per-recipient receipts, messages left with no receipts, and unbound history for terminal tasks. Active messages, active task bindings, non-terminal task history, subscriptions, tasks, artifacts, agents, reservations, retention reports, and schema records are not removed. Physical `VACUUM` is deliberately not automatic because it requires a more disruptive exclusive database operation; online backups remain the recovery boundary.
+
 ## Codex plugin lifecycle
 
 The plugin contains:
@@ -107,13 +121,13 @@ The plugin contains:
 
 The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call.
 
-## Deliberate non-goals for 0.4
+## Deliberate non-goals for 0.5
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;
 - replacing Codex tasks, worktrees, or native subagents;
 - remote multi-host synchronization;
 - automatic Git merging or conflict resolution;
-- holding secrets in repository files.
+- holding secrets in repository files;
 - exactly-once consumer side effects; replay-safe delivery is at-least-once until ACK;
 - automatic secure credential-vault integration or cross-device credential recovery.

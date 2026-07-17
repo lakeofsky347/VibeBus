@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 - 2026-07-17
+
+- Added authenticated retention planning with explicit, state-bound confirmation IDs.
+- Added retry-safe retention apply for old event prefixes, idempotency records, closed message history, orphaned messages, and terminal task/thread bindings.
+- Protected unread and pending subscription ranges with the slowest committed cursor and always kept a configurable recent event tail.
+- Added a persistent retained-history floor, stale event-cursor rejection, and snapshot-safe cursor clamping.
+- Added cross-policy validation so closed messages outlive their cached message idempotency responses.
+- Added schema-v8 retention state/run audit tables and a `retention_applied` audit event.
+- Expanded CLI, MCP, migration, concurrent apply, stale-plan, cursor-gap, and pending-delivery coverage.
+
 ## 0.4.0 - 2026-07-17
 
 - Added recipient-owned message closing with an ACK-before-close rule for acknowledgement-required messages.

@@ -375,6 +375,105 @@ fn cli_exposes_message_close_and_task_thread_bindings() {
     assert!(unbound["result"]["unboundAt"].as_i64().is_some());
 }
 
+#[test]
+fn cli_requires_a_confirmed_retention_plan_and_replays_apply() {
+    let project = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    initialize_project(project.path(), "CLI retention", Some(data.path())).unwrap();
+    let owner = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "register",
+            "--name",
+            "retention-cli",
+            "--role",
+            "operations",
+        ],
+    );
+    let token = owner["result"]["token"].as_str().unwrap();
+    let plan = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "retention",
+            "plan",
+            "--agent",
+            "retention-cli",
+            "--token",
+            token,
+            "--event-max-age-days",
+            "1",
+            "--keep-recent-events",
+            "1",
+            "--idempotency-max-age-days",
+            "1",
+            "--closed-message-max-age-days",
+            "1",
+            "--terminal-binding-max-age-days",
+            "1",
+        ],
+    );
+    let plan_id = plan["result"]["planId"].as_str().unwrap();
+    assert!(plan_id.starts_with("rtp_"));
+    let applied = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "retention",
+            "apply",
+            "--agent",
+            "retention-cli",
+            "--token",
+            token,
+            "--plan",
+            plan_id,
+            "--event-max-age-days",
+            "1",
+            "--keep-recent-events",
+            "1",
+            "--idempotency-max-age-days",
+            "1",
+            "--closed-message-max-age-days",
+            "1",
+            "--terminal-binding-max-age-days",
+            "1",
+        ],
+    );
+    assert_eq!(applied["result"]["replayed"], false);
+    let replayed = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "retention",
+            "apply",
+            "--agent",
+            "retention-cli",
+            "--token",
+            token,
+            "--plan",
+            plan_id,
+            "--event-max-age-days",
+            "1",
+            "--keep-recent-events",
+            "1",
+            "--idempotency-max-age-days",
+            "1",
+            "--closed-message-max-age-days",
+            "1",
+            "--terminal-binding-max-age-days",
+            "1",
+        ],
+    );
+    assert_eq!(replayed["result"]["replayed"], true);
+    assert_eq!(
+        replayed["result"]["appliedAt"],
+        applied["result"]["appliedAt"]
+    );
+    let status = run_cli(project.path(), data.path(), &["retention", "status"]);
+    assert_eq!(status["result"]["lastPlanId"], plan_id);
+}
+
 fn run_cli(project: &std::path::Path, data: &std::path::Path, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_vibebus"))
         .arg("--root")

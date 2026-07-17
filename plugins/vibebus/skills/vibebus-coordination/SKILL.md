@@ -1,6 +1,6 @@
 ---
 name: vibebus-coordination
-description: Coordinate independent Codex top-level tasks in the same project with VibeBus recoverable identities, directed message lifecycles, atomic task claims, durable task/thread bindings, renewable file reservations, event subscriptions, and structured handoffs. Use when several Codex tasks or worktrees must exchange durable facts without sharing full chat context.
+description: Coordinate independent Codex top-level tasks in the same project with VibeBus recoverable identities, directed message lifecycles, atomic task claims, durable task/thread bindings, renewable file reservations, replay-safe event subscriptions, confirmed bounded retention, and structured handoffs. Use when several Codex tasks or worktrees must exchange durable facts without sharing full chat context.
 ---
 
 # VibeBus coordination
@@ -30,6 +30,8 @@ Use the bundled `vibebus` MCP server as the single coordination interface. VibeB
 - Give every externally retried send, handoff, reservation acquire/renew, or artifact publish a stable `idempotencyKey`. Reuse it only for the identical logical request; a changed payload must use a new key.
 - For event-driven coordination, create one named `vibebus_subscription_create` subscription. Omit `fromSequence` to start at the current tail; use `0` only for deliberate history replay. Prefer `vibebus_subscription_peek`, process every returned event idempotently, then call `vibebus_subscription_ack` with the returned delivery ID. A repeated peek returns the same pending delivery until ACK.
 - Use legacy `vibebus_subscription_poll` only for non-critical consume-on-poll workflows. It commits immediately and refuses to cross a pending replay-safe delivery.
+- Before deliberate history cleanup, create a consistent database backup, call `vibebus_retention_plan`, and inspect every candidate count plus the slowest-cursor protection boundary. Apply only when cleanup is explicitly inside the current task scope. Pass the same policy and returned `planId` to `vibebus_retention_apply`; never guess or reuse a stale plan. Custom closed-message retention must not be shorter than idempotency retention.
+- Check `vibebus_retention_status` before requesting old event history. If a cursor predates `eventsPrunedThroughSequence`, resume from that floor or use independently durable task, message, artifact, or backup state; do not describe the remaining event page as complete history.
 - Complete work with `vibebus_task_complete` using the latest version. Dependency tasks unlock automatically after prerequisites complete.
 
 ## Conflict handling
@@ -42,6 +44,7 @@ Use the bundled `vibebus` MCP server as the single coordination interface. VibeB
 - Idempotency conflict: do not alter the request under the old key. Inspect the already-completed operation, then either accept it or choose a new key for a genuinely new mutation.
 - Subscription delivery conflict: another consumer changed the named cursor or a different delivery is pending. Re-list the subscription, re-peek the pending delivery, and never ACK an ID that was not returned to this consumer.
 - Thread-binding conflict: re-read the task and `vibebus_thread_list`. Do not work in a second native task against an already bound VibeBus task; coordinate a handoff and have the current owner unbind first.
+- Retention-plan conflict: state changed after preview. Re-run `vibebus_retention_plan`, review the new protection boundary and counts, and only then decide whether to apply the new ID. A replayed successful apply is evidence of retry recovery, not a second cleanup.
 - Missing project marker: do not initialize a project implicitly. Tell the user that `vibebus init` must be run deliberately at the intended root.
 
 ## End of turn

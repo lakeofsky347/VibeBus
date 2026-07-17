@@ -16,12 +16,14 @@ use crate::error::{BusError, Result};
 use crate::models::{
     AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, DoctorReport, EventView,
     HandoffSnapshot, MessageReceipt, MessageView, ProjectMetadata, RecoveryKeyView, ReleaseResult,
-    ReservationView, SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll,
-    SubscriptionView, TaskThreadBindingView, TaskView,
+    ReservationView, RetentionCounts, RetentionPlan, RetentionPolicy, RetentionProtectionView,
+    RetentionReport, RetentionStateView, SubscriptionAck, SubscriptionDeliveryView,
+    SubscriptionPeek, SubscriptionPoll, SubscriptionView, TaskThreadBindingView, TaskView,
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+const DAY_MS: i64 = 86_400_000;
 const TASK_STATUSES: &[&str] = &[
     "pending",
     "ready",
@@ -83,6 +85,18 @@ impl SubscriptionRecord {
             last_acked_delivery_id: self.last_acked_delivery_id.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
+        }
+    }
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            event_max_age_days: 90,
+            keep_recent_events: 1_000,
+            idempotency_max_age_days: 30,
+            closed_message_max_age_days: 30,
+            terminal_binding_max_age_days: 90,
         }
     }
 }
@@ -1581,6 +1595,8 @@ impl Bus {
         event_types: &[String],
     ) -> Result<Vec<EventView>> {
         validate_event_query(after_sequence, limit, event_types)?;
+        let retention_state = load_retention_state(&self.conn, &self.project.project_id)?;
+        validate_retained_event_cursor(after_sequence, &retention_state)?;
         query_events(
             &self.conn,
             &self.project.project_id,
@@ -1607,11 +1623,15 @@ impl Bus {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let latest_sequence = latest_event_sequence(&tx, &self.project.project_id)?;
+        let retention_state = load_retention_state(&tx, &self.project.project_id)?;
         let cursor_sequence = from_sequence.unwrap_or(latest_sequence);
         if !(0..=latest_sequence).contains(&cursor_sequence) {
             return Err(BusError::Validation(format!(
                 "subscription cursor must be between 0 and current sequence {latest_sequence}"
             )));
+        }
+        if from_sequence.is_some() {
+            validate_retained_event_cursor(cursor_sequence, &retention_state)?;
         }
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM subscriptions
@@ -2034,7 +2054,12 @@ impl Bus {
             .filter(|artifact| artifact.publisher == agent)
             .take(20)
             .collect();
-        let recent_events = self.list_events(after_sequence, 50, &[])?;
+        let retention_state = self.retention_state()?;
+        let recent_events = self.list_events(
+            after_sequence.max(retention_state.events_pruned_through_sequence),
+            50,
+            &[],
+        )?;
         let latest_event_sequence = latest_event_sequence(&self.conn, &self.project.project_id)?;
         Ok(HandoffSnapshot {
             agent: agent.to_owned(),
@@ -2045,7 +2070,180 @@ impl Bus {
             recent_artifacts,
             recent_events,
             latest_event_sequence,
+            retention_state,
         })
+    }
+
+    pub fn retention_state(&self) -> Result<RetentionStateView> {
+        load_retention_state(&self.conn, &self.project.project_id)
+    }
+
+    pub fn plan_retention(
+        &self,
+        agent: &str,
+        token: &str,
+        policy: &RetentionPolicy,
+    ) -> Result<RetentionPlan> {
+        self.authenticate(agent, token)?;
+        validate_retention_policy(policy)?;
+        build_retention_plan(&self.conn, &self.project.project_id, policy, now_ms())
+    }
+
+    pub fn apply_retention(
+        &mut self,
+        agent: &str,
+        token: &str,
+        policy: &RetentionPolicy,
+        confirmed_plan_id: &str,
+    ) -> Result<RetentionReport> {
+        validate_retention_policy(policy)?;
+        if !confirmed_plan_id.starts_with("rtp_") || confirmed_plan_id.len() != 68 {
+            return Err(BusError::Validation(
+                "retention confirmation must be a plan ID returned by retention plan".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cached: Option<(String, String)> = tx
+            .query_row(
+                "SELECT policy_json, report_json FROM retention_runs
+                 WHERE project_id = ?1 AND plan_id = ?2",
+                params![self.project.project_id, confirmed_plan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_policy, cached_report)) = cached {
+            let stored_policy: RetentionPolicy = serde_json::from_str(&stored_policy)?;
+            if stored_policy != *policy {
+                return Err(BusError::Conflict(
+                    "retention plan retry must use the policy originally confirmed".into(),
+                ));
+            }
+            let mut report: RetentionReport = serde_json::from_str(&cached_report)?;
+            report.replayed = true;
+            tx.commit()?;
+            return Ok(report);
+        }
+
+        let plan = build_retention_plan(&tx, &self.project.project_id, policy, now)?;
+        if plan.plan_id != confirmed_plan_id {
+            return Err(BusError::Conflict(format!(
+                "retention plan is stale: confirmed '{confirmed_plan_id}', current '{}'",
+                plan.plan_id
+            )));
+        }
+
+        let deleted_events = tx.execute(
+            "DELETE FROM events
+             WHERE project_id = ?1 AND sequence > ?2 AND sequence <= ?3",
+            params![
+                self.project.project_id,
+                plan.protection.events_pruned_through_sequence,
+                plan.protection.event_prune_through_sequence
+            ],
+        )? as i64;
+        let closed_message_cutoff = retention_cutoff(now, policy.closed_message_max_age_days)?;
+        let deleted_receipts = tx.execute(
+            "DELETE FROM message_receipts
+             WHERE closed_at IS NOT NULL AND closed_at < ?1
+               AND EXISTS (
+                 SELECT 1 FROM messages m
+                 WHERE m.id = message_receipts.message_id AND m.project_id = ?2
+               )",
+            params![closed_message_cutoff, self.project.project_id],
+        )? as i64;
+        let deleted_messages = tx.execute(
+            "DELETE FROM messages
+             WHERE project_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM message_receipts r WHERE r.message_id = messages.id
+               )",
+            params![self.project.project_id],
+        )? as i64;
+        let binding_cutoff = retention_cutoff(now, policy.terminal_binding_max_age_days)?;
+        let deleted_bindings = tx.execute(
+            "DELETE FROM task_thread_bindings
+             WHERE project_id = ?1 AND unbound_at IS NOT NULL AND unbound_at < ?2
+               AND EXISTS (
+                 SELECT 1 FROM tasks t
+                 WHERE t.project_id = task_thread_bindings.project_id
+                   AND t.id = task_thread_bindings.task_id
+                   AND t.status IN ('completed', 'abandoned')
+               )",
+            params![self.project.project_id, binding_cutoff],
+        )? as i64;
+        let idempotency_cutoff = retention_cutoff(now, policy.idempotency_max_age_days)?;
+        let deleted_idempotency = tx.execute(
+            "DELETE FROM idempotency_records
+             WHERE project_id = ?1 AND created_at < ?2",
+            params![self.project.project_id, idempotency_cutoff],
+        )? as i64;
+        let deleted = RetentionCounts {
+            events: deleted_events,
+            idempotency_records: deleted_idempotency,
+            message_receipts: deleted_receipts,
+            messages: deleted_messages,
+            task_thread_bindings: deleted_bindings,
+        };
+        if deleted != plan.candidates {
+            return Err(BusError::Conflict(
+                "retention candidates changed while applying the confirmed plan".into(),
+            ));
+        }
+
+        tx.execute(
+            "INSERT INTO retention_state
+             (project_id, events_pruned_through_sequence, last_applied_at, last_plan_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET
+               events_pruned_through_sequence = excluded.events_pruned_through_sequence,
+               last_applied_at = excluded.last_applied_at,
+               last_plan_id = excluded.last_plan_id",
+            params![
+                self.project.project_id,
+                plan.protection.event_prune_through_sequence,
+                now,
+                plan.plan_id
+            ],
+        )?;
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "retention_applied",
+            "retention_plan",
+            &plan.plan_id,
+            json!({
+                "policy": &plan.policy,
+                "deleted": &deleted,
+                "eventsPrunedThroughSequence": plan.protection.event_prune_through_sequence
+            }),
+        )?;
+        let report = RetentionReport {
+            plan_id: plan.plan_id.clone(),
+            applied_at: now,
+            deleted,
+            events_pruned_through_sequence: plan.protection.event_prune_through_sequence,
+            replayed: false,
+        };
+        tx.execute(
+            "INSERT INTO retention_runs
+             (project_id, plan_id, actor_agent_id, policy_json, report_json, applied_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                self.project.project_id,
+                plan.plan_id,
+                actor.id,
+                serde_json::to_string(&plan.policy)?,
+                serde_json::to_string(&report)?,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(report)
     }
 
     pub fn doctor(&self) -> Result<DoctorReport> {
@@ -2418,6 +2616,24 @@ impl Bus {
                 FOREIGN KEY(project_id) REFERENCES projects(id),
                 FOREIGN KEY(actor_agent_id) REFERENCES agents(id)
              );
+             CREATE TABLE IF NOT EXISTS retention_state (
+                project_id TEXT PRIMARY KEY,
+                events_pruned_through_sequence INTEGER NOT NULL DEFAULT 0,
+                last_applied_at INTEGER,
+                last_plan_id TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+             );
+             CREATE TABLE IF NOT EXISTS retention_runs (
+                project_id TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                actor_agent_id TEXT NOT NULL,
+                policy_json TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                applied_at INTEGER NOT NULL,
+                PRIMARY KEY(project_id, plan_id),
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(actor_agent_id) REFERENCES agents(id)
+             );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency
                 ON events(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_receipts_agent_unread
@@ -2435,7 +2651,9 @@ impl Bus {
              CREATE INDEX IF NOT EXISTS idx_idempotency_created
                 ON idempotency_records(project_id, created_at);
              CREATE INDEX IF NOT EXISTS idx_subscriptions_agent
-                ON subscriptions(project_id, agent_id, name);",
+                ON subscriptions(project_id, agent_id, name);
+             CREATE INDEX IF NOT EXISTS idx_retention_runs_applied
+                ON retention_runs(project_id, applied_at);",
         )?;
         ensure_column(&self.conn, "agents", "recovery_hash", "TEXT")?;
         ensure_column(
@@ -2583,6 +2801,201 @@ fn load_subscription_record(
             map_subscription_record,
         )
         .optional()?)
+}
+
+fn load_retention_state(connection: &Connection, project_id: &str) -> Result<RetentionStateView> {
+    let stored: Option<(i64, Option<i64>, Option<String>)> = connection
+        .query_row(
+            "SELECT events_pruned_through_sequence, last_applied_at, last_plan_id
+             FROM retention_state WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (events_pruned_through_sequence, last_applied_at, last_plan_id) =
+        stored.unwrap_or((0, None, None));
+    Ok(RetentionStateView {
+        events_pruned_through_sequence,
+        earliest_available_event_sequence: events_pruned_through_sequence.saturating_add(1),
+        last_applied_at,
+        last_plan_id,
+    })
+}
+
+fn validate_retained_event_cursor(after_sequence: i64, state: &RetentionStateView) -> Result<()> {
+    if after_sequence < state.events_pruned_through_sequence {
+        return Err(BusError::Conflict(format!(
+            "event cursor {after_sequence} predates retained history; use afterSequence {} or later",
+            state.events_pruned_through_sequence
+        )));
+    }
+    Ok(())
+}
+
+fn validate_retention_policy(policy: &RetentionPolicy) -> Result<()> {
+    for (label, days) in [
+        ("eventMaxAgeDays", policy.event_max_age_days),
+        ("idempotencyMaxAgeDays", policy.idempotency_max_age_days),
+        (
+            "closedMessageMaxAgeDays",
+            policy.closed_message_max_age_days,
+        ),
+        (
+            "terminalBindingMaxAgeDays",
+            policy.terminal_binding_max_age_days,
+        ),
+    ] {
+        if !(1..=3_650).contains(&days) {
+            return Err(BusError::Validation(format!(
+                "{label} must be between 1 and 3650"
+            )));
+        }
+    }
+    if !(1..=1_000_000).contains(&policy.keep_recent_events) {
+        return Err(BusError::Validation(
+            "keepRecentEvents must be between 1 and 1000000".into(),
+        ));
+    }
+    if policy.closed_message_max_age_days < policy.idempotency_max_age_days {
+        return Err(BusError::Validation(
+            "closedMessageMaxAgeDays must be greater than or equal to idempotencyMaxAgeDays so cached message retries never reference deleted messages"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn retention_cutoff(now: i64, days: i64) -> Result<i64> {
+    let age = days
+        .checked_mul(DAY_MS)
+        .ok_or_else(|| BusError::Validation("retention age is too large".into()))?;
+    now.checked_sub(age)
+        .ok_or_else(|| BusError::Validation("retention cutoff is outside timestamp range".into()))
+}
+
+fn build_retention_plan(
+    connection: &Connection,
+    project_id: &str,
+    policy: &RetentionPolicy,
+    generated_at: i64,
+) -> Result<RetentionPlan> {
+    validate_retention_policy(policy)?;
+    let state = load_retention_state(connection, project_id)?;
+    let latest_event_sequence = latest_event_sequence(connection, project_id)?;
+    let (subscription_count, pending_delivery_count, slowest_cursor): (i64, i64, Option<i64>) =
+        connection.query_row(
+            "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN pending_delivery_id IS NULL THEN 0 ELSE 1 END), 0),
+                MIN(cursor_sequence)
+         FROM subscriptions WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let safe_event_sequence = slowest_cursor.unwrap_or(latest_event_sequence);
+    let event_cutoff = retention_cutoff(generated_at, policy.event_max_age_days)?;
+    let age_boundary: i64 = connection.query_row(
+        "SELECT COALESCE(MIN(sequence) - 1, ?3)
+         FROM events
+         WHERE project_id = ?1 AND sequence > ?2 AND created_at >= ?4",
+        params![
+            project_id,
+            state.events_pruned_through_sequence,
+            latest_event_sequence,
+            event_cutoff
+        ],
+        |row| row.get(0),
+    )?;
+    let recent_offset = policy.keep_recent_events - 1;
+    let recent_floor: Option<i64> = connection
+        .query_row(
+            "SELECT sequence FROM events
+             WHERE project_id = ?1 ORDER BY sequence DESC LIMIT 1 OFFSET ?2",
+            params![project_id, recent_offset],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let recent_boundary = recent_floor
+        .map(|sequence| sequence.saturating_sub(1))
+        .unwrap_or(state.events_pruned_through_sequence);
+    let event_prune_through_sequence = safe_event_sequence
+        .min(age_boundary)
+        .min(recent_boundary)
+        .max(state.events_pruned_through_sequence);
+    let event_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM events
+         WHERE project_id = ?1 AND sequence > ?2 AND sequence <= ?3",
+        params![
+            project_id,
+            state.events_pruned_through_sequence,
+            event_prune_through_sequence
+        ],
+        |row| row.get(0),
+    )?;
+
+    let idempotency_cutoff = retention_cutoff(generated_at, policy.idempotency_max_age_days)?;
+    let idempotency_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM idempotency_records
+         WHERE project_id = ?1 AND created_at < ?2",
+        params![project_id, idempotency_cutoff],
+        |row| row.get(0),
+    )?;
+    let closed_message_cutoff = retention_cutoff(generated_at, policy.closed_message_max_age_days)?;
+    let receipt_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM message_receipts r JOIN messages m ON m.id = r.message_id
+         WHERE m.project_id = ?1 AND r.closed_at IS NOT NULL AND r.closed_at < ?2",
+        params![project_id, closed_message_cutoff],
+        |row| row.get(0),
+    )?;
+    let message_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM messages m
+         WHERE m.project_id = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM message_receipts r
+             WHERE r.message_id = m.id
+               AND (r.closed_at IS NULL OR r.closed_at >= ?2)
+           )",
+        params![project_id, closed_message_cutoff],
+        |row| row.get(0),
+    )?;
+    let binding_cutoff = retention_cutoff(generated_at, policy.terminal_binding_max_age_days)?;
+    let binding_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM task_thread_bindings b
+         JOIN tasks t ON t.project_id = b.project_id AND t.id = b.task_id
+         WHERE b.project_id = ?1 AND b.unbound_at IS NOT NULL AND b.unbound_at < ?2
+           AND t.status IN ('completed', 'abandoned')",
+        params![project_id, binding_cutoff],
+        |row| row.get(0),
+    )?;
+    let candidates = RetentionCounts {
+        events: event_candidates,
+        idempotency_records: idempotency_candidates,
+        message_receipts: receipt_candidates,
+        messages: message_candidates,
+        task_thread_bindings: binding_candidates,
+    };
+    let protection = RetentionProtectionView {
+        latest_event_sequence,
+        events_pruned_through_sequence: state.events_pruned_through_sequence,
+        safe_event_sequence,
+        event_prune_through_sequence,
+        subscription_count,
+        pending_delivery_count,
+    };
+    let plan_hash = hash_json(&json!({
+        "projectId": project_id,
+        "policy": policy,
+        "protection": &protection,
+        "candidates": &candidates
+    }))?;
+    Ok(RetentionPlan {
+        plan_id: format!("rtp_{plan_hash}"),
+        generated_at,
+        policy: policy.clone(),
+        protection,
+        candidates,
+    })
 }
 
 fn append_event(
