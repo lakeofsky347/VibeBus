@@ -83,6 +83,9 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     assert!(names.contains(&"vibebus_thread_bind"));
     assert!(names.contains(&"vibebus_thread_unbind"));
     assert!(names.contains(&"vibebus_thread_list"));
+    assert!(names.contains(&"vibebus_retention_plan"));
+    assert!(names.contains(&"vibebus_retention_apply"));
+    assert!(names.contains(&"vibebus_retention_status"));
 
     send(
         &mut writer,

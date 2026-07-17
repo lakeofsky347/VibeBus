@@ -8,7 +8,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Bus, BusError};
+use crate::{Bus, BusError, RetentionPolicy};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -230,6 +230,35 @@ pub struct EventListRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct RetentionPlanRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: String,
+    pub event_max_age_days: Option<i64>,
+    pub keep_recent_events: Option<i64>,
+    pub idempotency_max_age_days: Option<i64>,
+    pub closed_message_max_age_days: Option<i64>,
+    pub terminal_binding_max_age_days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionApplyRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: String,
+    pub plan_id: String,
+    pub event_max_age_days: Option<i64>,
+    pub keep_recent_events: Option<i64>,
+    pub idempotency_max_age_days: Option<i64>,
+    pub closed_message_max_age_days: Option<i64>,
+    pub terminal_binding_max_age_days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SubscriptionCreateRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
@@ -337,6 +366,7 @@ impl VibeBusMcp {
             "agents": bus.list_agents().map_err(bus_error)?,
             "tasks": bus.list_tasks().map_err(bus_error)?,
             "threadBindings": bus.list_task_thread_bindings(None, true).map_err(bus_error)?,
+            "retention": bus.retention_state().map_err(bus_error)?,
             "reservations": bus.list_active_reservations().map_err(bus_error)?,
             "artifacts": bus.list_artifacts(None).map_err(bus_error)?
         }))
@@ -716,6 +746,57 @@ impl VibeBusMcp {
         )
     }
 
+    #[tool(
+        description = "Preview bounded retention candidates without deleting data; returns a confirmation plan ID"
+    )]
+    fn vibebus_retention_plan(
+        &self,
+        Parameters(request): Parameters<RetentionPlanRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        let policy = retention_policy(
+            request.event_max_age_days,
+            request.keep_recent_events,
+            request.idempotency_max_age_days,
+            request.closed_message_max_age_days,
+            request.terminal_binding_max_age_days,
+        );
+        json_text(
+            &bus.plan_retention(&request.agent, &request.token, &policy)
+                .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Apply an unchanged retention plan; stale confirmation IDs conflict and retries are replay-safe"
+    )]
+    fn vibebus_retention_apply(
+        &self,
+        Parameters(request): Parameters<RetentionApplyRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        let policy = retention_policy(
+            request.event_max_age_days,
+            request.keep_recent_events,
+            request.idempotency_max_age_days,
+            request.closed_message_max_age_days,
+            request.terminal_binding_max_age_days,
+        );
+        json_text(
+            &bus.apply_retention(&request.agent, &request.token, &policy, &request.plan_id)
+                .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(description = "Inspect the retained event-history floor and most recent cleanup run")]
+    fn vibebus_retention_status(
+        &self,
+        Parameters(request): Parameters<RootRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        json_text(&bus.retention_state().map_err(bus_error)?)
+    }
+
     #[tool(description = "Create a named authenticated event subscription with a durable cursor")]
     fn vibebus_subscription_create(
         &self,
@@ -888,6 +969,26 @@ pub async fn run_mcp(
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+fn retention_policy(
+    event_max_age_days: Option<i64>,
+    keep_recent_events: Option<i64>,
+    idempotency_max_age_days: Option<i64>,
+    closed_message_max_age_days: Option<i64>,
+    terminal_binding_max_age_days: Option<i64>,
+) -> RetentionPolicy {
+    let defaults = RetentionPolicy::default();
+    RetentionPolicy {
+        event_max_age_days: event_max_age_days.unwrap_or(defaults.event_max_age_days),
+        keep_recent_events: keep_recent_events.unwrap_or(defaults.keep_recent_events),
+        idempotency_max_age_days: idempotency_max_age_days
+            .unwrap_or(defaults.idempotency_max_age_days),
+        closed_message_max_age_days: closed_message_max_age_days
+            .unwrap_or(defaults.closed_message_max_age_days),
+        terminal_binding_max_age_days: terminal_binding_max_age_days
+            .unwrap_or(defaults.terminal_binding_max_age_days),
+    }
 }
 
 fn json_text<T: Serialize>(value: &T) -> Result<String, ErrorData> {

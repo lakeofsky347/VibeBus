@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
-use vibebus::{Bus, BusError, Result, initialize_project, mcp::run_mcp};
+use vibebus::{Bus, BusError, Result, RetentionPolicy, initialize_project, mcp::run_mcp};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,6 +68,10 @@ enum Command {
     Subscription {
         #[command(subcommand)]
         command: SubscriptionCommand,
+    },
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
     },
     Handoff {
         #[command(subcommand)]
@@ -394,6 +398,55 @@ enum HandoffCommand {
     },
 }
 
+#[derive(Debug, Args)]
+struct RetentionPolicyArgs {
+    #[arg(long, default_value_t = 90)]
+    event_max_age_days: i64,
+    #[arg(long, default_value_t = 1_000)]
+    keep_recent_events: i64,
+    #[arg(long, default_value_t = 30)]
+    idempotency_max_age_days: i64,
+    #[arg(long, default_value_t = 30)]
+    closed_message_max_age_days: i64,
+    #[arg(long, default_value_t = 90)]
+    terminal_binding_max_age_days: i64,
+}
+
+impl From<RetentionPolicyArgs> for RetentionPolicy {
+    fn from(args: RetentionPolicyArgs) -> Self {
+        Self {
+            event_max_age_days: args.event_max_age_days,
+            keep_recent_events: args.keep_recent_events,
+            idempotency_max_age_days: args.idempotency_max_age_days,
+            closed_message_max_age_days: args.closed_message_max_age_days,
+            terminal_binding_max_age_days: args.terminal_binding_max_age_days,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum RetentionCommand {
+    Plan {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[command(flatten)]
+        policy: RetentionPolicyArgs,
+    },
+    Apply {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        plan: String,
+        #[command(flatten)]
+        policy: RetentionPolicyArgs,
+    },
+    Status,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -694,6 +747,26 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 json!(bus.acknowledge_subscription(&agent, &token, &name, &delivery)?)
             }
         },
+        Command::Retention { command } => match command {
+            RetentionCommand::Plan {
+                agent,
+                token,
+                policy,
+            } => {
+                let token = resolve_token(token)?;
+                json!(bus.plan_retention(&agent, &token, &policy.into())?)
+            }
+            RetentionCommand::Apply {
+                agent,
+                token,
+                plan,
+                policy,
+            } => {
+                let token = resolve_token(token)?;
+                json!(bus.apply_retention(&agent, &token, &policy.into(), &plan)?)
+            }
+            RetentionCommand::Status => json!(bus.retention_state()?),
+        },
         Command::Handoff { command } => match command {
             HandoffCommand::Send {
                 from,
@@ -737,6 +810,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             "agents": bus.list_agents()?,
             "tasks": bus.list_tasks()?,
             "threadBindings": bus.list_task_thread_bindings(None, true)?,
+            "retention": bus.retention_state()?,
             "reservations": bus.list_active_reservations()?,
             "artifacts": bus.list_artifacts(None)?
         }),
