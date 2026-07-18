@@ -39,6 +39,8 @@ $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
 
 发布脚本会生成 `plugins\vibebus\bin\vibebus.exe`、当前用户级 MSI、便携 marketplace 包、独立插件包、SHA-256 校验和与发布清单。插件的 `.mcp.json` 从打包后的二进制路径启动 stdio MCP 服务。单独更新插件二进制仍可运行 `powershell -File .\scripts\package-plugin.ps1`。
 
+2026-07-18 已完成真实桌面验收：严格预检 68/68，通过两个独立、用户拥有的 Codex 顶层任务按 B1/A1/B2/A2 协作，最终审计 178/178（0 失败、0 跳过）。完整证据见[双顶层任务桌面验收](docs/desktop-acceptance.md)，企划差距与后续优先级见[企划差距分析](docs/plan-gap-analysis.md)。
+
 ## 初始化项目
 
 ```powershell
@@ -106,6 +108,7 @@ MSI 安装到 `%LOCALAPPDATA%\Programs\VibeBus`，并将其中的 `plugins\vibeb
 - [验收记录](docs/acceptance.md)
 - [Operator 真实终端验收](docs/operator-acceptance.md)
 - [双顶层任务桌面验收](docs/desktop-acceptance.md)
+- [企划差距分析](docs/plan-gap-analysis.md)
 - [发布工程](docs/release.md)
 - [后续接手](docs/HANDOFF.md)
 

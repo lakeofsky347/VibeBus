@@ -162,3 +162,22 @@ powershell -NoProfile -File .\scripts\audit-desktop-acceptance.ps1 -ProjectRoot 
 Require JSON `ok=true`, `summary.failed=0`, and `summary.skipped=0`. The auditor reads VibeBus status, Agent credential metadata, tasks, closed bindings, messages, reservation events, subscription state, backup identity, Operator state, and Git state. Authenticated reads may refresh the relevant Agent `lastSeenAt`, but the auditor never receives a bearer token or recovery key and performs no ACK, close, Operator, retention, task, reservation, artifact, subscription-cursor, repository, or event-producing mutation.
 
 Only after the audit passes should the root task ACK and close the final handoff, update `docs/acceptance.md`, publish the evidence, and optionally remove the two disposable Agent vault entries. Credential deletion is explicit and irreversible for the local vault copy; never perform it before the recovery-key-retention evidence is durable. The subscription and database Agent rows remain audit history.
+
+## Accepted execution record
+
+The fixed run completed on 2026-07-18 exactly as staged:
+
+| Gate | Accepted evidence |
+| --- | --- |
+| Preflight | `2026-07-18T05:21:07Z`; 68 passed, 0 failed, 0 skipped, including clean Git and upstream equality |
+| Task B | User-owned top-level task `019f73ad-0618-76a1-9c42-e17a8fda1486`; final phase markers `READY_FOR_A` and `B_RESULT_SENT` |
+| Task A | User-owned top-level task `019f73af-839c-7b03-a62b-09fd7eb07ec0`; final phase markers `WAITING_FOR_B_RESULT` and `DESKTOP_ACCEPTANCE_READY_FOR_AUDIT` |
+| A-to-B handoff | `msg_42112ccc95584a26988c263ae60ed0b2`; ACKed and closed by B |
+| B-to-A handoff | `msg_71fff6874eff46078a8ae895f975feff`; ACKed and closed by A |
+| A-to-root handoff | `msg_438b66a994574f6393b977f7d958beec`; audited while unread/open, then ACKed at `1784353201423` and closed at `1784353206244` |
+| Reservation | `rsv_8c26986f53cc46729b68f0ec3877d782`; expiry renewed from `1784353036068` to `1784353342645`, competing overlap rejected, finally released |
+| Replay-safe delivery | `sdl_d287418ff18a4ef78d732a8c413afa6d`; same delivery on repeated peek, ACK replay `false` then `true`, no pending delivery |
+| Audit | `2026-07-18T05:39:45Z`; 178 passed, 0 failed, 0 skipped |
+| Recovery point | `backups/vibebus-0.8-desktop-acceptance.db`; 589,824 bytes; SHA-256 `5928201fd62fa0d5a7588a91650bfaf86ace173f0c43f2b10eb9f4c8f232d37b` |
+
+All four fixture tasks are terminal, all four task/thread bindings are closed, no acceptance reservation remains, `doctor.ok=true`, and the live Operator remains unconfigured. The final 178-check audit intentionally ran before the root ACK/close, because unread/open status of that final evidence handoff is an audit gate. The retained A/B vault entries remain a deliberate regression asset until the maintainer explicitly chooses to delete them.

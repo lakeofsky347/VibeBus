@@ -107,9 +107,25 @@ Explicit Agent credential deletion returned `deleted=true` and `stored=false`. I
 
 `scripts/preflight-desktop-acceptance.ps1` now verifies the fixed two-real-task fixture before either user-owned top-level task is created. It is read-only and fails closed on fixture identity drift, Agent or vault residue, task state/version/dependency drift, binding history, a live acceptance reservation, schema or Operator drift, backup size/hash drift, a dirty checkout, or a `HEAD`/upstream mismatch.
 
-Windows PowerShell 5.1 accepted the pristine live fixture with `-SkipGit` during development: 68 checks, 66 passed, 0 failed, and 2 explicitly skipped Git gates. A deliberate wrong run ID exited 1 with one failed fixture-identity check. The real desktop run must execute the script again without `-SkipGit` from a clean pushed checkout and require zero failed or skipped checks.
+Windows PowerShell 5.1 accepted the pristine live fixture with `-SkipGit` during development: 68 checks, 66 passed, 0 failed, and 2 explicitly skipped Git gates. A deliberate wrong run ID exited 1 with one failed fixture-identity check. The final clean-checkout preflight ran without `-SkipGit` at `2026-07-18T05:21:07Z` and passed all 68 checks with zero failures and zero skips. During preparation, the script was hardened to preserve empty JSON lists as PowerShell arrays so the active-reservation gate cannot silently disappear under Windows PowerShell 5.1.
+
+## Two-real-task desktop acceptance
+
+The fixed desktop run `desktop-20260717-01` completed on 2026-07-18 using two independent, user-owned Codex top-level tasks:
+
+- Task B `019f73ad-0618-76a1-9c42-e17a8fda1486` executed B1 and B2 as `desktop-b-20260717-01`.
+- Task A `019f73af-839c-7b03-a62b-09fd7eb07ec0` executed A1 and A2 as `desktop-a-20260717-01`.
+- The two task IDs differ, while each Agent's readiness/result or claim/finalize bindings reuse that Agent's real native task ID and are closed after terminal task completion.
+
+Both Agent credentials are stored in Windows Credential Manager with recovery-key retention and redacted responses. B completed `DESKTOP-B-READY-001`, created subscription `desktop-20260717-01`, and stopped at the required `READY_FOR_A` gate. A then claimed and completed `DESKTOP-CLAIM-001`, acquired reservation `rsv_8c26986f53cc46729b68f0ec3877d782`, renewed its expiry from `1784353036068` to `1784353342645`, sent the structured A-to-B handoff `msg_42112ccc95584a26988c263ae60ed0b2`, and stopped at `WAITING_FOR_B_RESULT`.
+
+B's second phase proved replay-safe delivery `sdl_d287418ff18a4ef78d732a8c413afa6d`: repeated peek returned the same delivery, first ACK returned `replayed=false`, retry returned `replayed=true`, and the subscription ended with no pending delivery. B also proved that a competing claim and overlapping reservation both return `conflict` without changing A's ownership. B completed `DESKTOP-B-RESULT-001` and sent result handoff `msg_71fff6874eff46078a8ae895f975feff`. A ACKed and closed that handoff, released the reservation, completed `DESKTOP-A-FINALIZE-001`, and sent final root handoff `msg_438b66a994574f6393b977f7d958beec`.
+
+Before the root recipient mutated that final handoff or edited the repository, `scripts/audit-desktop-acceptance.ps1` ran from a clean pushed checkout at `2026-07-18T05:39:45Z` and passed all 178 checks with zero failures and zero skips. The root then ACKed the final handoff at `1784353201423` and closed it at `1784353206244`. `doctor.ok=true`, the Operator remains unconfigured, no acceptance reservation remains, and the accepted post-run online backup `backups/vibebus-0.8-desktop-acceptance.db` is 589,824 bytes with SHA-256 `5928201fd62fa0d5a7588a91650bfaf86ace173f0c43f2b10eb9f4c8f232d37b`.
+
+The two desktop Agent vault entries remain stored intentionally for repeatable regression and were not deleted implicitly. Their deletion, if desired, is a separate explicit local-vault decision; the database Agent, task, message, subscription, and binding history remains authoritative audit evidence either way.
 
 ## Remaining manual acceptance
 
-1. Run `scripts/preflight-desktop-acceptance.ps1` without `-SkipGit`, then follow `docs/desktop-acceptance.md` with two new independent, user-owned Codex top-level tasks in the same initialized project; verify registration/recovery-key retention, a structured handoff plus ACK/close, a competing task claim, a reservation conflict plus owner renewal, and subscription peek/ACK replay through the actual UI. The deterministic fixture, start-state preflight, copy-ready A/B prompts, and non-destructive `scripts/audit-desktop-acceptance.ps1` evidence verifier are prepared, but the two user-owned tasks have not yet been created.
-2. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.
+1. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.
+2. Separately decide whether the retained desktop A/B Windows vault entries should remain as regression identities or be explicitly deleted. This is not a product acceptance blocker.
