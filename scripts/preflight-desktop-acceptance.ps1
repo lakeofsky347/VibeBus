@@ -186,19 +186,19 @@ Add-EqualCheck -Name "fixture.controllerAgent" -Actual $ControllerAgent -Expecte
 
 $doctor = Get-VibeBusResult -Name "doctor" -Arguments @("doctor", "--root", $ProjectRoot)
 $operator = Get-VibeBusResult -Name "operator-status" -Arguments @("operator", "status", "--root", $ProjectRoot)
-$agents = Get-VibeBusResult -Name "agents" -Arguments @("agents", "--root", $ProjectRoot)
+$agents = @(Get-VibeBusResult -Name "agents" -Arguments @("agents", "--root", $ProjectRoot))
 $credentialA = Get-VibeBusResult -Name "credential-a" -Arguments @(
     "credential", "status", "--root", $ProjectRoot, "--agent", $AgentA
 )
 $credentialB = Get-VibeBusResult -Name "credential-b" -Arguments @(
     "credential", "status", "--root", $ProjectRoot, "--agent", $AgentB
 )
-$tasks = Get-VibeBusResult -Name "tasks" -Arguments @("task", "list", "--root", $ProjectRoot)
-$bindings = Get-VibeBusResult -Name "bindings" -Arguments @("thread", "list", "--root", $ProjectRoot, "--all")
-$reservations = Get-VibeBusResult -Name "reservations" -Arguments @("reserve", "list", "--root", $ProjectRoot)
-$artifacts = Get-VibeBusResult -Name "controller-artifacts" -Arguments @(
+$tasks = @(Get-VibeBusResult -Name "tasks" -Arguments @("task", "list", "--root", $ProjectRoot))
+$bindings = @(Get-VibeBusResult -Name "bindings" -Arguments @("thread", "list", "--root", $ProjectRoot, "--all"))
+$reservations = @(Get-VibeBusResult -Name "reservations" -Arguments @("reserve", "list", "--root", $ProjectRoot))
+$artifacts = @(Get-VibeBusResult -Name "controller-artifacts" -Arguments @(
     "artifact", "list", "--root", $ProjectRoot, "--task", $taskIds.Controller
-)
+))
 
 if ($null -ne $doctor) {
     Add-EqualCheck -Name "doctor.ok" -Actual $doctor.ok -Expected $true
