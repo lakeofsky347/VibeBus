@@ -636,6 +636,186 @@ fn cli_requires_a_confirmed_retention_plan_and_replays_apply() {
 }
 
 #[test]
+fn cli_exposes_responsibility_facts_and_bounded_handoff_proposals() {
+    let project = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    initialize_project(project.path(), "CLI responsibility", Some(data.path())).unwrap();
+    fs::create_dir_all(project.path().join(".vibebus")).unwrap();
+    fs::write(
+        project.path().join(".vibebus/responsibility.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "defaultAllowedPaths": [],
+            "roles": {"implementation": {"allowedPaths": ["src/**"]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let registration = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "register",
+            "--name",
+            "cli-policy",
+            "--role",
+            "implementation",
+        ],
+    );
+    let token = registration["result"]["token"].as_str().unwrap();
+    run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "task",
+            "create",
+            "--agent",
+            "cli-policy",
+            "--token",
+            token,
+            "--id",
+            "CLI-POLICY-001",
+            "--title",
+            "Exercise policy facts",
+        ],
+    );
+    run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "task",
+            "claim",
+            "--agent",
+            "cli-policy",
+            "--token",
+            token,
+            "--id",
+            "CLI-POLICY-001",
+        ],
+    );
+
+    let inspected = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "responsibility",
+            "inspect",
+            "--agent",
+            "cli-policy",
+            "--token",
+            token,
+        ],
+    );
+    assert_eq!(inspected["result"]["configured"], true);
+    assert_eq!(inspected["result"]["allowedPaths"][0], "src/**");
+
+    let granted = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "responsibility",
+            "override",
+            "--agent",
+            "cli-policy",
+            "--token",
+            token,
+            "--task",
+            "CLI-POLICY-001",
+            "--grantee",
+            "cli-policy",
+            "--path",
+            "docs/**",
+            "--reason",
+            "Document this task",
+            "--ttl",
+            "600",
+            "--idempotency-key",
+            "cli-policy-override",
+        ],
+    );
+    assert_eq!(granted["result"]["pathPattern"], "docs/**");
+
+    let commit = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "fact",
+            "git-commit",
+            "--agent",
+            "cli-policy",
+            "--token",
+            token,
+            "--task",
+            "CLI-POLICY-001",
+            "--commit-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--summary",
+            "Add responsibility documentation",
+            "--changed-path",
+            "docs/policy.md",
+            "--idempotency-key",
+            "cli-policy-commit",
+        ],
+    );
+    assert_eq!(commit["result"]["changedPaths"][0], "docs/policy.md");
+
+    let result = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "fact",
+            "test-result",
+            "--agent",
+            "cli-policy",
+            "--token",
+            token,
+            "--task",
+            "CLI-POLICY-001",
+            "--result-key",
+            "cargo-test-head",
+            "--suite",
+            "cargo test",
+            "--outcome",
+            "passed",
+            "--summary",
+            "All tests passed",
+            "--command",
+            "cargo test --all-targets --locked",
+            "--idempotency-key",
+            "cli-policy-test",
+        ],
+    );
+    assert_eq!(result["result"]["outcome"], "passed");
+
+    let proposal = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "handoff",
+            "propose",
+            "--agent",
+            "cli-policy",
+            "--token",
+            token,
+            "--task",
+            "CLI-POLICY-001",
+            "--item-limit",
+            "5",
+        ],
+    );
+    assert_eq!(proposal["result"]["task"]["taskId"], "CLI-POLICY-001");
+    assert_eq!(
+        proposal["result"]["gitCommits"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        proposal["result"]["testResults"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[test]
 fn operator_mutations_reject_redirected_noninteractive_cli_calls() {
     let project = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();

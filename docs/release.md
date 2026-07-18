@@ -1,6 +1,6 @@
 # Release engineering
 
-VibeBus 0.9 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
+VibeBus 0.10 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
 
 ## Outputs
 
@@ -29,12 +29,13 @@ The repository pins Rust 1.97.1 in `rust-toolchain.toml` and WiX 4.0.6 in `.conf
 cargo fmt --all -- --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
+./scripts/test-lifecycle-hooks.ps1
 ./scripts/build-release.ps1
 $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
 ./scripts/test-installer.ps1 -MsiPath $msi.FullName
 ```
 
-The installer acceptance runs the stock MSI ICE checks except ICE91. ICE91 only warns that the intentionally per-user payload would not behave like a per-machine payload. The acceptance then creates an administrative image in a unique temporary directory, verifies the marketplace, manifest, MCP configuration, binary, hook, script, and Skill, executes the extracted binary, and removes the temporary image.
+The lifecycle acceptance runs deterministic dry-run fixtures for Git commit capture, test-result capture, unknown-outcome refusal, and review-only Stop proposals. The installer acceptance runs the stock MSI ICE checks except ICE91. ICE91 only warns that the intentionally per-user payload would not behave like a per-machine payload. The acceptance then creates an administrative image in a unique temporary directory, verifies the marketplace, manifest, MCP configuration, binary, Hooks, scripts, and Skill, executes the extracted binary, and removes the temporary image.
 
 Local builds are unsigned unless `-Sign` is supplied with both signing environment variables. This permits PR validation without sharing a private key. A local unsigned package is not a production release.
 
@@ -62,7 +63,7 @@ Do not commit a PFX, Base64 certificate, password, or decoded temporary file. Gi
 
 ## GitHub Actions behavior
 
-`.github/workflows/ci.yml` runs on pull requests, `main` pushes, and manual dispatch. It has read-only `contents` permission and performs formatting, tests, Clippy-as-error, release packaging, MSI validation, administrative extraction, and 14-day workflow artifact upload.
+`.github/workflows/ci.yml` runs on pull requests, `main` pushes, and manual dispatch. It has read-only `contents` permission and performs formatting, tests, Clippy-as-error, lifecycle-Hook fixtures, release packaging, MSI validation, administrative extraction, and 14-day workflow artifact upload.
 
 `.github/workflows/release.yml` runs for `v*.*.*` tag pushes or manual dispatch against an existing tag. It:
 

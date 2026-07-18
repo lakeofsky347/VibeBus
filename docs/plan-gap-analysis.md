@@ -2,15 +2,15 @@
 
 Assessment date: 2026-07-18.
 
-This document compares the implemented VibeBus 0.9 baseline with the goals and phased roadmap in the 2026-07-17 project startup plan. The comparison uses repository code, tests, release automation, VibeBus durable state, and the completed two-real-task desktop acceptance as evidence.
+This document compares the implemented VibeBus 0.10 baseline with the goals and phased roadmap in the 2026-07-17 project startup plan. The comparison uses repository code, tests, release automation, VibeBus durable state, and the completed two-real-task desktop acceptance as evidence.
 
 ## Executive assessment
 
 The core product definition is achieved: independent Codex top-level tasks can exchange authenticated, structured, durable facts through a local SQLite-backed CLI/MCP plugin without sharing complete conversations. The real desktop run used two user-owned top-level tasks and passed the repository auditor with 178 of 178 checks, zero failures, and zero skips.
 
-All 12 original MVP acceptance criteria are now fully covered. VibeBus 0.9 closes the former Agent-specific `sync` gap with an authenticated deterministic projection of active owned tasks, direct dependencies, unread directed messages, relevant artifacts, and immutable confirmed decisions. Item/byte budgets, bounded previews, semantic deduplication, and continuation cursors keep that projection explicit and bounded.
+All 12 original MVP acceptance criteria are fully covered. VibeBus 0.10 adds strict responsibility domains, authenticated expiring task-scoped overrides, immutable Git/test facts, and deterministic lifecycle Hooks to the 0.9 context projection. Item/byte budgets, bounded previews, semantic deduplication, and continuation cursors keep the shared surface explicit and bounded.
 
-Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. Phase 2 is mixed: context sync, confirmed decisions, reservations, dependency unlock, idempotency, handoffs, and lease expiry are present, while responsibility-domain enforcement and deterministic Git/test Hooks are not. Phase 4 remains deliberately deferred.
+Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. The planned local Phase 2 coordination controls are now substantially complete: context sync, confirmed decisions, responsibility enforcement, reservations, dependency unlock, idempotency, handoffs, lease expiry, and bounded Git/test lifecycle automation are present. Phase 4 remains deliberately deferred.
 
 ## Roadmap comparison
 
@@ -22,8 +22,8 @@ Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. Phase 
 | Tasks, dependencies, atomic claim, versions, and terminal bindings | Complete | Dependency unlock, live competing-claim conflict, optimistic-version tests, and four closed desktop bindings | Task reassignment and richer scheduling remain Phase 4 concerns |
 | Artifacts, audit history, backup, and recovery | Complete | Hashed project-scoped artifacts, ordered events, schema migrations, online backups, static handoff, retained-history floor | Export/import UX and optional physical compaction can be improved |
 | Agent-specific context synchronization | Complete | `context sync` has CLI/MCP parity, authenticated scope isolation, direct-dependency expansion, confirmed decisions, item/byte budgets, bounded previews, and stable continuation | Cursor pagination is deliberately not an atomic database snapshot; restart for fresh concurrent state |
-| File conflict control | Partial | Exclusive overlapping reservations, renewal, expiry, release, and live conflict proof | No declarative `allowed_paths`/responsibility-domain policy or enforcement |
-| Deterministic lifecycle automation | Partial | Read-only SessionStart discovery Hook and repository CI exist | No Git-commit association Hook, test-result publication Hook, or automatic terminal handoff generation |
+| File conflict control | Complete for declared operations | Strict role `allowedPaths`, task-scoped expiring overrides, reservation/artifact/Git-path enforcement, plus existing overlap/TTL control | This is application policy, not an OS filesystem sandbox; raw external writes remain outside the bus |
+| Deterministic lifecycle automation | Complete for bounded local facts | PostToolUse records commit identity/path lists and test outcomes; Stop writes a review-only proposal; Hook fixtures run in CI | Specialized host tools may opt out of Hooks; automatic handoff sending is deliberately excluded |
 | Codex plugin packaging and Windows delivery | Complete for unsigned acceptance | Plugin manifest, Skill, stdio MCP, Hook, portable ZIP, per-user MSI, validation, and CI | Production certificate, protected release environment, signed tag, and disposable-profile acceptance remain external gates |
 | Notifications, Supervisor, and visualization | Deferred | Codex task tools can create, read, wait, and continue user-authorized tasks; SQLite remained authoritative during acceptance | No plugin-owned best-effort notification bridge, status UI, dependency graph, or Worker supervisor |
 | Remote/multi-host operation | Deferred by design | Project state is local and project-ID scoped | No remote synchronization, cross-device vault recovery, or distributed consistency model |
@@ -65,19 +65,19 @@ This is the only remaining release blocker, but it requires maintainer-owned ext
 
 This closes the former sole partial MVP criterion and makes responsibility-domain enforcement the next highest-value product slice.
 
-### P1: responsibility-domain policy
+### Completed in 0.10: responsibility-domain policy
 
-- Add project-configured Agent roles and `allowed_paths` patterns.
-- Validate reservations and artifact/code-change declarations against those patterns.
-- Require an explicit cross-domain request or override fact rather than silently allowing drift.
-- Preserve reservations as the concurrency mechanism; responsibility rules are policy, not filesystem locks.
+- `.vibebus/responsibility.json` maps Agent roles to strict bounded project-relative patterns; absent means legacy-compatible allow-all, present-invalid fails closed.
+- Task-scoped reservations, artifact declarations, and Git changed paths are validated against the effective role policy.
+- Cross-domain overrides are owner-authenticated, task-scoped, expiring, idempotent, and audited.
+- Reservations remain the concurrency mechanism; responsibility rules authorize intent but are not filesystem locks.
 
-### P1: deterministic Git and test Hooks
+### Completed in 0.10: deterministic Git and test Hooks
 
-- Associate commit hashes with VibeBus tasks and artifacts through idempotent, bounded Hook payloads.
-- Publish test results as summaries plus report paths, never raw unbounded logs.
-- Generate terminal handoff proposals at safe lifecycle points while retaining recipient ACK/close control.
-- Treat Hook failure as observable degradation, not permission to corrupt task state.
+- Git facts bind task, commit SHA, summary, and at most 200 authorized changed paths; no diff content is parsed or stored.
+- Test facts store bounded suite/outcome/command/summary plus an optional report artifact; raw logs are excluded.
+- PostToolUse records only when a real active binding and reliable exit status exist. Stop writes a bounded proposal and never sends automatically.
+- Hook failure surfaces a `systemMessage`, exits safely, and cannot alter completed tool side effects.
 
 ### P2: best-effort native-task notification bridge
 
@@ -99,14 +99,12 @@ This closes the former sole partial MVP criterion and makes responsibility-domai
 
 ## Recommended next implementation slice
 
-Implement responsibility-domain policy and deterministic Git/test Hooks before expanding orchestration. Acceptance for that slice should require:
+The next repository-owned slice should focus on operational maturity without expanding into remote orchestration:
 
-1. Project configuration maps Agent roles to validated project-relative `allowed_paths` patterns.
-2. Reservation and declared code/artifact changes outside an Agent's responsibility domain conflict unless a durable explicit override exists.
-3. Cross-domain requests are authenticated, task-scoped, idempotent, and auditable.
-4. Git commit association publishes bounded task facts without parsing or copying entire diffs.
-5. Test-result publication stores summaries plus report artifact references, never unbounded logs.
-6. Hook failure is observable and retry-safe without corrupting task, decision, message, or reservation state.
-7. Context projection, authentication, migration, retained-history-floor, concurrency, and secret-redaction tests remain green.
+1. Add a documented restore drill and export/import verification around online backups.
+2. Define an explicitly approved offline compaction command instead of coupling `VACUUM` to logical retention.
+3. Add stale-Agent/offline visibility and a safe identity lifecycle runbook without automatic credential deletion.
+4. Consider an optional notification bridge only as best-effort UI delivery over the authoritative SQLite Inbox.
+5. Preserve context scope, responsibility authorization, Hook no-log/no-auto-send boundaries, migration, retained-history floor, concurrency, and secret redaction.
 
-The signed release can proceed in parallel only after the maintainer supplies the external certificate and protected environment. The optional notification bridge may now follow the authoritative context projection, but it remains lower priority than responsibility and lifecycle automation.
+The signed release remains the highest-priority external gate and can proceed only after the maintainer supplies the certificate and protected environment. Remote synchronization, automatic merging, Supervisor scheduling, and forced model interruption remain separate product decisions rather than 0.10 gaps.

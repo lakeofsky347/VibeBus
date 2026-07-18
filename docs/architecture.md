@@ -2,7 +2,7 @@
 
 ## Goal
 
-VibeBus coordinates independent Codex top-level tasks without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, task/thread associations, dependencies, reservations, artifacts, confirmed decisions, subscriptions, and audit events.
+VibeBus coordinates independent Codex top-level tasks without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, task/thread associations, dependencies, responsibility overrides, reservations, artifacts, confirmed decisions, Git/test facts, subscriptions, and audit events.
 
 ## Runtime shape
 
@@ -66,9 +66,12 @@ The serialized secret pair includes a format version and token generation and st
 | `tasks` | Owner, state, version, blocker, timestamps |
 | `task_dependencies` | Prerequisite edges |
 | `task_thread_bindings` | Historical task-to-Codex-thread associations and unbind time |
-| `reservations` | TTL-backed path intent |
+| `reservations` | TTL-backed path intent with optional task association |
+| `responsibility_overrides` | Expiring owner-issued task/path authorization for one grantee |
 | `artifacts` | File path, hash, summary, task relation, metadata |
 | `decisions` | Immutable task-scoped confirmed facts, semantic keys, artifact references, and author/timestamp evidence |
+| `git_commit_facts` | Immutable task/commit association, bounded changed paths, author, and summary |
+| `test_result_facts` | Immutable task/result-key association, outcome, bounded command/summary, and optional report artifact |
 | `idempotency_records` | Operation-scoped request hashes and cached responses |
 | `subscriptions` | Agent-owned filters, committed cursors, pending deliveries, and last-ACK state |
 | `events` | Append-only audit facts |
@@ -112,6 +115,12 @@ The serialized secret pair includes a format version and token generation and st
 30. Only the owner of a non-terminal task may confirm a decision for it, and referenced task-scoped artifacts cannot belong to another task.
 31. Agent context sync contains only active owned tasks, their direct dependencies, unread directed messages, artifacts related to that scope, and confirmed decisions related to that scope.
 32. Context pagination uses deterministic fact keys rather than database offsets; every returned page obeys both its item limit and serialized-item byte budget.
+33. A configured responsibility policy is strict and fail-closed; an absent policy preserves the pre-0.10 allow-all behavior for existing projects.
+34. Task-scoped reservations, task artifact declarations, and Git changed-path facts must match the authenticated Agent's role or one active task-scoped override.
+35. Only the non-terminal task owner may grant an authenticated 60–86,400-second responsibility override; it never bypasses reservation overlap or task ownership.
+36. A task/commit SHA and a task/test-result key each identify one immutable semantic payload; exact retries replay and drift conflicts.
+37. Lifecycle Hooks never treat shell output, transcripts, diffs, or logs as durable fact payloads; unknown exit status is skipped instead of guessed.
+38. Stop generates a bounded proposal only. Sending a handoff remains an explicit authenticated action.
 
 ## Recovery and retry boundaries
 
@@ -127,7 +136,7 @@ Externally retried writes record a canonical JSON request hash and serialized re
 
 ## Agent context projection
 
-`context sync` is the authenticated task-specific read model. It starts from the Agent's active owned tasks, expands exactly one dependency edge, and then selects unread directed messages plus artifacts and immutable confirmed decisions associated with that task scope. It never returns unrelated tasks, project-global event history, artifact metadata blobs, or artifact file contents. ACKed, read, or closed messages leave the default projection because their receipt state remains durable outside the context page.
+`context sync` is the authenticated task-specific read model. It starts from the Agent's active owned tasks, expands exactly one dependency edge, and then selects unread directed messages plus artifacts, immutable confirmed decisions, Git commit facts, and test-result facts associated with that task scope. It never returns unrelated tasks, project-global event history, artifact metadata blobs, artifact file contents, diffs, or test logs. ACKed, read, or closed messages leave the default projection because their receipt state remains durable outside the context page.
 
 Every projected fact has a deterministic category/order key. The continuation cursor encodes the last emitted key, so static pagination does not repeat or skip facts and does not depend on a mutable SQL offset. Concurrent state changes can add or remove later facts; callers should restart from the beginning when they require a fresh atomic view rather than treating a cursor as a database snapshot.
 
@@ -163,9 +172,9 @@ The plugin contains:
 
 - `.mcp.json`, which launches the packaged native executable with `mcp`;
 - `skills/vibebus-coordination/SKILL.md`, which defines the coordination discipline;
-- `hooks/hooks.json`, which runs a read-only Windows SessionStart discovery script.
+- `hooks/hooks.json`, which runs Windows SessionStart discovery, Bash PostToolUse fact capture, and Stop proposal generation.
 
-The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call.
+The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call. Hook commands receive `PLUGIN_ROOT` and writable `PLUGIN_DATA`, require Codex trust review, and run at the session working directory. PostToolUse resolves only an active task/thread binding, reliable exit metadata, commit identity/subject/path names, and a hashed working state; Stop calls the bounded proposal read model and writes it under plugin data. Neither Hook reads the unstable transcript format, and Stop emits no continuation or automatic message mutation.
 
 ## Release supply chain
 
@@ -175,7 +184,7 @@ Pull-request CI has read-only repository permission and produces explicitly unsi
 
 Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z` tag must match Cargo and plugin versions. SignTool signs and verifies the binary before staging and the MSI after construction using SHA-256 and an RFC 3161 timestamp. Checksums are calculated only after signing. A job-scoped `GITHUB_TOKEN` with `contents: write` publishes assets; signing material remains only in repository or protected-environment Secrets.
 
-## Deliberate non-goals for 0.9
+## Deliberate non-goals for 0.10
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;

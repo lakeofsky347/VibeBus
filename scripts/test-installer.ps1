@@ -79,7 +79,10 @@ try {
         "plugins\vibebus\.mcp.json",
         "plugins\vibebus\bin\vibebus.exe",
         "plugins\vibebus\hooks\hooks.json",
+        "plugins\vibebus\scripts\hook-common.ps1",
+        "plugins\vibebus\scripts\post-tool-facts.ps1",
         "plugins\vibebus\scripts\session-start.ps1",
+        "plugins\vibebus\scripts\stop-handoff.ps1",
         "plugins\vibebus\skills\vibebus-coordination\SKILL.md"
     )
     $extractedBinary = Get-ChildItem -LiteralPath $extractRoot -Recurse -Filter vibebus.exe |

@@ -45,6 +45,10 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      - name: Test lifecycle hooks
+        shell: pwsh
+        run: ./scripts/test-lifecycle-hooks.ps1
+
       - name: Build unsigned release assets
         shell: pwsh
         run: ./scripts/build-release.ps1

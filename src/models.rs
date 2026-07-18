@@ -136,6 +136,7 @@ pub struct TaskThreadBindingView {
 pub struct ReservationView {
     pub reservation_id: String,
     pub owner: String,
+    pub task_id: Option<String>,
     pub path_pattern: String,
     pub exclusive: bool,
     pub reason: Option<String>,
@@ -174,6 +175,69 @@ pub struct DecisionView {
     pub summary: String,
     pub artifact_ids: Vec<String>,
     pub confirmed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponsibilityOverrideView {
+    pub override_id: String,
+    pub task_id: String,
+    pub grantee: String,
+    pub granted_by: String,
+    pub path_pattern: String,
+    pub reason: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponsibilityPolicyView {
+    pub agent: String,
+    pub role: String,
+    pub configured: bool,
+    pub source_path: String,
+    pub policy_sha256: Option<String>,
+    pub allowed_paths: Vec<String>,
+    pub active_overrides: Vec<ResponsibilityOverrideView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitFactView {
+    pub fact_id: String,
+    pub task_id: String,
+    pub author: String,
+    pub commit_sha: String,
+    pub summary: String,
+    pub changed_paths: Vec<String>,
+    pub recorded_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestResultFactView {
+    pub fact_id: String,
+    pub task_id: String,
+    pub author: String,
+    pub result_key: String,
+    pub suite: String,
+    pub outcome: String,
+    pub summary: String,
+    pub command: Option<String>,
+    pub report_artifact_id: Option<String>,
+    pub recorded_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffProposalView {
+    pub task: TaskView,
+    pub summary: String,
+    pub git_commits: Vec<GitCommitFactView>,
+    pub test_results: Vec<TestResultFactView>,
+    pub decisions: Vec<DecisionView>,
+    pub artifacts: Vec<ArtifactView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +285,9 @@ pub struct DoctorReport {
     pub active_reservations: i64,
     pub artifacts: i64,
     pub decisions: i64,
+    pub responsibility_overrides: i64,
+    pub git_commit_facts: i64,
+    pub test_result_facts: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
