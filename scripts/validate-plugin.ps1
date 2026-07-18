@@ -44,6 +44,18 @@ foreach ($field in @("description", "license", "skills", "mcpServers")) {
 if ([string]::IsNullOrWhiteSpace([string]$manifest.author.name)) {
     throw "Plugin author.name is required."
 }
+$assetFields = @("composerIcon", "logo")
+foreach ($field in $assetFields) {
+    $assetReference = [string]$manifest.interface.$field
+    if ([string]::IsNullOrWhiteSpace($assetReference) -or $assetReference -notmatch '^\./assets/[^/]+\.png$') {
+        throw "Plugin interface.$field must be a relative PNG path under ./assets/."
+    }
+    $assetPath = Join-Path $PluginRoot ($assetReference -replace '^\./', '')
+    Require-Path $assetPath "Plugin interface.$field asset"
+    if ((Get-Item -LiteralPath $assetPath).Length -le 0) {
+        throw "Plugin interface.$field asset is empty: $assetPath"
+    }
+}
 
 $mcp = Get-Content -Raw -LiteralPath $mcpPath | ConvertFrom-Json
 $server = $mcp.mcpServers.vibebus

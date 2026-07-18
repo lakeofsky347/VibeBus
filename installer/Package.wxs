@@ -27,6 +27,7 @@
               <Directory Id="PluginManifestFolder" Name=".codex-plugin" />
               <Directory Id="PluginBinFolder" Name="bin" />
               <Directory Id="PluginHooksFolder" Name="hooks" />
+              <Directory Id="PluginAssetsFolder" Name="assets" />
               <Directory Id="PluginScriptsFolder" Name="scripts" />
               <Directory Id="PluginSkillsFolder" Name="skills">
                 <Directory Id="CoordinationSkillFolder" Name="vibebus-coordination" />
@@ -46,6 +47,7 @@
       <ComponentRef Id="PluginManifestFiles" />
       <ComponentRef Id="PluginBinaryFiles" />
       <ComponentRef Id="PluginHookFiles" />
+      <ComponentRef Id="PluginAssetFiles" />
       <ComponentRef Id="PluginScriptFiles" />
       <ComponentRef Id="PluginSkillFiles" />
     </Feature>
@@ -57,6 +59,7 @@
       <RemoveFolder Id="RemovePluginSkillsFolder" Directory="PluginSkillsFolder" On="uninstall" />
       <RemoveFolder Id="RemovePluginScriptsFolder" Directory="PluginScriptsFolder" On="uninstall" />
       <RemoveFolder Id="RemovePluginHooksFolder" Directory="PluginHooksFolder" On="uninstall" />
+      <RemoveFolder Id="RemovePluginAssetsFolder" Directory="PluginAssetsFolder" On="uninstall" />
       <RemoveFolder Id="RemovePluginBinFolder" Directory="PluginBinFolder" On="uninstall" />
       <RemoveFolder Id="RemovePluginManifestFolder" Directory="PluginManifestFolder" On="uninstall" />
       <RemoveFolder Id="RemovePluginFolder" Directory="PluginFolder" On="uninstall" />
@@ -101,6 +104,14 @@
     <Component Id="PluginHookFiles" Directory="PluginHooksFolder" Guid="{DF81CE84-1D50-488F-9F4D-9B5051F46D58}">
       <File Id="PluginHooks" Source="$(var.PayloadRoot)\plugins\vibebus\hooks\hooks.json" />
       <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="PluginHooks" Value="[ProductVersion]" Type="string" KeyPath="yes" />
+    </Component>
+
+    <Component Id="PluginAssetFiles" Directory="PluginAssetsFolder" Guid="{A6B0C7A3-1B8A-4C5C-9F6B-2ECA7BCA0E1F}">
+      <File Id="VibeBusIconLight" Source="$(var.PayloadRoot)\plugins\vibebus\assets\vibebus-icon-light.png" />
+      <File Id="VibeBusIconDark" Source="$(var.PayloadRoot)\plugins\vibebus\assets\vibebus-icon-dark.png" />
+      <File Id="VibeBusLogoLight" Source="$(var.PayloadRoot)\plugins\vibebus\assets\vibebus-logo-light.png" />
+      <File Id="VibeBusLogoDark" Source="$(var.PayloadRoot)\plugins\vibebus\assets\vibebus-logo-dark.png" />
+      <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="PluginAssets" Value="[ProductVersion]" Type="string" KeyPath="yes" />
     </Component>
 
     <Component Id="PluginScriptFiles" Directory="PluginScriptsFolder" Guid="{B2259671-5E49-4291-A024-050895714A4F}">

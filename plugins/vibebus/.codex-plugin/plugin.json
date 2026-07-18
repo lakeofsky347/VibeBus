@@ -3,8 +3,11 @@
   "version": "0.10.0",
   "description": "Project-scoped coordination for independent Codex tasks.",
   "author": {
-    "name": "VibeBus Contributors"
+    "name": "VibeBus Contributors",
+    "url": "https://github.com/lakeofsky347/VibeBus"
   },
+  "homepage": "https://github.com/lakeofsky347/VibeBus",
+  "repository": "https://github.com/lakeofsky347/VibeBus",
   "license": "MIT",
   "keywords": ["codex", "coordination", "tasks", "sqlite"],
   "skills": "./skills/",
@@ -19,7 +22,9 @@
       "Register this task with VibeBus and check its inbox.",
       "Use VibeBus to coordinate this work with the other project tasks."
     ],
-    "brandColor": "#4F7CAC"
+    "brandColor": "#243B8F",
+    "composerIcon": "./assets/vibebus-icon-light.png",
+    "logo": "./assets/vibebus-logo-light.png"
   },
   "mcpServers": "./.mcp.json"
 }
