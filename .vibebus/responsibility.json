@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "defaultAllowedPaths": [],
+  "roles": {
+    "coordination": {
+      "allowedPaths": ["acceptance/**", "docs/**"]
+    },
+    "context-projection-implementation": {
+      "allowedPaths": [
+        ".github/workflows/**",
+        "Cargo.lock",
+        "Cargo.toml",
+        "CHANGELOG.md",
+        "README.md",
+        "docs/**",
+        "plugins/vibebus/**",
+        "src/**",
+        "tests/**"
+      ]
+    },
+    "desktop-acceptance-coordinator": {
+      "allowedPaths": ["acceptance/**"]
+    },
+    "desktop-acceptance-receiver": {
+      "allowedPaths": ["acceptance/**"]
+    },
+    "implementation": {
+      "allowedPaths": ["src/**", "tests/**"]
+    },
+    "release": {
+      "allowedPaths": ["backups/**", "dist/**", "docs/**", "plugins/vibebus/**"]
+    },
+    "release-management": {
+      "allowedPaths": ["**"]
+    },
+    "responsibility-policy-hooks-implementation": {
+      "allowedPaths": [
+        ".github/workflows/**",
+        ".vibebus/**",
+        "Cargo.lock",
+        "Cargo.toml",
+        "CHANGELOG.md",
+        "README.md",
+        "docs/**",
+        "plugins/vibebus/**",
+        "scripts/**",
+        "src/**",
+        "tests/**"
+      ]
+    }
+  }
+}

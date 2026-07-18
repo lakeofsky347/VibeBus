@@ -220,6 +220,7 @@ pub struct ReservationAddRequest {
     pub ttl_seconds: Option<i64>,
     pub exclusive: Option<bool>,
     pub reason: Option<String>,
+    pub task_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -280,6 +281,61 @@ pub struct DecisionConfirmRequest {
     pub task_id: String,
     pub summary: String,
     pub artifact_ids: Option<Vec<String>>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponsibilityInspectRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponsibilityOverrideRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    pub task_id: String,
+    pub grantee: String,
+    pub path_pattern: String,
+    pub reason: String,
+    pub ttl_seconds: Option<i64>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitRecordRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    pub task_id: String,
+    pub commit_sha: String,
+    pub summary: String,
+    pub changed_paths: Vec<String>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TestResultRecordRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    pub task_id: String,
+    pub result_key: String,
+    pub suite: String,
+    pub outcome: String,
+    pub summary: String,
+    pub command: Option<String>,
+    pub report_artifact_id: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -396,6 +452,17 @@ pub struct HandoffSnapshotRequest {
     pub agent: String,
     pub token: Option<String>,
     pub after_sequence: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffProposalRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    pub task_id: String,
+    pub item_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -861,7 +928,7 @@ impl VibeBusMcp {
     ) -> Result<String, ErrorData> {
         let mut bus = self.open(request.root.as_deref())?;
         json_text(
-            &bus.reserve_path_idempotent(
+            &bus.reserve_path_for_task_idempotent(
                 &request.agent,
                 &self
                     .token(&bus, &request.agent, request.token.as_deref())?
@@ -870,6 +937,7 @@ impl VibeBusMcp {
                 request.ttl_seconds.unwrap_or(3600),
                 request.exclusive.unwrap_or(true),
                 request.reason.as_deref(),
+                request.task_id.as_deref(),
                 request.idempotency_key.as_deref(),
             )
             .map_err(bus_error)?,
@@ -974,6 +1042,95 @@ impl VibeBusMcp {
                 &request.task_id,
                 &request.summary,
                 request.artifact_ids.as_deref().unwrap_or(&[]),
+                request.idempotency_key.as_deref(),
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Inspect an Agent's configured responsibility paths and active task overrides"
+    )]
+    fn vibebus_responsibility_inspect(
+        &self,
+        Parameters(request): Parameters<ResponsibilityInspectRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.inspect_responsibility_policy(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(description = "Grant an authenticated, expiring, task-scoped responsibility override")]
+    fn vibebus_responsibility_override(
+        &self,
+        Parameters(request): Parameters<ResponsibilityOverrideRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.grant_responsibility_override_idempotent(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.task_id,
+                &request.grantee,
+                &request.path_pattern,
+                &request.reason,
+                request.ttl_seconds.unwrap_or(3600),
+                request.idempotency_key.as_deref(),
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(description = "Record one bounded immutable Git commit fact for an owned task")]
+    fn vibebus_git_commit_record(
+        &self,
+        Parameters(request): Parameters<GitCommitRecordRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.record_git_commit_idempotent(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.task_id,
+                &request.commit_sha,
+                &request.summary,
+                &request.changed_paths,
+                request.idempotency_key.as_deref(),
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(description = "Record one bounded immutable test-result fact for an owned task")]
+    fn vibebus_test_result_record(
+        &self,
+        Parameters(request): Parameters<TestResultRecordRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.record_test_result_idempotent(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.task_id,
+                &request.result_key,
+                &request.suite,
+                &request.outcome,
+                &request.summary,
+                request.command.as_deref(),
+                request.report_artifact_id.as_deref(),
                 request.idempotency_key.as_deref(),
             )
             .map_err(bus_error)?,
@@ -1224,6 +1381,27 @@ impl VibeBusMcp {
                     .token(&bus, &request.agent, request.token.as_deref())?
                     .value,
                 request.after_sequence.unwrap_or(0),
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Build a bounded read-only handoff proposal from task facts without sending a message"
+    )]
+    fn vibebus_handoff_propose(
+        &self,
+        Parameters(request): Parameters<HandoffProposalRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.handoff_proposal(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.task_id,
+                request.item_limit.unwrap_or(10),
             )
             .map_err(bus_error)?,
         )

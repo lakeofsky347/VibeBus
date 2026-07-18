@@ -81,6 +81,14 @@ enum Command {
         #[command(subcommand)]
         command: DecisionCommand,
     },
+    Responsibility {
+        #[command(subcommand)]
+        command: ResponsibilityCommand,
+    },
+    Fact {
+        #[command(subcommand)]
+        command: FactCommand,
+    },
     Context {
         #[command(subcommand)]
         command: ContextCommand,
@@ -255,6 +263,8 @@ enum ReservationCommand {
         #[arg(long)]
         reason: Option<String>,
         #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
         idempotency_key: Option<String>,
     },
     Release {
@@ -378,6 +388,76 @@ enum DecisionCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ResponsibilityCommand {
+    Inspect {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    Override {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        grantee: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = 3600)]
+        ttl: i64,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FactCommand {
+    GitCommit {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        commit_sha: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long = "changed-path", value_delimiter = ',')]
+        changed_paths: Vec<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    TestResult {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        result_key: String,
+        #[arg(long)]
+        suite: String,
+        #[arg(long)]
+        outcome: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long = "command")]
+        command_text: Option<String>,
+        #[arg(long)]
+        report_artifact: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ContextCommand {
     Sync {
         #[arg(long)]
@@ -488,6 +568,16 @@ enum HandoffCommand {
         token: Option<String>,
         #[arg(long, default_value_t = 0)]
         after_sequence: i64,
+    },
+    Propose {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long, default_value_t = 10)]
+        item_limit: usize,
     },
 }
 
@@ -851,16 +941,18 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 ttl,
                 exclusive,
                 reason,
+                task,
                 idempotency_key,
             } => {
                 let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
-                json!(bus.reserve_path_idempotent(
+                json!(bus.reserve_path_for_task_idempotent(
                     &agent,
                     &token,
                     &path,
                     ttl,
                     exclusive,
                     reason.as_deref(),
+                    task.as_deref(),
                     idempotency_key.as_deref(),
                 )?)
             }
@@ -939,6 +1031,82 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     &task,
                     &summary,
                     &artifacts,
+                    idempotency_key.as_deref(),
+                )?)
+            }
+        },
+        Command::Responsibility { command } => match command {
+            ResponsibilityCommand::Inspect { agent, token } => {
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
+                json!(bus.inspect_responsibility_policy(&agent, &token)?)
+            }
+            ResponsibilityCommand::Override {
+                agent,
+                token,
+                task,
+                grantee,
+                path,
+                reason,
+                ttl,
+                idempotency_key,
+            } => {
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
+                json!(bus.grant_responsibility_override_idempotent(
+                    &agent,
+                    &token,
+                    &task,
+                    &grantee,
+                    &path,
+                    &reason,
+                    ttl,
+                    idempotency_key.as_deref(),
+                )?)
+            }
+        },
+        Command::Fact { command } => match command {
+            FactCommand::GitCommit {
+                agent,
+                token,
+                task,
+                commit_sha,
+                summary,
+                changed_paths,
+                idempotency_key,
+            } => {
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
+                json!(bus.record_git_commit_idempotent(
+                    &agent,
+                    &token,
+                    &task,
+                    &commit_sha,
+                    &summary,
+                    &changed_paths,
+                    idempotency_key.as_deref(),
+                )?)
+            }
+            FactCommand::TestResult {
+                agent,
+                token,
+                task,
+                result_key,
+                suite,
+                outcome,
+                summary,
+                command_text,
+                report_artifact,
+                idempotency_key,
+            } => {
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
+                json!(bus.record_test_result_idempotent(
+                    &agent,
+                    &token,
+                    &task,
+                    &result_key,
+                    &suite,
+                    &outcome,
+                    &summary,
+                    command_text.as_deref(),
+                    report_artifact.as_deref(),
                     idempotency_key.as_deref(),
                 )?)
             }
@@ -1071,6 +1239,15 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             } => {
                 let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
                 json!(bus.handoff_snapshot(&agent, &token, after_sequence)?)
+            }
+            HandoffCommand::Propose {
+                agent,
+                token,
+                task,
+                item_limit,
+            } => {
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
+                json!(bus.handoff_proposal(&agent, &token, &task, item_limit)?)
             }
         },
         Command::Status => json!({

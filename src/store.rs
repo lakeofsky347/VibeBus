@@ -12,19 +12,25 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+type ReservationRenewRow = (Option<String>, String, bool, Option<String>, i64);
+
 use crate::error::{BusError, Result};
 use crate::models::{
     AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, ContextItemView,
-    ContextScopeView, ContextSyncView, DecisionView, DoctorReport, EventView, HandoffSnapshot,
-    MessageReceipt, MessageView, OperatorCredentialView, OperatorStatusView, ProjectMetadata,
-    RecoveryKeyView, ReleaseResult, ReservationView, RetentionApprovalView, RetentionCounts,
+    ContextScopeView, ContextSyncView, DecisionView, DoctorReport, EventView, GitCommitFactView,
+    HandoffProposalView, HandoffSnapshot, MessageReceipt, MessageView, OperatorCredentialView,
+    OperatorStatusView, ProjectMetadata, RecoveryKeyView, ReleaseResult, ReservationView,
+    ResponsibilityOverrideView, ResponsibilityPolicyView, RetentionApprovalView, RetentionCounts,
     RetentionPlan, RetentionPolicy, RetentionProtectionView, RetentionReport, RetentionStateView,
     SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll,
-    SubscriptionView, TaskThreadBindingView, TaskView,
+    SubscriptionView, TaskThreadBindingView, TaskView, TestResultFactView,
+};
+use crate::policy::{
+    ResponsibilityPolicy, normalize_policy_pattern, normalize_project_path, policy_pattern_matches,
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const DAY_MS: i64 = 86_400_000;
 const MIN_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 60;
 const MAX_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 3_600;
@@ -46,6 +52,7 @@ const TASK_STATUSES: &[&str] = &[
 struct AuthenticatedAgent {
     id: String,
     name: String,
+    role: String,
 }
 
 struct ReceiptLifecycle {
@@ -1142,8 +1149,35 @@ impl Bus {
         reason: Option<&str>,
         idempotency_key: Option<&str>,
     ) -> Result<ReservationView> {
+        self.reserve_path_for_task_idempotent(
+            agent,
+            token,
+            path_pattern,
+            ttl_seconds,
+            exclusive,
+            reason,
+            None,
+            idempotency_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_path_for_task_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        path_pattern: &str,
+        ttl_seconds: i64,
+        exclusive: bool,
+        reason: Option<&str>,
+        task_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<ReservationView> {
         validate_reservation_ttl(ttl_seconds)?;
-        let normalized = normalize_path_pattern(path_pattern)?;
+        if let Some(task_id) = task_id {
+            validate_task_id(task_id)?;
+        }
+        let normalized = normalize_project_path(path_pattern)?;
         let request_hash = idempotency_key
             .map(|key| {
                 validate_idempotency_key(key)?;
@@ -1151,11 +1185,13 @@ impl Bus {
                     "pathPattern": normalized,
                     "ttlSeconds": ttl_seconds,
                     "exclusive": exclusive,
-                    "reason": reason
+                    "reason": reason,
+                    "taskId": task_id
                 }))
             })
             .transpose()?;
         let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
         let now = now_ms();
         let expires_at = now + ttl_seconds * 1_000;
         let reservation_id = format!("rsv_{}", Uuid::new_v4().simple());
@@ -1175,6 +1211,18 @@ impl Bus {
             tx.commit()?;
             return Ok(cached);
         }
+        if let Some(task_id) = task_id {
+            ensure_nonterminal_task_exists(&tx, &self.project.project_id, task_id)?;
+        }
+        authorize_project_path(
+            &tx,
+            &self.project.project_id,
+            &policy,
+            &actor,
+            task_id,
+            &normalized,
+            now,
+        )?;
 
         let active = {
             let mut statement = tx.prepare(
@@ -1205,12 +1253,13 @@ impl Bus {
 
         tx.execute(
             "INSERT INTO reservations
-             (id, project_id, owner_agent_id, path_pattern, exclusive, reason, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, project_id, owner_agent_id, task_id, path_pattern, exclusive, reason, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 reservation_id,
                 self.project.project_id,
                 actor.id,
+                task_id,
                 normalized,
                 exclusive as i64,
                 reason,
@@ -1221,6 +1270,7 @@ impl Bus {
         let response = ReservationView {
             reservation_id: reservation_id.clone(),
             owner: actor.name.clone(),
+            task_id: task_id.map(ToOwned::to_owned),
             path_pattern: normalized.clone(),
             exclusive,
             reason: reason.map(ToOwned::to_owned),
@@ -1250,6 +1300,7 @@ impl Bus {
                 "exclusive": exclusive,
                 "expiresAt": expires_at,
                 "reason": reason
+                ,"taskId": task_id
             }),
         )?;
         tx.commit()?;
@@ -1341,21 +1392,30 @@ impl Bus {
             tx.commit()?;
             return Ok(cached);
         }
-        let reservation: Option<(String, bool, Option<String>, i64)> = tx
+        let reservation: Option<ReservationRenewRow> = tx
             .query_row(
-                "SELECT path_pattern, exclusive, reason, created_at FROM reservations
+                "SELECT task_id, path_pattern, exclusive, reason, created_at FROM reservations
                  WHERE id = ?1 AND project_id = ?2 AND owner_agent_id = ?3
                    AND released_at IS NULL AND expires_at > ?4",
                 params![reservation_id, self.project.project_id, actor.id, now],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let (path_pattern, exclusive, reason, created_at) = reservation.ok_or_else(|| {
-            BusError::Conflict(format!(
-                "active reservation '{reservation_id}' is expired or not owned by agent '{}'",
-                actor.name
-            ))
-        })?;
+        let (task_id, path_pattern, exclusive, reason, created_at) =
+            reservation.ok_or_else(|| {
+                BusError::Conflict(format!(
+                    "active reservation '{reservation_id}' is expired or not owned by agent '{}'",
+                    actor.name
+                ))
+            })?;
         tx.execute(
             "UPDATE reservations SET expires_at = ?1 WHERE id = ?2 AND project_id = ?3",
             params![expires_at, reservation_id, self.project.project_id],
@@ -1363,6 +1423,7 @@ impl Bus {
         let response = ReservationView {
             reservation_id: reservation_id.to_owned(),
             owner: actor.name.clone(),
+            task_id,
             path_pattern,
             exclusive,
             reason,
@@ -1396,7 +1457,7 @@ impl Bus {
     pub fn list_active_reservations(&self) -> Result<Vec<ReservationView>> {
         let now = now_ms();
         let mut statement = self.conn.prepare(
-            "SELECT r.id, owner.name, r.path_pattern, r.exclusive, r.reason,
+            "SELECT r.id, owner.name, r.task_id, r.path_pattern, r.exclusive, r.reason,
                     r.created_at, r.expires_at
              FROM reservations r JOIN agents owner ON owner.id = r.owner_agent_id
              WHERE r.project_id = ?1 AND r.released_at IS NULL AND r.expires_at > ?2
@@ -1406,11 +1467,12 @@ impl Bus {
             Ok(ReservationView {
                 reservation_id: row.get(0)?,
                 owner: row.get(1)?,
-                path_pattern: row.get(2)?,
-                exclusive: row.get(3)?,
-                reason: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
+                task_id: row.get(2)?,
+                path_pattern: row.get(3)?,
+                exclusive: row.get(4)?,
+                reason: row.get(5)?,
+                created_at: row.get(6)?,
+                expires_at: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1448,7 +1510,7 @@ impl Bus {
             ));
         }
         let actor = self.authenticate(agent, token)?;
-        let normalized = normalize_path_pattern(path)?;
+        let normalized = normalize_project_path(path)?;
         let project_root = self.project_root.canonicalize()?;
         let artifact_path = self.project_root.join(&normalized).canonicalize()?;
         if !artifact_path.starts_with(&project_root) || !artifact_path.is_file() {
@@ -1489,6 +1551,16 @@ impl Bus {
             tx.commit()?;
             return Ok(cached);
         }
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        authorize_project_path(
+            &tx,
+            &self.project.project_id,
+            &policy,
+            &actor,
+            task_id,
+            &normalized,
+            now,
+        )?;
         if let Some(task_id) = task_id {
             let task_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM tasks WHERE project_id = ?1 AND id = ?2)",
@@ -1599,6 +1671,595 @@ impl Bus {
             statement.query_map(params![self.project.project_id], map)?
         };
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn inspect_responsibility_policy(
+        &self,
+        agent: &str,
+        token: &str,
+    ) -> Result<ResponsibilityPolicyView> {
+        let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        let now = now_ms();
+        let mut statement = self.conn.prepare(
+            "SELECT o.id, o.task_id, grantee.name, grantor.name, o.path_pattern,
+                    o.reason, o.created_at, o.expires_at
+             FROM responsibility_overrides o
+             JOIN agents grantee ON grantee.id = o.grantee_agent_id
+             JOIN agents grantor ON grantor.id = o.granted_by_agent_id
+             WHERE o.project_id = ?1 AND o.grantee_agent_id = ?2 AND o.expires_at > ?3
+             ORDER BY o.task_id, o.path_pattern, o.created_at, o.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, actor.id, now],
+            map_responsibility_override,
+        )?;
+        Ok(ResponsibilityPolicyView {
+            agent: actor.name,
+            role: actor.role.clone(),
+            configured: policy.configured(),
+            source_path: policy.source_path().to_owned(),
+            policy_sha256: policy.sha256().map(ToOwned::to_owned),
+            allowed_paths: policy.allowed_paths(&actor.role),
+            active_overrides: rows.collect::<std::result::Result<Vec<_>, _>>()?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_responsibility_override_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        grantee: &str,
+        path_pattern: &str,
+        reason: &str,
+        ttl_seconds: i64,
+        idempotency_key: Option<&str>,
+    ) -> Result<ResponsibilityOverrideView> {
+        validate_task_id(task_id)?;
+        validate_identifier("override grantee", grantee)?;
+        validate_responsibility_ttl(ttl_seconds)?;
+        let path_pattern = normalize_policy_pattern(path_pattern)?;
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > 512 {
+            return Err(BusError::Validation(
+                "responsibility override reason must be 1-512 UTF-8 bytes".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        if !policy.configured() {
+            return Err(BusError::Conflict(
+                "responsibility overrides require a configured project policy".into(),
+            ));
+        }
+        let request_hash = idempotency_key
+            .map(|key| {
+                validate_idempotency_key(key)?;
+                hash_json(&json!({
+                    "taskId": task_id,
+                    "grantee": grantee,
+                    "pathPattern": path_pattern,
+                    "reason": reason,
+                    "ttlSeconds": ttl_seconds
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let expires_at = now + ttl_seconds * 1_000;
+        let override_id = format!("rov_{}", Uuid::new_v4().simple());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<ResponsibilityOverrideView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "responsibility.override",
+                key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+        ensure_owned_nonterminal_task(&tx, &self.project.project_id, &actor, task_id)?;
+        let grantee_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
+                params![self.project.project_id, grantee],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let grantee_id = grantee_id.ok_or_else(|| BusError::AgentNotFound(grantee.to_owned()))?;
+        tx.execute(
+            "INSERT INTO responsibility_overrides
+             (id, project_id, task_id, grantee_agent_id, granted_by_agent_id,
+              path_pattern, reason, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                override_id,
+                self.project.project_id,
+                task_id,
+                grantee_id,
+                actor.id,
+                path_pattern,
+                reason,
+                now,
+                expires_at
+            ],
+        )?;
+        let response = ResponsibilityOverrideView {
+            override_id: override_id.clone(),
+            task_id: task_id.to_owned(),
+            grantee: grantee.to_owned(),
+            granted_by: actor.name.clone(),
+            path_pattern: path_pattern.clone(),
+            reason: reason.to_owned(),
+            created_at: now,
+            expires_at,
+        };
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "responsibility.override",
+                key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "responsibility_override_granted",
+            "responsibility_override",
+            &override_id,
+            json!({
+                "taskId": task_id,
+                "grantee": grantee,
+                "pathPattern": path_pattern,
+                "expiresAt": expires_at
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_git_commit_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        commit_sha: &str,
+        summary: &str,
+        changed_paths: &[String],
+        idempotency_key: Option<&str>,
+    ) -> Result<GitCommitFactView> {
+        validate_task_id(task_id)?;
+        let commit_sha = normalize_commit_sha(commit_sha)?;
+        let summary = summary.trim();
+        if summary.is_empty() || summary.len() > 512 {
+            return Err(BusError::Validation(
+                "Git commit summary must be 1-512 UTF-8 bytes".into(),
+            ));
+        }
+        if changed_paths.len() > 200 {
+            return Err(BusError::Validation(
+                "a Git commit fact can declare at most 200 changed paths".into(),
+            ));
+        }
+        let mut changed_paths = changed_paths
+            .iter()
+            .map(|path| normalize_project_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        changed_paths.sort();
+        changed_paths.dedup();
+        let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        let request_hash = idempotency_key
+            .map(|key| {
+                validate_idempotency_key(key)?;
+                hash_json(&json!({
+                    "taskId": task_id,
+                    "commitSha": commit_sha,
+                    "summary": summary,
+                    "changedPaths": changed_paths
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let fact_id = format!("gcf_{}", Uuid::new_v4().simple());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<GitCommitFactView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.git_commit",
+                key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+        ensure_owned_nonterminal_task(&tx, &self.project.project_id, &actor, task_id)?;
+        for path in &changed_paths {
+            authorize_project_path(
+                &tx,
+                &self.project.project_id,
+                &policy,
+                &actor,
+                Some(task_id),
+                path,
+                now,
+            )?;
+        }
+        let existing = tx
+            .query_row(
+                "SELECT f.id, f.task_id, author.name, f.commit_sha, f.summary,
+                        f.changed_paths_json, f.recorded_at
+                 FROM git_commit_facts f JOIN agents author ON author.id = f.author_agent_id
+                 WHERE f.project_id = ?1 AND f.task_id = ?2 AND f.commit_sha = ?3",
+                params![self.project.project_id, task_id, commit_sha],
+                map_git_commit_fact,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.author != actor.name
+                || existing.summary != summary
+                || existing.changed_paths != changed_paths
+            {
+                return Err(BusError::Conflict(format!(
+                    "Git commit fact '{task_id}/{commit_sha}' already exists with different semantics"
+                )));
+            }
+            if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+                store_idempotent(
+                    &tx,
+                    &self.project.project_id,
+                    &actor.id,
+                    "fact.git_commit",
+                    key,
+                    request_hash,
+                    &existing,
+                )?;
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        tx.execute(
+            "INSERT INTO git_commit_facts
+             (id, project_id, task_id, author_agent_id, commit_sha, summary,
+              changed_paths_json, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                fact_id,
+                self.project.project_id,
+                task_id,
+                actor.id,
+                commit_sha,
+                summary,
+                serde_json::to_string(&changed_paths)?,
+                now
+            ],
+        )?;
+        let response = GitCommitFactView {
+            fact_id: fact_id.clone(),
+            task_id: task_id.to_owned(),
+            author: actor.name.clone(),
+            commit_sha: commit_sha.clone(),
+            summary: summary.to_owned(),
+            changed_paths: changed_paths.clone(),
+            recorded_at: now,
+        };
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.git_commit",
+                key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "git_commit_recorded",
+            "git_commit_fact",
+            &fact_id,
+            json!({
+                "taskId": task_id,
+                "commitSha": commit_sha,
+                "changedPathCount": changed_paths.len()
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_test_result_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        result_key: &str,
+        suite: &str,
+        outcome: &str,
+        summary: &str,
+        command: Option<&str>,
+        report_artifact_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<TestResultFactView> {
+        validate_task_id(task_id)?;
+        validate_result_key(result_key)?;
+        let suite = suite.trim();
+        if suite.is_empty() || suite.len() > 128 {
+            return Err(BusError::Validation(
+                "test suite must be 1-128 UTF-8 bytes".into(),
+            ));
+        }
+        if !matches!(outcome, "passed" | "failed" | "skipped" | "error") {
+            return Err(BusError::Validation(
+                "test outcome must be passed, failed, skipped, or error".into(),
+            ));
+        }
+        let summary = summary.trim();
+        if summary.is_empty() || summary.len() > 1_024 {
+            return Err(BusError::Validation(
+                "test result summary must be 1-1024 UTF-8 bytes".into(),
+            ));
+        }
+        let command = command.map(str::trim);
+        if command.is_some_and(|value| value.is_empty() || value.len() > 512) {
+            return Err(BusError::Validation(
+                "test command must be 1-512 UTF-8 bytes when provided".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let request_hash = idempotency_key
+            .map(|key| {
+                validate_idempotency_key(key)?;
+                hash_json(&json!({
+                    "taskId": task_id,
+                    "resultKey": result_key,
+                    "suite": suite,
+                    "outcome": outcome,
+                    "summary": summary,
+                    "command": command,
+                    "reportArtifactId": report_artifact_id
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let fact_id = format!("trf_{}", Uuid::new_v4().simple());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<TestResultFactView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.test_result",
+                key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+        ensure_owned_nonterminal_task(&tx, &self.project.project_id, &actor, task_id)?;
+        if let Some(artifact_id) = report_artifact_id {
+            let artifact_task: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT task_id FROM artifacts WHERE project_id = ?1 AND id = ?2",
+                    params![self.project.project_id, artifact_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let artifact_task = artifact_task.ok_or_else(|| {
+                BusError::Validation(format!("report artifact '{artifact_id}' does not exist"))
+            })?;
+            if artifact_task
+                .as_deref()
+                .is_some_and(|value| value != task_id)
+            {
+                return Err(BusError::Conflict(format!(
+                    "report artifact '{artifact_id}' belongs to unrelated task '{}'",
+                    artifact_task.unwrap_or_default()
+                )));
+            }
+        }
+        let existing = tx
+            .query_row(
+                "SELECT f.id, f.task_id, author.name, f.result_key, f.suite, f.outcome,
+                        f.summary, f.command, f.report_artifact_id, f.recorded_at
+                 FROM test_result_facts f JOIN agents author ON author.id = f.author_agent_id
+                 WHERE f.project_id = ?1 AND f.task_id = ?2 AND f.result_key = ?3",
+                params![self.project.project_id, task_id, result_key],
+                map_test_result_fact,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.author != actor.name
+                || existing.suite != suite
+                || existing.outcome != outcome
+                || existing.summary != summary
+                || existing.command.as_deref() != command
+                || existing.report_artifact_id.as_deref() != report_artifact_id
+            {
+                return Err(BusError::Conflict(format!(
+                    "test result fact '{task_id}/{result_key}' already exists with different semantics"
+                )));
+            }
+            if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+                store_idempotent(
+                    &tx,
+                    &self.project.project_id,
+                    &actor.id,
+                    "fact.test_result",
+                    key,
+                    request_hash,
+                    &existing,
+                )?;
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        tx.execute(
+            "INSERT INTO test_result_facts
+             (id, project_id, task_id, author_agent_id, result_key, suite, outcome,
+              summary, command, report_artifact_id, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                fact_id,
+                self.project.project_id,
+                task_id,
+                actor.id,
+                result_key,
+                suite,
+                outcome,
+                summary,
+                command,
+                report_artifact_id,
+                now
+            ],
+        )?;
+        let response = TestResultFactView {
+            fact_id: fact_id.clone(),
+            task_id: task_id.to_owned(),
+            author: actor.name.clone(),
+            result_key: result_key.to_owned(),
+            suite: suite.to_owned(),
+            outcome: outcome.to_owned(),
+            summary: summary.to_owned(),
+            command: command.map(ToOwned::to_owned),
+            report_artifact_id: report_artifact_id.map(ToOwned::to_owned),
+            recorded_at: now,
+        };
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.test_result",
+                key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "test_result_recorded",
+            "test_result_fact",
+            &fact_id,
+            json!({
+                "taskId": task_id,
+                "resultKey": result_key,
+                "suite": suite,
+                "outcome": outcome,
+                "reportArtifactId": report_artifact_id
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    pub fn list_git_commit_facts(&self, task_id: &str) -> Result<Vec<GitCommitFactView>> {
+        validate_task_id(task_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT f.id, f.task_id, author.name, f.commit_sha, f.summary,
+                    f.changed_paths_json, f.recorded_at
+             FROM git_commit_facts f JOIN agents author ON author.id = f.author_agent_id
+             WHERE f.project_id = ?1 AND f.task_id = ?2
+             ORDER BY f.recorded_at, f.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, task_id],
+            map_git_commit_fact,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_test_result_facts(&self, task_id: &str) -> Result<Vec<TestResultFactView>> {
+        validate_task_id(task_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT f.id, f.task_id, author.name, f.result_key, f.suite, f.outcome,
+                    f.summary, f.command, f.report_artifact_id, f.recorded_at
+             FROM test_result_facts f JOIN agents author ON author.id = f.author_agent_id
+             WHERE f.project_id = ?1 AND f.task_id = ?2
+             ORDER BY f.recorded_at, f.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, task_id],
+            map_test_result_fact,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn handoff_proposal(
+        &self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        item_limit: usize,
+    ) -> Result<HandoffProposalView> {
+        validate_task_id(task_id)?;
+        if !(1..=20).contains(&item_limit) {
+            return Err(BusError::Validation(
+                "handoff proposal item limit must be between 1 and 20".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let task = self.get_task(task_id)?;
+        if task.owner.as_deref() != Some(actor.name.as_str()) {
+            return Err(BusError::Unauthorized(format!(
+                "agent '{}' must own task '{task_id}' to build its handoff proposal",
+                actor.name
+            )));
+        }
+        let git_commits = bounded_tail(self.list_git_commit_facts(task_id)?, item_limit);
+        let test_results = bounded_tail(self.list_test_result_facts(task_id)?, item_limit);
+        let decisions = bounded_tail(
+            self.list_confirmed_decisions()?
+                .into_iter()
+                .filter(|decision| decision.task_id == task_id)
+                .collect(),
+            item_limit,
+        );
+        let artifacts = bounded_tail(self.list_artifacts(Some(task_id))?, item_limit);
+        let summary = format!(
+            "Task {task_id} is {} at version {}; proposal includes {} Git commit facts, {} test results, {} decisions, and {} artifacts.",
+            task.status,
+            task.version,
+            git_commits.len(),
+            test_results.len(),
+            decisions.len(),
+            artifacts.len()
+        );
+        Ok(HandoffProposalView {
+            task,
+            summary,
+            git_commits,
+            test_results,
+            decisions,
+            artifacts,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1901,6 +2562,60 @@ impl Bus {
                         "summary": summary,
                         "summaryTruncated": summary_truncated,
                         "createdAt": artifact.created_at
+                    }),
+                });
+            }
+        }
+        let mut relevant_task_ids_sorted = relevant_task_ids.into_iter().collect::<Vec<_>>();
+        relevant_task_ids_sorted.sort();
+        for task_id in &relevant_task_ids_sorted {
+            for fact in self.list_git_commit_facts(task_id)? {
+                let (summary, summary_truncated) = text_preview(&fact.summary, 256);
+                let changed_paths = fact
+                    .changed_paths
+                    .iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.push(ContextCandidate {
+                    sort_key: format!("6|{:020}|{}", fact.recorded_at.max(0), fact.fact_id),
+                    kind: "gitCommitFact",
+                    value: json!({
+                        "factId": fact.fact_id,
+                        "taskId": fact.task_id,
+                        "author": fact.author,
+                        "commitSha": fact.commit_sha,
+                        "summary": summary,
+                        "summaryTruncated": summary_truncated,
+                        "changedPaths": changed_paths,
+                        "changedPathsTruncated": fact.changed_paths.len() > 20,
+                        "recordedAt": fact.recorded_at
+                    }),
+                });
+            }
+            for fact in self.list_test_result_facts(task_id)? {
+                let (summary, summary_truncated) = text_preview(&fact.summary, 256);
+                let (command, command_truncated) = fact
+                    .command
+                    .as_deref()
+                    .map(|command| text_preview(command, 256))
+                    .unwrap_or_default();
+                candidates.push(ContextCandidate {
+                    sort_key: format!("7|{:020}|{}", fact.recorded_at.max(0), fact.fact_id),
+                    kind: "testResultFact",
+                    value: json!({
+                        "factId": fact.fact_id,
+                        "taskId": fact.task_id,
+                        "author": fact.author,
+                        "resultKey": fact.result_key,
+                        "suite": fact.suite,
+                        "outcome": fact.outcome,
+                        "summary": summary,
+                        "summaryTruncated": summary_truncated,
+                        "command": command,
+                        "commandTruncated": command_truncated,
+                        "reportArtifactId": fact.report_artifact_id,
+                        "recordedAt": fact.recorded_at
                     }),
                 });
             }
@@ -2856,7 +3571,7 @@ impl Bus {
             [],
             |row| row.get(0),
         )?;
-        let counts: (i64, i64, i64, i64, i64, i64) = self.conn.query_row(
+        let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM agents WHERE project_id = ?1),
                (SELECT COUNT(*) FROM messages WHERE project_id = ?1),
@@ -2864,7 +3579,10 @@ impl Bus {
                (SELECT COUNT(*) FROM reservations
                  WHERE project_id = ?1 AND released_at IS NULL AND expires_at > ?2),
                (SELECT COUNT(*) FROM artifacts WHERE project_id = ?1),
-               (SELECT COUNT(*) FROM decisions WHERE project_id = ?1)",
+               (SELECT COUNT(*) FROM decisions WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM responsibility_overrides WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM git_commit_facts WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM test_result_facts WHERE project_id = ?1)",
             params![self.project.project_id, now_ms()],
             |row| {
                 Ok((
@@ -2874,6 +3592,9 @@ impl Bus {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )?;
@@ -2894,6 +3615,9 @@ impl Bus {
             active_reservations: counts.3,
             artifacts: counts.4,
             decisions: counts.5,
+            responsibility_overrides: counts.6,
+            git_commit_facts: counts.7,
+            test_result_facts: counts.8,
         })
     }
 
@@ -3022,15 +3746,15 @@ impl Bus {
     }
 
     fn authenticate(&self, name: &str, token: &str) -> Result<AuthenticatedAgent> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, String)> = self
             .conn
             .query_row(
-                "SELECT id, token_hash FROM agents WHERE project_id = ?1 AND name = ?2",
+                "SELECT id, token_hash, role FROM agents WHERE project_id = ?1 AND name = ?2",
                 params![self.project.project_id, name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let (id, token_hash) = row.ok_or_else(|| BusError::AgentNotFound(name.to_owned()))?;
+        let (id, token_hash, role) = row.ok_or_else(|| BusError::AgentNotFound(name.to_owned()))?;
         if token.is_empty() || !secret_matches(token, &token_hash) {
             return Err(BusError::Unauthorized(name.to_owned()));
         }
@@ -3041,6 +3765,7 @@ impl Bus {
         Ok(AuthenticatedAgent {
             id,
             name: name.to_owned(),
+            role,
         })
     }
 
@@ -3144,6 +3869,7 @@ impl Bus {
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 owner_agent_id TEXT NOT NULL,
+                task_id TEXT,
                 path_pattern TEXT NOT NULL,
                 exclusive INTEGER NOT NULL,
                 reason TEXT,
@@ -3151,7 +3877,8 @@ impl Bus {
                 expires_at INTEGER NOT NULL,
                 released_at INTEGER,
                 FOREIGN KEY(project_id) REFERENCES projects(id),
-                FOREIGN KEY(owner_agent_id) REFERENCES agents(id)
+                FOREIGN KEY(owner_agent_id) REFERENCES agents(id),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
              );
              CREATE TABLE IF NOT EXISTS artifacts (
                 id TEXT PRIMARY KEY,
@@ -3181,6 +3908,50 @@ impl Bus {
                 FOREIGN KEY(project_id) REFERENCES projects(id),
                 FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
                 FOREIGN KEY(author_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS responsibility_overrides (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                grantee_agent_id TEXT NOT NULL,
+                granted_by_agent_id TEXT NOT NULL,
+                path_pattern TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(grantee_agent_id) REFERENCES agents(id),
+                FOREIGN KEY(granted_by_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS git_commit_facts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                author_agent_id TEXT NOT NULL,
+                commit_sha TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                changed_paths_json TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(project_id, task_id, commit_sha),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(author_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS test_result_facts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                author_agent_id TEXT NOT NULL,
+                result_key TEXT NOT NULL,
+                suite TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                command TEXT,
+                report_artifact_id TEXT,
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(project_id, task_id, result_key),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(author_agent_id) REFERENCES agents(id),
+                FOREIGN KEY(report_artifact_id) REFERENCES artifacts(id)
              );
              CREATE TABLE IF NOT EXISTS idempotency_records (
                 project_id TEXT NOT NULL,
@@ -3284,6 +4055,12 @@ impl Bus {
                 ON artifacts(project_id, task_id, created_at);
              CREATE INDEX IF NOT EXISTS idx_decisions_task
                 ON decisions(project_id, task_id, confirmed_at);
+             CREATE INDEX IF NOT EXISTS idx_responsibility_overrides_active
+                ON responsibility_overrides(project_id, grantee_agent_id, task_id, expires_at);
+             CREATE INDEX IF NOT EXISTS idx_git_commit_facts_task
+                ON git_commit_facts(project_id, task_id, recorded_at);
+             CREATE INDEX IF NOT EXISTS idx_test_result_facts_task
+                ON test_result_facts(project_id, task_id, recorded_at);
              CREATE INDEX IF NOT EXISTS idx_idempotency_created
                 ON idempotency_records(project_id, created_at);
              CREATE INDEX IF NOT EXISTS idx_subscriptions_agent
@@ -3301,6 +4078,7 @@ impl Bus {
             "INTEGER NOT NULL DEFAULT 1",
         )?;
         ensure_column(&self.conn, "message_receipts", "closed_at", "INTEGER")?;
+        ensure_column(&self.conn, "reservations", "task_id", "TEXT")?;
         ensure_column(&self.conn, "subscriptions", "pending_delivery_id", "TEXT")?;
         ensure_column(
             &self.conn,
@@ -3378,6 +4156,49 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionView> {
         summary: row.get(4)?,
         artifact_ids,
         confirmed_at: row.get(6)?,
+    })
+}
+
+fn map_responsibility_override(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ResponsibilityOverrideView> {
+    Ok(ResponsibilityOverrideView {
+        override_id: row.get(0)?,
+        task_id: row.get(1)?,
+        grantee: row.get(2)?,
+        granted_by: row.get(3)?,
+        path_pattern: row.get(4)?,
+        reason: row.get(5)?,
+        created_at: row.get(6)?,
+        expires_at: row.get(7)?,
+    })
+}
+
+fn map_git_commit_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitCommitFactView> {
+    let changed_paths_json: String = row.get(5)?;
+    Ok(GitCommitFactView {
+        fact_id: row.get(0)?,
+        task_id: row.get(1)?,
+        author: row.get(2)?,
+        commit_sha: row.get(3)?,
+        summary: row.get(4)?,
+        changed_paths: parse_json_column(&changed_paths_json, 5)?,
+        recorded_at: row.get(6)?,
+    })
+}
+
+fn map_test_result_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestResultFactView> {
+    Ok(TestResultFactView {
+        fact_id: row.get(0)?,
+        task_id: row.get(1)?,
+        author: row.get(2)?,
+        result_key: row.get(3)?,
+        suite: row.get(4)?,
+        outcome: row.get(5)?,
+        summary: row.get(6)?,
+        command: row.get(7)?,
+        report_artifact_id: row.get(8)?,
+        recorded_at: row.get(9)?,
     })
 }
 
@@ -4002,6 +4823,126 @@ fn unlock_ready_tasks(tx: &Transaction<'_>, project_id: &str, now: i64) -> Resul
     Ok(())
 }
 
+fn authorize_project_path(
+    connection: &Connection,
+    project_id: &str,
+    policy: &ResponsibilityPolicy,
+    actor: &AuthenticatedAgent,
+    task_id: Option<&str>,
+    project_path: &str,
+    now: i64,
+) -> Result<()> {
+    let task_status = if let Some(task_id) = task_id {
+        let status: Option<String> = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE project_id = ?1 AND id = ?2",
+                params![project_id, task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let status = status
+            .ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+        Some(status)
+    } else {
+        None
+    };
+    if policy.allows(&actor.role, project_path) {
+        return Ok(());
+    }
+    let task_id = task_id.ok_or_else(|| {
+        BusError::Conflict(format!(
+            "path '{project_path}' is outside responsibility role '{}' and requires a task-scoped override",
+            actor.role
+        ))
+    })?;
+    if task_status
+        .as_deref()
+        .is_some_and(|status| matches!(status, "completed" | "abandoned"))
+    {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot authorize responsibility overrides"
+        )));
+    }
+    let mut statement = connection.prepare(
+        "SELECT path_pattern FROM responsibility_overrides
+         WHERE project_id = ?1 AND task_id = ?2 AND grantee_agent_id = ?3
+           AND expires_at > ?4
+         ORDER BY created_at, id",
+    )?;
+    let patterns = statement.query_map(params![project_id, task_id, actor.id, now], |row| {
+        row.get::<_, String>(0)
+    })?;
+    if patterns
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|pattern| policy_pattern_matches(pattern, project_path))
+    {
+        return Ok(());
+    }
+    Err(BusError::Conflict(format!(
+        "path '{project_path}' is outside responsibility role '{}' and task '{task_id}' has no active matching override",
+        actor.role
+    )))
+}
+
+fn ensure_nonterminal_task_exists(
+    connection: &Connection,
+    project_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM tasks WHERE project_id = ?1 AND id = ?2",
+            params![project_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let status =
+        status.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+    if matches!(status.as_str(), "completed" | "abandoned") {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot be associated with a new reservation"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_owned_nonterminal_task(
+    connection: &Connection,
+    project_id: &str,
+    actor: &AuthenticatedAgent,
+    task_id: &str,
+) -> Result<String> {
+    let task: Option<(Option<String>, String)> = connection
+        .query_row(
+            "SELECT owner_agent_id, status FROM tasks WHERE project_id = ?1 AND id = ?2",
+            params![project_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (owner, status) =
+        task.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+    if owner.as_deref() != Some(actor.id.as_str()) {
+        return Err(BusError::Unauthorized(format!(
+            "agent '{}' must own task '{task_id}'",
+            actor.name
+        )));
+    }
+    if matches!(status.as_str(), "completed" | "abandoned") {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot accept new facts or overrides"
+        )));
+    }
+    Ok(status)
+}
+
+fn bounded_tail<T>(mut values: Vec<T>, limit: usize) -> Vec<T> {
+    if values.len() > limit {
+        values.drain(0..values.len() - limit);
+    }
+    values
+}
+
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
     let valid = !value.is_empty()
         && value.len() <= 64
@@ -4028,6 +4969,36 @@ fn validate_task_id(task_id: &str) -> Result<()> {
     } else {
         Err(BusError::Validation(
             "task id must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
+        ))
+    }
+}
+
+fn validate_result_key(key: &str) -> Result<()> {
+    let valid = !key.is_empty()
+        && key.len() <= 96
+        && key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "test result key must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
+        ))
+    }
+}
+
+fn normalize_commit_sha(commit_sha: &str) -> Result<String> {
+    let normalized = commit_sha.trim().to_ascii_lowercase();
+    if matches!(normalized.len(), 40 | 64)
+        && normalized
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        Ok(normalized)
+    } else {
+        Err(BusError::Validation(
+            "Git commit SHA must contain exactly 40 or 64 hexadecimal characters".into(),
         ))
     }
 }
@@ -4132,7 +5103,7 @@ fn decode_context_cursor(cursor: &str) -> Result<String> {
         .map_err(|_| BusError::Validation("context cursor is malformed".into()))?;
     if !matches!(
         sort_key.as_bytes(),
-        [b'1' | b'2' | b'3' | b'4' | b'5', b'|', ..]
+        [b'1' | b'2' | b'3' | b'4' | b'5' | b'6' | b'7', b'|', ..]
     ) {
         return Err(BusError::Validation("context cursor is malformed".into()));
     }
@@ -4208,6 +5179,15 @@ fn validate_reservation_ttl(ttl_seconds: i64) -> Result<()> {
     Ok(())
 }
 
+fn validate_responsibility_ttl(ttl_seconds: i64) -> Result<()> {
+    if !(60..=86_400).contains(&ttl_seconds) {
+        return Err(BusError::Validation(
+            "responsibility override TTL must be between 60 and 86400 seconds".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
@@ -4249,34 +5229,6 @@ fn sha256_file(path: &Path) -> Result<String> {
 
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
-}
-
-fn normalize_path_pattern(path: &str) -> Result<String> {
-    let trimmed = path.trim();
-    let candidate = Path::new(trimmed);
-    if candidate.is_absolute()
-        || trimmed.starts_with('/')
-        || trimmed.starts_with('\\')
-        || trimmed.as_bytes().get(1).is_some_and(|byte| *byte == b':')
-    {
-        return Err(BusError::Validation(
-            "reservation path must be project-relative".into(),
-        ));
-    }
-    let normalized = trimmed.replace('\\', "/").trim_matches('/').to_owned();
-    if normalized.is_empty()
-        || normalized.starts_with("..")
-        || normalized.split('/').any(|segment| segment == "..")
-    {
-        return Err(BusError::Validation(
-            "reservation path must be project-relative and cannot contain '..'".into(),
-        ));
-    }
-    Ok(if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    })
 }
 
 fn validate_task_transition(current: &str, next: &str) -> Result<()> {

@@ -985,6 +985,259 @@ fn artifacts_are_project_scoped_hashed_and_filterable() {
 }
 
 #[test]
+fn responsibility_policy_overrides_and_task_facts_are_enforced_and_projected() {
+    let harness = Harness::new();
+    fs::write(
+        harness
+            .project
+            .path()
+            .join(".vibebus")
+            .join("responsibility.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "defaultAllowedPaths": [],
+            "roles": {
+                "owner-role": {"allowedPaths": ["src/**"]},
+                "grantee-role": {"allowedPaths": []}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(harness.project.path().join("docs")).unwrap();
+    fs::write(
+        harness.project.path().join("docs").join("report.txt"),
+        "bounded report\n",
+    )
+    .unwrap();
+
+    let mut bus = harness.bus();
+    let owner = bus.register_agent("policy-owner", "owner-role").unwrap();
+    let grantee = bus
+        .register_agent("policy-grantee", "grantee-role")
+        .unwrap();
+    bus.create_task(
+        &owner.name,
+        &owner.token,
+        "POLICY-001",
+        "Policy task",
+        None,
+        &[],
+    )
+    .unwrap();
+    bus.claim_task(&owner.name, &owner.token, "POLICY-001")
+        .unwrap();
+
+    assert!(matches!(
+        bus.reserve_path_for_task_idempotent(
+            &owner.name,
+            &owner.token,
+            "src/missing-task",
+            300,
+            true,
+            Some("invalid task association"),
+            Some("POLICY-MISSING"),
+            None,
+        ),
+        Err(BusError::Validation(_))
+    ));
+
+    assert!(matches!(
+        bus.publish_artifact(
+            &owner.name,
+            &owner.token,
+            "report",
+            "docs/report.txt",
+            "Outside owner role",
+            Some("POLICY-001"),
+            None,
+        ),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.reserve_path_for_task_idempotent(
+            &grantee.name,
+            &grantee.token,
+            "external/resource",
+            300,
+            true,
+            Some("cross-domain work"),
+            Some("POLICY-001"),
+            Some("policy-reserve-before-override"),
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let self_override = bus
+        .grant_responsibility_override_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &owner.name,
+            "docs/**",
+            "Task needs a bounded report",
+            600,
+            Some("policy-self-override"),
+        )
+        .unwrap();
+    let self_override_retry = bus
+        .grant_responsibility_override_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &owner.name,
+            "docs/**",
+            "Task needs a bounded report",
+            600,
+            Some("policy-self-override"),
+        )
+        .unwrap();
+    assert_eq!(self_override, self_override_retry);
+    bus.grant_responsibility_override_idempotent(
+        &owner.name,
+        &owner.token,
+        "POLICY-001",
+        &grantee.name,
+        "external/**",
+        "Delegate one cross-domain resource",
+        600,
+        Some("policy-grantee-override"),
+    )
+    .unwrap();
+
+    let delegated = bus
+        .reserve_path_for_task_idempotent(
+            &grantee.name,
+            &grantee.token,
+            "external/resource",
+            300,
+            true,
+            Some("cross-domain work"),
+            Some("POLICY-001"),
+            Some("policy-reserve-after-override"),
+        )
+        .unwrap();
+    assert_eq!(delegated.task_id.as_deref(), Some("POLICY-001"));
+
+    let artifact = bus
+        .publish_artifact_idempotent(
+            &owner.name,
+            &owner.token,
+            "report",
+            "docs/report.txt",
+            "Task-scoped report",
+            Some("POLICY-001"),
+            None,
+            Some("policy-artifact"),
+        )
+        .unwrap();
+    let changed_paths = vec!["src/store.rs".to_owned(), "docs/report.txt".to_owned()];
+    let commit = bus
+        .record_git_commit_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &"a".repeat(40),
+            "feat: enforce responsibility policy",
+            &changed_paths,
+            Some("policy-commit"),
+        )
+        .unwrap();
+    let commit_retry = bus
+        .record_git_commit_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &"a".repeat(40),
+            "feat: enforce responsibility policy",
+            &changed_paths,
+            Some("policy-commit"),
+        )
+        .unwrap();
+    assert_eq!(commit, commit_retry);
+    assert!(matches!(
+        bus.record_git_commit_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &"a".repeat(40),
+            "changed semantics",
+            &changed_paths,
+            Some("policy-commit-drift"),
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let test_result = bus
+        .record_test_result_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            "unit-1",
+            "cargo test",
+            "passed",
+            "All responsibility tests passed",
+            Some("cargo test --all-targets --locked"),
+            Some(&artifact.artifact_id),
+            Some("policy-test-result"),
+        )
+        .unwrap();
+    let test_retry = bus
+        .record_test_result_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            "unit-1",
+            "cargo test",
+            "passed",
+            "All responsibility tests passed",
+            Some("cargo test --all-targets --locked"),
+            Some(&artifact.artifact_id),
+            Some("policy-test-result"),
+        )
+        .unwrap();
+    assert_eq!(test_result, test_retry);
+
+    let inspection = bus
+        .inspect_responsibility_policy(&owner.name, &owner.token)
+        .unwrap();
+    assert!(inspection.configured);
+    assert_eq!(inspection.allowed_paths, vec!["src/**"]);
+    assert_eq!(inspection.active_overrides.len(), 1);
+    assert_eq!(
+        inspection.active_overrides[0].override_id,
+        self_override.override_id
+    );
+
+    let context = bus
+        .context_sync(&owner.name, &owner.token, None, 100, 65_536)
+        .unwrap();
+    assert!(
+        context
+            .items
+            .iter()
+            .any(|item| item.kind == "gitCommitFact")
+    );
+    assert!(
+        context
+            .items
+            .iter()
+            .any(|item| item.kind == "testResultFact")
+    );
+    let proposal = bus
+        .handoff_proposal(&owner.name, &owner.token, "POLICY-001", 10)
+        .unwrap();
+    assert_eq!(proposal.git_commits, vec![commit]);
+    assert_eq!(proposal.test_results, vec![test_result]);
+    assert_eq!(proposal.artifacts[0].artifact_id, artifact.artifact_id);
+
+    let doctor = bus.doctor().unwrap();
+    assert_eq!(doctor.responsibility_overrides, 2);
+    assert_eq!(doctor.git_commit_facts, 1);
+    assert_eq!(doctor.test_result_facts, 1);
+}
+
+#[test]
 fn doctor_reports_healthy_database_and_backup_is_consistent() {
     let harness = Harness::new();
     let mut bus = harness.bus();
@@ -995,7 +1248,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 10);
+    assert_eq!(doctor.schema_version, 11);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -1193,7 +1446,29 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
         .unwrap();
     assert!(decision_columns.contains(&"decision_key".to_owned()));
     assert!(decision_columns.contains(&"artifact_ids_json".to_owned()));
-    assert_eq!(bus.doctor().unwrap().schema_version, 10);
+    let reservation_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(reservations)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(reservation_columns.contains(&"task_id".to_owned()));
+    for table in [
+        "responsibility_overrides",
+        "git_commit_facts",
+        "test_result_facts",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "migration must create {table}");
+    }
+    assert_eq!(bus.doctor().unwrap().schema_version, 11);
 }
 
 #[test]

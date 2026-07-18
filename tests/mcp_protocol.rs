@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
@@ -11,6 +11,17 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     let project = TempDir::new().unwrap();
     let data_home = TempDir::new().unwrap();
     initialize_project(project.path(), "MCP test", Some(data_home.path())).unwrap();
+    fs::create_dir_all(project.path().join(".vibebus")).unwrap();
+    fs::write(
+        project.path().join(".vibebus/responsibility.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "defaultAllowedPaths": [],
+            "roles": {"test": {"allowedPaths": ["src/**"]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
     let project_root = project.path().to_path_buf();
@@ -82,6 +93,11 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     assert!(names.contains(&"vibebus_handoff_snapshot"));
     assert!(names.contains(&"vibebus_decision_confirm"));
     assert!(names.contains(&"vibebus_context_sync"));
+    assert!(names.contains(&"vibebus_responsibility_inspect"));
+    assert!(names.contains(&"vibebus_responsibility_override"));
+    assert!(names.contains(&"vibebus_git_commit_record"));
+    assert!(names.contains(&"vibebus_test_result_record"));
+    assert!(names.contains(&"vibebus_handoff_propose"));
     assert!(names.contains(&"vibebus_close"));
     assert!(names.contains(&"vibebus_thread_bind"));
     assert!(names.contains(&"vibebus_thread_unbind"));
@@ -201,6 +217,124 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     .await;
     let claimed = tool_text(&response(&mut lines, 7).await);
     assert_eq!(claimed["owner"], "mcp-vault-agent");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_responsibility_inspect",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    let policy = tool_text(&response(&mut lines, 20).await);
+    assert_eq!(policy["configured"], true);
+    assert_eq!(policy["allowedPaths"][0], "src/**");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_responsibility_override",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "grantee": "mcp-vault-agent",
+                    "pathPattern": "docs/**",
+                    "reason": "Record task documentation",
+                    "ttlSeconds": 600,
+                    "idempotencyKey": "mcp-responsibility-override"
+                }
+            }
+        }),
+    )
+    .await;
+    let granted = tool_text(&response(&mut lines, 21).await);
+    assert_eq!(granted["pathPattern"], "docs/**");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_git_commit_record",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "commitSha": "0123456789abcdef0123456789abcdef01234567",
+                    "summary": "Document the MCP policy",
+                    "changedPaths": ["docs/policy.md"],
+                    "idempotencyKey": "mcp-git-fact"
+                }
+            }
+        }),
+    )
+    .await;
+    let git_fact = tool_text(&response(&mut lines, 22).await);
+    assert_eq!(git_fact["changedPaths"][0], "docs/policy.md");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_test_result_record",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "resultKey": "mcp-protocol-head",
+                    "suite": "MCP protocol",
+                    "outcome": "passed",
+                    "summary": "MCP fact tools passed",
+                    "command": "cargo test --test mcp_protocol",
+                    "idempotencyKey": "mcp-test-fact"
+                }
+            }
+        }),
+    )
+    .await;
+    let test_fact = tool_text(&response(&mut lines, 23).await);
+    assert_eq!(test_fact["outcome"], "passed");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_handoff_propose",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "itemLimit": 5
+                }
+            }
+        }),
+    )
+    .await;
+    let proposal = tool_text(&response(&mut lines, 24).await);
+    assert_eq!(proposal["task"]["taskId"], "MCP-CONTEXT-001");
+    assert_eq!(proposal["gitCommits"].as_array().unwrap().len(), 1);
+    assert_eq!(proposal["testResults"].as_array().unwrap().len(), 1);
 
     send(
         &mut writer,

@@ -104,7 +104,10 @@
     </Component>
 
     <Component Id="PluginScriptFiles" Directory="PluginScriptsFolder" Guid="{B2259671-5E49-4291-A024-050895714A4F}">
+      <File Id="HookCommonScript" Source="$(var.PayloadRoot)\plugins\vibebus\scripts\hook-common.ps1" />
+      <File Id="PostToolFactsScript" Source="$(var.PayloadRoot)\plugins\vibebus\scripts\post-tool-facts.ps1" />
       <File Id="SessionStartScript" Source="$(var.PayloadRoot)\plugins\vibebus\scripts\session-start.ps1" />
+      <File Id="StopHandoffScript" Source="$(var.PayloadRoot)\plugins\vibebus\scripts\stop-handoff.ps1" />
       <RegistryValue Root="HKCU" Key="Software\VibeBus\Components" Name="SessionStartScript" Value="[ProductVersion]" Type="string" KeyPath="yes" />
     </Component>
 

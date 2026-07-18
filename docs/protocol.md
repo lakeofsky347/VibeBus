@@ -93,7 +93,22 @@ The thread ID is an opaque caller-provided identifier of 1-128 ASCII letters, di
 
 TTL is 1 to 86,400 seconds. Paths use `/`-normalized project-relative syntax. A reservation expresses intent and conflict detection; it is not an operating-system file lock.
 
-Acquire and renew accept idempotency keys. Renewal requires the authenticated owner and an active, unexpired reservation; the new expiry is calculated from renewal time.
+Acquire accepts optional `--task`/`taskId` plus an idempotency key. When a task is supplied, it must be non-terminal and the requested path must pass the role policy or an active override for that exact task and Agent. Renewal preserves the original task association and requires the authenticated owner plus an active, unexpired reservation; the new expiry is calculated from renewal time.
+
+## Responsibility policy and task facts
+
+| Capability | CLI | MCP |
+| --- | --- | --- |
+| Inspect effective role policy | `responsibility inspect` | `vibebus_responsibility_inspect` |
+| Grant task-scoped override | `responsibility override` | `vibebus_responsibility_override` |
+| Record Git commit fact | `fact git-commit` | `vibebus_git_commit_record` |
+| Record test-result fact | `fact test-result` | `vibebus_test_result_record` |
+
+`.vibebus/responsibility.json` version 1 maps role names to `allowedPaths` and may provide `defaultAllowedPaths`. Each pattern is an exact project-relative path, a terminal `/**` subtree, or global `**`; absolute paths, `..`, empty segments, and other wildcard placement are invalid. The document is limited to 64 KiB, 128 roles, and 256 patterns per role. If the file is absent, legacy projects remain allow-all. If it is present but invalid, protected operations fail closed.
+
+An override may be granted only by the authenticated owner of a non-terminal task to an existing Agent. It binds one validated path pattern, grantee, reason, and 60–86,400-second TTL to that task. An idempotency key makes exact retry safe and changed payload conflict. Overrides authorize responsibility only: they do not transfer task ownership, suppress reservation conflicts, or grant operating-system access.
+
+A Git fact binds a 40- or 64-hex commit SHA, 1–512-byte summary, and at most 200 unique normalized changed paths to an owned non-terminal task. Every path must pass responsibility authorization. A test fact binds a stable result key, suite, `passed|failed|skipped|error` outcome, bounded summary/command, and optional report artifact that is project-level or belongs to the same task. Task/commit and task/result-key uniqueness outlive generic idempotency cleanup; exact semantic retries return the original fact and drift conflicts.
 
 ## Artifacts
 
@@ -102,7 +117,7 @@ Acquire and renew accept idempotency keys. Renewal requires the authenticated ow
 | Publish | `artifact publish` | `vibebus_artifact_publish` |
 | List | `artifact list` | `vibebus_artifact_list` |
 
-Publishing requires an existing regular file inside the project. VibeBus stores a SHA-256 digest, type, summary, optional task ID, and arbitrary JSON metadata.
+Publishing requires an existing regular file inside the project. VibeBus stores a SHA-256 digest, type, summary, optional task ID, and arbitrary JSON metadata. A task-scoped artifact must pass responsibility authorization for the publisher and task; a project-level artifact retains the existing project-boundary behavior.
 For Windows CLI calls, `--metadata-file <path>` is the stable form for complex JSON because native argument quoting can alter embedded quotes. MCP accepts the metadata object directly.
 
 Artifact publication accepts an idempotency key. The request identity includes the current file SHA-256, so changing the file and reusing the key produces a conflict instead of returning a stale artifact.
@@ -122,9 +137,11 @@ Artifact publication accepts an idempotency key. The request identity includes t
 2. those tasks' direct dependencies;
 3. unread messages directed to the Agent;
 4. confirmed decisions related to the owned/dependency task scope; and
-5. artifacts related to the same scope.
+5. artifacts related to the same scope;
+6. Git commit facts for the same scope; and
+7. test-result facts for the same scope.
 
-Unrelated task facts and acknowledged, read, or closed messages are excluded. Artifacts expose identity, task, kind, path, SHA-256, and a bounded summary; VibeBus never reads artifact contents into context. Long task/message fields are bounded previews with explicit truncation flags.
+Unrelated task facts and acknowledged, read, or closed messages are excluded. Artifacts expose identity, task, kind, path, SHA-256, and a bounded summary; VibeBus never reads artifact contents into context. Git facts expose only commit identity, summary, and a bounded changed-path preview. Test facts expose bounded summaries/commands and report references, never logs. Long task/message fields are bounded previews with explicit truncation flags.
 
 CLI defaults are `--item-limit 100 --byte-budget 65536`; MCP uses `itemLimit` and `byteBudget`. Item limits accept 1–500 and byte budgets accept 4,096–1,048,576. `bytesUsed` is the exact sum of serialized context items, not the response envelope. A truncated page returns `hasMore=true` and an opaque `nextCursor`; pass it as `--cursor`/`cursor` to continue. Cursors encode the last deterministic fact key rather than a SQL offset, so an unchanged projection paginates without duplicates or omissions. A cursor is not an atomic database snapshot: restart from the beginning when concurrent task/message state must be reflected consistently.
 
@@ -172,14 +189,17 @@ Event candidates form one contiguous prefix that is old enough, at or below the 
 | --- | --- | --- |
 | Send handoff | `handoff send` | `vibebus_handoff_send` |
 | Resume snapshot | `handoff snapshot` | `vibebus_handoff_snapshot` |
+| Build review-only proposal | `handoff propose` | `vibebus_handoff_propose` |
 
 A handoff is a directed message with a JSON body containing `summary`, optional `taskId`, `decisions`, `artifacts`, `blockers`, and `nextActions`. VibeBus forces `high` priority and `requiresAck=true`, verifies referenced tasks and artifacts, and supports retry deduplication with an idempotency key. The recipient should read the body, act on it, and call `ack`.
 
-The authenticated snapshot combines unread messages, non-terminal owned tasks, their active task/thread bindings, active owned reservations, the agent's recent artifacts, recent available events after a supplied sequence, the latest event sequence, and retention state. It clamps an obsolete supplied sequence to the retained-history floor so recovery remains available. It is an operational resume view. Use `context sync` for the deterministic, task-scoped, budgeted projection of dependencies, decisions, and relevant artifacts.
+The authenticated snapshot combines unread messages, non-terminal owned tasks, their active task/thread bindings, active owned reservations, the agent's recent artifacts, recent available events after a supplied sequence, the latest event sequence, and retention state. It clamps an obsolete supplied sequence to the retained-history floor so recovery remains available. It is an operational resume view. Use `context sync` for the deterministic, task-scoped, budgeted projection of dependencies, decisions, artifacts, and lifecycle facts.
+
+`handoff propose` is an owner-authenticated read model for one task. It returns the task, one bounded summary, and tail-limited Git facts, test results, decisions, and artifacts. It creates no message, recipient, ACK obligation, or side effect. The Stop Hook writes this proposal to plugin data for review; a human or task must still invoke `handoff send` explicitly.
 
 ## Idempotency rules
 
-Idempotency keys are scoped by project, authenticated agent, and operation. Valid keys are 1-128 ASCII letters, digits, `-`, `_`, `.`, or `:`. They are available on message/handoff send, reservation acquire/renew, artifact publish, and decision confirmation. Same key plus same effective request returns the stored response; same key plus different request returns a conflict while the record remains inside the configured retention window. Confirmed decisions also retain semantic deduplication through their immutable project-wide decision key. Task creation already has a stable caller-selected task ID, while task claim and update rely on atomic state/version checks.
+Idempotency keys are scoped by project, authenticated agent, and operation. Valid keys are 1-128 ASCII letters, digits, `-`, `_`, `.`, or `:`. They are available on message/handoff send, reservation acquire/renew, artifact publish, decision confirmation, responsibility override, Git fact, and test-result fact. Same key plus same effective request returns the stored response; same key plus different request returns a conflict while the record remains inside the configured retention window. Confirmed decisions, Git commits, and test results also retain semantic deduplication through immutable domain keys. Task creation already has a stable caller-selected task ID, while task claim and update rely on atomic state/version checks.
 
 ## MCP root rule
 

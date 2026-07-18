@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.0 - 2026-07-18
+
+- Added a strict, bounded `.vibebus/responsibility.json` policy that maps Agent roles to validated project-relative paths, while preserving allow-all compatibility only when no policy is configured.
+- Enforced responsibility domains for task-scoped reservations, artifact declarations, and immutable Git changed-path facts.
+- Added authenticated, expiring, task-owner-issued cross-domain overrides with semantic idempotency and audit events; overrides do not replace reservation conflict control.
+- Added immutable, task-scoped Git commit and test-result facts with bounded payloads, stable replay, payload-drift conflicts, optional report-artifact references, CLI/MCP parity, and context projection.
+- Added a read-only bounded handoff proposal command and MCP tool.
+- Added deterministic Codex `PostToolUse` capture for successful Git commits and observed test outcomes, plus a `Stop` Hook that writes a reviewable proposal without sending a handoff or reading transcripts.
+- Added schema-v11 migration, policy/core/CLI/MCP coverage, seven deterministic PowerShell Hook checks, and CI Hook validation.
+
 ## 0.9.0 - 2026-07-18
 
 - Added immutable, task-scoped confirmed decisions with stable semantic keys, task-owner authorization, artifact references, exact replay, payload-drift conflicts, idempotency, and audit events.
