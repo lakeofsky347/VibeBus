@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params_from_iter,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -16,14 +17,15 @@ type ReservationRenewRow = (Option<String>, String, bool, Option<String>, i64);
 
 use crate::error::{BusError, Result};
 use crate::models::{
-    AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, ContextItemView,
-    ContextScopeView, ContextSyncView, DecisionView, DoctorReport, EventView, GitCommitFactView,
-    HandoffProposalView, HandoffSnapshot, MessageReceipt, MessageView, OperatorCredentialView,
-    OperatorStatusView, ProjectMetadata, RecoveryKeyView, ReleaseResult, ReservationView,
-    ResponsibilityOverrideView, ResponsibilityPolicyView, RetentionApprovalView, RetentionCounts,
-    RetentionPlan, RetentionPolicy, RetentionProtectionView, RetentionReport, RetentionStateView,
-    SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll,
-    SubscriptionView, TaskThreadBindingView, TaskView, TestResultFactView,
+    AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, CompactionMetricsView,
+    CompactionView, ContextItemView, ContextScopeView, ContextSyncView, DecisionView, DoctorReport,
+    EventView, GitCommitFactView, HandoffProposalView, HandoffSnapshot, MessageReceipt,
+    MessageView, OperatorCredentialView, OperatorStatusView, ProjectMetadata, RecoveryKeyView,
+    ReleaseResult, ReservationView, ResponsibilityOverrideView, ResponsibilityPolicyView,
+    RetentionApprovalView, RetentionCounts, RetentionPlan, RetentionPolicy,
+    RetentionProtectionView, RetentionReport, RetentionStateView, SubscriptionAck,
+    SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll, SubscriptionView,
+    TaskThreadBindingView, TaskView, TestResultFactView,
 };
 use crate::policy::{
     ResponsibilityPolicy, normalize_policy_pattern, normalize_project_path, policy_pattern_matches,
@@ -3622,37 +3624,222 @@ impl Bus {
     }
 
     pub fn backup_to(&self, destination: &Path) -> Result<BackupView> {
-        if destination.exists() {
-            return Err(BusError::Conflict(format!(
-                "backup destination '{}' already exists",
-                destination.display()
+        backup_connection_to(&self.conn, destination)
+    }
+
+    pub fn compact_offline(
+        start: &Path,
+        data_home: Option<&Path>,
+        operator_secret: &str,
+        backup_destination: &Path,
+    ) -> Result<CompactionView> {
+        let (_project_root, project) = discover_project(start)?;
+        let database_path = database_path(&project.project_id, data_home)?;
+        if !database_path.is_file() {
+            return Err(BusError::Validation(format!(
+                "database '{}' does not exist; offline compaction never creates a database",
+                database_path.display()
             )));
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+        if backup_destination == database_path {
+            return Err(BusError::Validation(
+                "backup destination must differ from the live database".into(),
+            ));
         }
-        let temporary =
-            destination.with_extension(format!("vibebus-tmp-{}", Uuid::new_v4().simple()));
-        let backup_result = (|| -> Result<()> {
-            let mut destination_connection = Connection::open(&temporary)?;
-            let backup = rusqlite::backup::Backup::new(&self.conn, &mut destination_connection)?;
-            backup.run_to_completion(64, Duration::from_millis(10), None)?;
-            drop(backup);
-            destination_connection.close().map_err(|(_, error)| error)?;
-            fs::rename(&temporary, destination)?;
-            Ok(())
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut connection = Connection::open_with_flags(&database_path, flags)?;
+        connection.busy_timeout(Duration::ZERO)?;
+        connection.execute_batch(
+            "PRAGMA busy_timeout=0;
+             PRAGMA foreign_keys=ON;
+             PRAGMA locking_mode=EXCLUSIVE;",
+        )?;
+
+        let checkpoint: (i64, i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(exclusive_compaction_error)?;
+        if checkpoint.0 != 0 || checkpoint.1 != checkpoint.2 {
+            return Err(BusError::Conflict(
+                "offline compaction could not checkpoint WAL without another active database user"
+                    .into(),
+            ));
+        }
+        connection
+            .execute_batch("BEGIN EXCLUSIVE; COMMIT;")
+            .map_err(exclusive_compaction_error)?;
+
+        let original_journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !original_journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(BusError::Conflict(format!(
+                "offline compaction requires WAL mode, found '{original_journal_mode}'"
+            )));
+        }
+        let exclusive_journal_mode: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .map_err(exclusive_compaction_error)?;
+        if !exclusive_journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(BusError::Conflict(format!(
+                "offline compaction could not acquire the DELETE journal boundary; SQLite returned '{exclusive_journal_mode}'"
+            )));
+        }
+
+        let operation = (|| -> Result<CompactionView> {
+            let schema_version: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )?;
+            if schema_version != SCHEMA_VERSION {
+                return Err(BusError::Conflict(format!(
+                    "offline compaction requires schema version {SCHEMA_VERSION}, found {schema_version}"
+                )));
+            }
+            let project_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                params![project.project_id],
+                |row| row.get(0),
+            )?;
+            if !project_exists {
+                return Err(BusError::Conflict(format!(
+                    "database does not contain project '{}'",
+                    project.project_id
+                )));
+            }
+            let operator_generation =
+                authenticate_operator(&connection, &project.project_id, operator_secret)?;
+            let active_state: (i64, i64, i64) = connection.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM tasks
+                      WHERE project_id = ?1 AND status NOT IN ('completed', 'abandoned')),
+                    (SELECT COUNT(*) FROM task_thread_bindings
+                      WHERE project_id = ?1 AND unbound_at IS NULL),
+                    (SELECT COUNT(*) FROM reservations
+                      WHERE project_id = ?1 AND released_at IS NULL AND expires_at > ?2)",
+                params![project.project_id, now_ms()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if active_state != (0, 0, 0) {
+                return Err(BusError::Conflict(format!(
+                    "offline compaction requires zero active tasks, bindings, and reservations; found {}, {}, {}",
+                    active_state.0, active_state.1, active_state.2
+                )));
+            }
+
+            let backup = backup_connection_to(&connection, backup_destination)?;
+            if let Err(error) = verify_database_file(backup_destination, &project.project_id) {
+                let _ = fs::remove_file(backup_destination);
+                return Err(error);
+            }
+
+            let initial_bytes = fs::metadata(&database_path)?.len();
+            let database_parent = database_path.parent().ok_or_else(|| {
+                BusError::Validation("database path has no parent directory".into())
+            })?;
+            let available_bytes = fs2::available_space(database_parent)?;
+            let required_bytes = initial_bytes.saturating_mul(2);
+            if available_bytes < required_bytes {
+                return Err(BusError::Validation(format!(
+                    "offline compaction requires at least {required_bytes} free bytes beside the database; found {available_bytes}"
+                )));
+            }
+
+            let compaction_id = format!("cmp_{}", Uuid::new_v4().simple());
+            let started = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            append_event(
+                &started,
+                &project.project_id,
+                None,
+                "compaction_started",
+                "maintenance_compaction",
+                &compaction_id,
+                json!({
+                    "backupPath": &backup.path,
+                    "backupSha256": &backup.sha256,
+                    "operatorGeneration": operator_generation
+                }),
+            )?;
+            started.commit()?;
+            let before = compaction_metrics(&connection, &database_path)?;
+
+            connection.execute_batch("VACUUM;")?;
+            let restored_mode: String =
+                connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+            if !restored_mode.eq_ignore_ascii_case("wal") {
+                return Err(BusError::Conflict(format!(
+                    "compaction completed but WAL restoration returned '{restored_mode}'"
+                )));
+            }
+
+            let completed_at = now_ms();
+            let completed = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            append_event(
+                &completed,
+                &project.project_id,
+                None,
+                "compaction_completed",
+                "maintenance_compaction",
+                &compaction_id,
+                json!({
+                    "backupSha256": &backup.sha256,
+                    "beforeBytes": before.bytes,
+                    "beforeFreelistPages": before.freelist_pages,
+                    "operatorGeneration": operator_generation
+                }),
+            )?;
+            completed.commit()?;
+            let final_checkpoint: (i64, i64, i64) =
+                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if final_checkpoint.0 != 0 || final_checkpoint.1 != final_checkpoint.2 {
+                return Err(BusError::Conflict(
+                    "compaction completed but the final WAL checkpoint was busy".into(),
+                ));
+            }
+
+            let (integrity, foreign_key_violations, final_schema_version) =
+                verify_open_database(&connection, &project.project_id)?;
+            let final_journal_mode: String =
+                connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            let after = compaction_metrics(&connection, &database_path)?;
+            let verified = integrity == "ok"
+                && foreign_key_violations == 0
+                && final_schema_version == SCHEMA_VERSION
+                && final_journal_mode.eq_ignore_ascii_case("wal");
+            if !verified {
+                return Err(BusError::Conflict(
+                    "post-compaction database verification failed".into(),
+                ));
+            }
+            let reclaimed_bytes = before.bytes.saturating_sub(after.bytes);
+            Ok(CompactionView {
+                compaction_id,
+                database_path: database_path.to_string_lossy().into_owned(),
+                operator_generation,
+                backup,
+                before,
+                after,
+                reclaimed_bytes,
+                journal_mode: final_journal_mode,
+                integrity,
+                foreign_key_violations,
+                schema_version: final_schema_version,
+                verified,
+                completed_at,
+            })
         })();
-        if backup_result.is_err() && temporary.exists() {
-            let _ = fs::remove_file(&temporary);
+
+        if operation.is_err() {
+            let _ = connection
+                .query_row::<String, _, _>("PRAGMA journal_mode=WAL", [], |row| row.get(0));
         }
-        backup_result?;
-        let metadata = fs::metadata(destination)?;
-        Ok(BackupView {
-            path: destination.to_string_lossy().into_owned(),
-            bytes: metadata.len(),
-            sha256: sha256_file(destination)?,
-            created_at: now_ms(),
-        })
+        let _ = connection.execute_batch("PRAGMA locking_mode=NORMAL;");
+        drop(connection);
+        operation
     }
 
     fn update_receipt(
@@ -5225,6 +5412,96 @@ fn sha256_file(path: &Path) -> Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+fn backup_connection_to(source: &Connection, destination: &Path) -> Result<BackupView> {
+    if destination.exists() {
+        return Err(BusError::Conflict(format!(
+            "backup destination '{}' already exists",
+            destination.display()
+        )));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = destination.with_extension(format!("vibebus-tmp-{}", Uuid::new_v4().simple()));
+    let backup_result = (|| -> Result<()> {
+        let mut destination_connection = Connection::open(&temporary)?;
+        let backup = rusqlite::backup::Backup::new(source, &mut destination_connection)?;
+        backup.run_to_completion(64, Duration::from_millis(10), None)?;
+        drop(backup);
+        destination_connection.close().map_err(|(_, error)| error)?;
+        fs::rename(&temporary, destination)?;
+        Ok(())
+    })();
+    if backup_result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    backup_result?;
+    let metadata = fs::metadata(destination)?;
+    Ok(BackupView {
+        path: destination.to_string_lossy().into_owned(),
+        bytes: metadata.len(),
+        sha256: sha256_file(destination)?,
+        created_at: now_ms(),
+    })
+}
+
+fn compaction_metrics(connection: &Connection, path: &Path) -> Result<CompactionMetricsView> {
+    Ok(CompactionMetricsView {
+        bytes: fs::metadata(path)?.len(),
+        page_count: connection.query_row("PRAGMA page_count", [], |row| row.get(0))?,
+        page_size: connection.query_row("PRAGMA page_size", [], |row| row.get(0))?,
+        freelist_pages: connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?,
+        sha256: sha256_file(path)?,
+    })
+}
+
+fn verify_database_file(path: &Path, project_id: &str) -> Result<()> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection = Connection::open_with_flags(path, flags)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let (integrity, foreign_key_violations, schema_version) =
+        verify_open_database(&connection, project_id)?;
+    connection.close().map_err(|(_, error)| error)?;
+    if integrity != "ok" || foreign_key_violations != 0 || schema_version != SCHEMA_VERSION {
+        return Err(BusError::Conflict(format!(
+            "backup verification failed: integrity={integrity}, foreignKeyViolations={foreign_key_violations}, schemaVersion={schema_version}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_open_database(connection: &Connection, project_id: &str) -> Result<(String, i64, i64)> {
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let mut foreign_keys = connection.prepare("PRAGMA foreign_key_check")?;
+    let foreign_key_violations = foreign_keys
+        .query_map([], |_| Ok(()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .len() as i64;
+    drop(foreign_keys);
+    let schema_version: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    let project_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    if !project_exists {
+        return Err(BusError::Conflict(format!(
+            "database does not contain project '{project_id}'"
+        )));
+    }
+    Ok((integrity, foreign_key_violations, schema_version))
+}
+
+fn exclusive_compaction_error(error: rusqlite::Error) -> BusError {
+    BusError::Conflict(format!(
+        "offline compaction could not obtain an exclusive SQLite boundary: {error}"
+    ))
 }
 
 fn now_ms() -> i64 {

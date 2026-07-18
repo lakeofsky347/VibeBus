@@ -9,6 +9,7 @@ license = "MIT"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.2", features = ["derive"] }
 directories = "6.0.0"
+fs2 = "0.4.3"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io"] }
 rpassword = "7.5.4"

@@ -51,7 +51,7 @@ Destructive maintenance uses a distinct project operator target:
 VibeBusOperator:<project-id>
 ```
 
-The operator is intentionally not an Agent role. Its CLI-only interactive capability approves a single exact retention plan for a short window; MCP can plan and apply but cannot initialize, rotate, restore, delete, or approve the operator credential.
+The operator is intentionally not an Agent role. Its CLI-only interactive capability approves a single exact retention plan for a short window and directly authorizes an explicitly confirmed offline compaction. MCP can plan and apply logical retention but cannot initialize, rotate, restore, delete, approve, or compact.
 
 The serialized secret pair includes a format version and token generation and stays below the Windows 2,560-byte Generic Credential BLOB limit. `CRED_PERSIST_LOCAL_MACHINE` makes it available to later local logon sessions of the same Windows user, not to other users or machines.
 
@@ -121,6 +121,8 @@ The serialized secret pair includes a format version and token generation and st
 36. A task/commit SHA and a task/test-result key each identify one immutable semantic payload; exact retries replay and drift conflicts.
 37. Lifecycle Hooks never treat shell output, transcripts, diffs, or logs as durable fact payloads; unknown exit status is skipped instead of guessed.
 38. Stop generates a bounded proposal only. Sending a handoff remains an explicit authenticated action.
+39. Offline compaction is CLI-only, starts before normal `Bus::open`, requires `compact:<project-id>` plus the vault-backed Operator secret, and refuses non-terminal tasks, active bindings, active reservations, a busy SQLite boundary, an existing backup path, an unverified backup, or insufficient database-volume free space.
+40. Compaction creates and verifies a consistent backup before `VACUUM`, retains an exclusive lock while switching WAL to DELETE, restores and checkpoints WAL afterward, verifies integrity/foreign keys/schema, and appends bounded start/completion audit events without exposing an Operator secret.
 
 ## Recovery and retry boundaries
 
@@ -164,7 +166,13 @@ The accepted approval is consumed in the same transaction as deletion, the `rete
 
 Events are pruned only as a contiguous prefix. The planned boundary is the minimum of the age boundary, the slowest committed subscription cursor, and the sequence immediately before the configured recent-event tail. A subscription with cursor `0` therefore blocks event deletion; an unacknowledged pending delivery keeps the same protection until ACK. Each successful cleanup appends a new `retention_applied` audit event after deletion and advances a persistent history floor. Event queries or deliberate subscription replays older than that floor conflict instead of silently returning incomplete history; compact handoff snapshots clamp to the available floor.
 
-Other cleanup domains are independent and age-bounded: idempotency records, closed per-recipient receipts, messages left with no receipts, and unbound history for terminal tasks. Active messages, active task bindings, non-terminal task history, subscriptions, tasks, artifacts, confirmed decisions, agents, reservations, retention reports, and schema records are not removed. Physical `VACUUM` is deliberately not automatic because it requires a more disruptive exclusive database operation; online backups remain the recovery boundary.
+Other cleanup domains are independent and age-bounded: idempotency records, closed per-recipient receipts, messages left with no receipts, and unbound history for terminal tasks. Active messages, active task bindings, non-terminal task history, subscriptions, tasks, artifacts, confirmed decisions, agents, reservations, retention reports, and schema records are not removed. Logical retention never runs `VACUUM` automatically; physical compaction is the separately confirmed offline operation below.
+
+## Offline compaction
+
+`maintenance compact --backup <new-path>` is intentionally absent from MCP and handled before the normal connection/migration path. The maintainer must stop every CLI, MCP, Hook, and Codex task for the project, use a real terminal to type `compact:<project-id>`, and have the current Operator credential in the Windows vault. The core then opens the existing database read/write without creating or migrating it, sets zero busy timeout, checkpoints WAL, retains an exclusive lock, switches to DELETE journaling, verifies current schema/project/Operator identity, and refuses any non-terminal task, active task binding, or unexpired reservation.
+
+Before `VACUUM`, VibeBus creates a new non-overwriting SQLite backup, verifies its integrity, foreign keys, schema, and project identity, and requires at least twice the current database size free beside the live database. It records a bounded start event, runs `VACUUM` under the exclusive boundary, restores WAL, records completion, checkpoints, and returns before/after file hashes, sizes, page/freelist counts, reclaimed bytes, backup identity, Operator generation, and final verification. On failure after the journal switch it best-effort restores WAL; the verified backup remains the recovery boundary. Repository acceptance invokes the core only against disposable project/data directories, never the live coordination database.
 
 ## Codex plugin lifecycle
 

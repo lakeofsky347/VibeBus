@@ -301,6 +301,34 @@ pub struct BackupView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CompactionMetricsView {
+    pub bytes: u64,
+    pub page_count: i64,
+    pub page_size: i64,
+    pub freelist_pages: i64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionView {
+    pub compaction_id: String,
+    pub database_path: String,
+    pub operator_generation: i64,
+    pub backup: BackupView,
+    pub before: CompactionMetricsView,
+    pub after: CompactionMetricsView,
+    pub reclaimed_bytes: u64,
+    pub journal_mode: String,
+    pub integrity: String,
+    pub foreign_key_violations: i64,
+    pub schema_version: i64,
+    pub verified: bool,
+    pub completed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EventView {
     pub sequence: i64,
     pub event_id: String,

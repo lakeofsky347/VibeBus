@@ -7,9 +7,10 @@ use serde::Serialize;
 use serde_json::json;
 use vibebus::{
     Bus, BusError, CredentialVault, Result, RetentionPolicy, SecretSource,
-    StoredOperatorCredential, initialize_project, mcp::run_mcp, operator_credential_delivery,
-    recovery_delivery, recovery_key_delivery, registration_delivery, resolve_agent_recovery_key,
-    resolve_agent_token, resolve_operator_secret, system_credential_vault,
+    StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
+    operator_credential_delivery, recovery_delivery, recovery_key_delivery, registration_delivery,
+    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret,
+    system_credential_vault,
 };
 
 #[derive(Debug, Parser)]
@@ -114,6 +115,10 @@ enum Command {
     Backup {
         #[arg(long)]
         output: PathBuf,
+    },
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
     },
     Mcp,
 }
@@ -630,6 +635,14 @@ enum RetentionCommand {
     Status,
 }
 
+#[derive(Debug, Subcommand)]
+enum MaintenanceCommand {
+    Compact {
+        #[arg(long)]
+        backup: PathBuf,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -673,6 +686,28 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             "markerPath": initialized.marker_path,
             "databasePath": bus.database_path().to_string_lossy(),
             "journalMode": "WAL"
+        }));
+    }
+
+    if let Command::Maintenance {
+        command: MaintenanceCommand::Compact { backup },
+    } = &cli.command
+    {
+        let (_, project) = discover_project(&cli.root)?;
+        require_interactive_confirmation(
+            "Compact the project database offline. Type compact:<project-id> to continue",
+            &format!("compact:{}", project.project_id),
+        )?;
+        let vault = system_credential_vault();
+        let operator_secret = resolve_operator_secret(vault.as_ref(), &project.project_id)?;
+        return Ok(json!({
+            "ok": true,
+            "result": Bus::compact_offline(
+                &cli.root,
+                cli.data_home.as_deref(),
+                &operator_secret,
+                backup,
+            )?
         }));
     }
 
@@ -1264,6 +1299,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         }),
         Command::Doctor => json!(bus.doctor()?),
         Command::Backup { output } => json!(bus.backup_to(&output)?),
+        Command::Maintenance { .. } => unreachable!(),
         Command::Mcp => unreachable!(),
     };
     Ok(json!({"ok": true, "result": result}))

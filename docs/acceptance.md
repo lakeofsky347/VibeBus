@@ -1,6 +1,6 @@
 # Acceptance record
 
-Acceptance date: 2026-07-18.
+Acceptance date: 2026-07-19.
 
 ## Automated checks
 
@@ -31,6 +31,7 @@ Covered behaviors:
 - immutable task-owner confirmed decisions, semantic-key exact replay, payload-drift conflicts, artifact/task validation, idempotency, and audit events;
 - authenticated Agent context isolation across active owned tasks, direct dependencies, unread directed messages, relevant decisions/artifacts, bounded previews, byte/item budgets, and cursor pagination;
 - SQLite integrity, WAL, foreign keys, schema version, and online backup;
+- backup-first offline compaction on disposable data, WAL restoration, page reclamation, audit events, active-state refusal, busy-database fail-fast behavior, and redirected-input rejection before mutation;
 - ancestor project discovery;
 - single-use recovery-key rotation, legacy-agent migration, and invalidation of old secrets;
 - project-scoped credential-vault isolation, explicit/environment/vault token precedence, successful secret redaction, rotation write-back, deletion, and safe write-failure fallback;
@@ -49,7 +50,7 @@ Covered behaviors:
 - MCP initialize negotiation, responsibility/fact/proposal tools, explicit absence of operator mutation tools, stored registration, no-token inbox access, vault-backed recovery, unapproved retention rejection, credential deletion, and rejection after deletion;
 - seven deterministic PowerShell lifecycle-Hook checks covering path-only Git facts, no-log test facts, unknown exit refusal, review-only Stop proposals, and plugin configuration.
 
-The suite contains 35 tests: 1 policy unit test, 7 CLI workflows, 22 core workflows, 4 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.10 checkout together with formatting, clippy-as-error, and 7/7 lifecycle-Hook checks.
+The suite contains 38 tests: 1 policy unit test, 7 CLI workflows, 25 core workflows, 4 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted checkout together with formatting, clippy-as-error, and 7/7 lifecycle-Hook checks.
 
 The 0.10 release layer additionally covers Cargo/plugin version agreement, repository-owned Codex plugin validation, pinned release tools, per-user MSI ICE validation, administrative extraction, all three Hooks and four Hook scripts, extracted binary execution/version, portable/plugin archives, post-build SHA-256 checksums, and a machine-readable signed-state manifest. Production publishing remains configured to fail before packaging when either signing Secret is absent.
 
@@ -63,7 +64,7 @@ The accepted local 0.10 package is intentionally unsigned because no production 
 - The Skill states responsibility inspection/override, task-scoped reservations, Git/test no-diff/no-log facts, proposal-versus-send, root/vault, retention, delivery, conflict, and non-interruption boundaries.
 - The repository plugin manifest is version 0.10.0 and passes the repository validator.
 - `codex plugin add vibebus@vibebus-local` refreshed the development install; `codex plugin list` reports version 0.10.0 installed and enabled from `vibebus-local`.
-- The installed and packaged binaries both report `vibebus 0.10.0`, are 7,736,832 bytes, and share SHA-256 `fcc312a74af2b1f54900839001b92a98ff44e9e8809179a8551da4409c0321f0`.
+- The previously installed development cache remains accepted at `vibebus 0.10.0` with SHA-256 `fcc312a74af2b1f54900839001b92a98ff44e9e8809179a8551da4409c0321f0`. The current repository/plugin package binary includes offline compaction, reports the same version, is 7,796,736 bytes, and has SHA-256 `71e2ea693f5d8da0ce38ffe57cf1b5ae3f6663613f20935fe8e394602c158f71`.
 
 ## Release package acceptance
 
@@ -71,9 +72,9 @@ The accepted unsigned local artifacts are:
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `VibeBus-0.10.0-windows-x64.msi` | 2,162,688 | `fed64d789897ab1471e3cbfba8438ce4ee607046d18776d1c8fccfcb4caf7197` |
-| `VibeBus-0.10.0-windows-x64.zip` | 2,840,820 | `855c41d8abafbd1a9f839bb59aeea85c17b4d4f579820260ebc49f8b4f2bbb6a` |
-| `VibeBus-Codex-plugin-0.10.0.zip` | 2,833,437 | `782497b72cc109eedc9bd14f1e36c3c9251d38faa5bb46aafc33164d8186a3ac` |
+| `VibeBus-0.10.0-windows-x64.msi` | 2,789,376 | `93356bd9e068e0b1736de5ebd0909bb74e4167a161a4dd404e91ce7c7b515a7d` |
+| `VibeBus-0.10.0-windows-x64.zip` | 3,474,202 | `b07842222f3f74ca1ca5e9c75dd022ff8e55877d0d6eb4b018e3916d834203bd` |
+| `VibeBus-Codex-plugin-0.10.0.zip` | 3,469,334 | `638680d50829a1ab2d4fa69cff663d5d70179a4a064292d4652f782dc106b3be` |
 
 The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, ten critical payload paths are present, and the extracted binary reports 0.10.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
 
@@ -157,7 +158,13 @@ Repository intake reran the complete build and acceptance after hardening native
 
 The source contained one Agent and one task at backup time, then received a second task after the backup. The isolated restore reported schema 11, WAL, foreign keys, one Agent, and exactly the pre-backup task; the post-backup mutation was absent. The original in-process Agent token authenticated an empty restored Inbox without being printed, and the temporary source, export, and restored data trees were removed. Every run uses a new project ID and therefore a new artifact hash; acceptance compares each imported copy with the hash returned by that run's online backup rather than pinning the sample hash.
 
-Windows CI runs the same drill against the just-built release binary before MSI acceptance. The production runbook in `docs/backup-restore.md` requires an isolated verification root and an explicit maintainer-controlled offline cutover; no automated live-database overwrite or `VACUUM` path was added.
+Windows CI runs the same drill against the just-built release binary before MSI acceptance. The production runbook in `docs/backup-restore.md` requires an isolated verification root and an explicit maintainer-controlled offline cutover; it never automates a live-database overwrite.
+
+## Disposable offline compaction
+
+Three core workflows execute `Bus::compact_offline` only against fresh `TempDir` project/data homes. The success fixture creates and deletes 4 MiB of disposable SQLite payload, then proves a new verified backup, Operator generation binding, `compaction_started`/`compaction_completed` audit facts, freelist reduction to zero, smaller final bytes, distinct 64-character hashes, WAL restoration, schema 11, foreign-key cleanliness, integrity `ok`, and `doctor.ok=true`. Separate fixtures prove that any non-terminal task prevents backup/`VACUUM`, and that an outstanding `BEGIN IMMEDIATE` causes fail-fast conflict without creating the backup.
+
+The CLI workflow invokes `maintenance compact --backup` with redirected input and proves validation failure before database mutation or backup creation. `tools/list` remains unchanged because no compaction MCP tool exists. The real project at `D:\MyProjects\CoWork` was not compacted; its Operator remains intentionally not ready, and the implementation used its database only for VibeBus coordination facts.
 
 ## Remaining manual acceptance
 

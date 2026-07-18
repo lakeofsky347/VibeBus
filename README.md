@@ -49,7 +49,7 @@ docker run --rm `
 - 定向消息、未读 Inbox、read/ACK/close、带依赖任务、原子领取、乐观版本冲突和 Codex task/thread 绑定。
 - 项目相对路径 reservation、严格责任域、任务作用域限时 override、产物登记和 SHA-256 校验。
 - 不可变 Git commit/test 事实、确认决策、任务作用域 context sync、幂等键和 replay-safe subscription peek/ACK。
-- 高优先级结构化 handoff、review-only proposal、SQLite health/backup、Windows CI、MSI、便携包和独立插件包。
+- 高优先级结构化 handoff、review-only proposal、SQLite health/backup、CLI-only 离线压缩、Windows CI、MSI、便携包和独立插件包。
 
 VibeBus 共享结构化事实，不共享整段聊天或隐藏推理；不承诺远程多主机同步、强制中断/唤醒正在生成的模型、自动 Git 合并/冲突解决、自动生产签名或已完成的远程发布。PostToolUse 只记录有界事实，Stop 只保存待审阅提案。
 
@@ -71,6 +71,7 @@ flowchart LR
 - token 与 recovery key 只在注册、恢复或轮换边界返回明文；SQLite 仅保存 SHA-256 摘要，凭据库成功写入后响应脱敏。
 - Inbox 必须使用收件人身份认证；reservation 不替代 task ownership，override 不绕过 reservation 冲突。
 - operator 初始化、轮换、恢复、删除和 retention 批准只允许真实交互式 CLI，MCP 不提供 operator mutation。
+- `maintenance compact --backup <new-path>` 还要求真实终端输入 `compact:<project-id>`、vault-backed Operator、零活动任务/绑定/reservation、独占 SQLite 边界和足够空间；它先创建并验证新备份，且不通过 MCP 暴露。
 - replay-safe delivery 是至少一次交付，副作用必须幂等；需要 ACK 的消息不得先 close。
 - Hook 不读取 transcript、diff 或原始测试日志；插件不创建、打开、唤醒或控制原生 Codex 任务。
 

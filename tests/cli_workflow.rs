@@ -840,6 +840,32 @@ fn operator_mutations_reject_redirected_noninteractive_cli_calls() {
         );
     }
     let bus = Bus::open(project.path(), Some(data.path())).unwrap();
+    let database_path = bus.database_path().to_path_buf();
+    drop(bus);
+    let before = fs::read(&database_path).unwrap();
+    let backup_path = data.path().join("redirected-compact-backup.db");
+    let output = Command::new(env!("CARGO_BIN_EXE_vibebus"))
+        .arg("--root")
+        .arg(project.path())
+        .arg("--data-home")
+        .arg(data.path())
+        .args(["maintenance", "compact", "--backup"])
+        .arg(&backup_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["kind"], "validation");
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("interactive terminal")
+    );
+    assert_eq!(fs::read(&database_path).unwrap(), before);
+    assert!(!backup_path.exists());
+
+    let bus = Bus::open(project.path(), Some(data.path())).unwrap();
     assert!(!bus.operator_status().unwrap().configured);
 }
 

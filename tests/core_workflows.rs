@@ -1264,6 +1264,124 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
 }
 
 #[test]
+fn offline_compaction_is_backup_first_verified_and_reclaims_disposable_space() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let operator = bus.initialize_operator().unwrap();
+    let database_path = bus.database_path().to_path_buf();
+    drop(bus);
+
+    let fixture = Connection::open(&database_path).unwrap();
+    fixture
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE compaction_fixture (payload BLOB NOT NULL);
+             WITH RECURSIVE sequence(value) AS (
+               VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 256
+             )
+             INSERT INTO compaction_fixture(payload)
+             SELECT zeroblob(16384) FROM sequence;
+             DELETE FROM compaction_fixture;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    let fragmented_pages: i64 = fixture
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap();
+    assert!(fragmented_pages > 0);
+    drop(fixture);
+
+    let backup_path = harness.data.path().join("offline-before-vacuum.db");
+    let report = Bus::compact_offline(
+        harness.project.path(),
+        Some(harness.data.path()),
+        &operator.operator_secret,
+        &backup_path,
+    )
+    .unwrap();
+    assert!(report.verified);
+    assert_eq!(report.journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(report.integrity, "ok");
+    assert_eq!(report.foreign_key_violations, 0);
+    assert_eq!(report.schema_version, 11);
+    assert_eq!(report.operator_generation, 1);
+    assert_eq!(report.backup.path, backup_path.to_string_lossy());
+    assert_eq!(report.backup.sha256.len(), 64);
+    assert_eq!(report.before.sha256.len(), 64);
+    assert_eq!(report.after.sha256.len(), 64);
+    assert!(report.before.freelist_pages > 0);
+    assert_eq!(report.after.freelist_pages, 0);
+    assert!(report.after.bytes < report.before.bytes);
+    assert_eq!(
+        report.reclaimed_bytes,
+        report.before.bytes - report.after.bytes
+    );
+
+    let bus = harness.bus();
+    assert!(bus.doctor().unwrap().ok);
+    let events = bus
+        .list_events(
+            0,
+            10,
+            &["compaction_started".into(), "compaction_completed".into()],
+        )
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].entity_id, report.compaction_id);
+    assert_eq!(events[1].entity_id, report.compaction_id);
+}
+
+#[test]
+fn offline_compaction_refuses_active_coordination_state_before_backup() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let operator = bus.initialize_operator().unwrap();
+    let agent = bus.register_agent("compact-active", "operations").unwrap();
+    bus.create_task(
+        &agent.name,
+        &agent.token,
+        "COMPACT-ACTIVE-001",
+        "Still active",
+        None,
+        &[],
+    )
+    .unwrap();
+    drop(bus);
+
+    let backup_path = harness.data.path().join("must-not-exist.db");
+    let result = Bus::compact_offline(
+        harness.project.path(),
+        Some(harness.data.path()),
+        &operator.operator_secret,
+        &backup_path,
+    );
+    assert!(matches!(result, Err(BusError::Conflict(_))));
+    assert!(!backup_path.exists());
+}
+
+#[test]
+fn offline_compaction_fails_fast_when_sqlite_is_busy() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let operator = bus.initialize_operator().unwrap();
+    let database_path = bus.database_path().to_path_buf();
+    drop(bus);
+
+    let busy_connection = Connection::open(&database_path).unwrap();
+    busy_connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let backup_path = harness.data.path().join("busy-must-not-exist.db");
+    let result = Bus::compact_offline(
+        harness.project.path(),
+        Some(harness.data.path()),
+        &operator.operator_secret,
+        &backup_path,
+    );
+    assert!(matches!(result, Err(BusError::Conflict(_))));
+    assert!(!backup_path.exists());
+    busy_connection.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
 fn recovery_rotates_both_secrets_and_reservations_can_be_renewed_by_owner() {
     let harness = Harness::new();
     let mut bus = harness.bus();
