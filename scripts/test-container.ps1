@@ -109,13 +109,15 @@ $dataRoot = Join-Path $acceptanceRoot "data"
 [IO.Directory]::CreateDirectory($projectRoot) | Out-Null
 [IO.Directory]::CreateDirectory($dataRoot) | Out-Null
 Grant-ContainerTestAccess -ParentPath $acceptanceRoot -WritablePaths @($projectRoot, $dataRoot)
+$mountProject = "type=bind,source=$projectRoot,target=/workspace"
+$mountData = "type=bind,source=$dataRoot,target=/data"
+$containerMayOwnFiles = $false
 
 try {
-    $mountProject = "type=bind,source=$projectRoot,target=/workspace"
-    $mountData = "type=bind,source=$dataRoot,target=/data"
     $common = @("run", "--rm", "--mount", $mountProject, "--mount", $mountData, $ImageTag)
 
     Write-Host "[container] initializing disposable project"
+    $containerMayOwnFiles = $true
     $initRaw = (Invoke-DockerChecked -Arguments ($common + @(
         "init", "--root", "/workspace", "--name", "Container Acceptance"
     ))) -join "`n"
@@ -231,6 +233,19 @@ try {
 }
 finally {
     Remove-Variable registration, registrationRaw, inboxRaw, mcpInput -ErrorAction SilentlyContinue
+    if ($containerMayOwnFiles -and [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        # Files created by UID 10001 can contain owner-only directories. Remove
+        # their contents inside the same mount namespace before host cleanup.
+        Invoke-DockerChecked -Arguments @(
+            "run", "--rm",
+            "--user", "0",
+            "--entrypoint", "/bin/sh",
+            "--mount", $mountProject,
+            "--mount", $mountData,
+            $ImageTag,
+            "-c", "rm -rf /workspace/* /workspace/.[!.]* /workspace/..?* /data/* /data/.[!.]* /data/..?*"
+        ) | Out-Null
+    }
     if ([IO.Directory]::Exists($acceptanceRoot)) {
         [IO.Directory]::Delete($acceptanceRoot, $true)
     }
