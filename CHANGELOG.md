@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added a CLI-only `maintenance compact --backup <new-path>` operation with exact real-terminal confirmation, vault-backed Operator authentication, fail-fast exclusive SQLite locking, and zero-active-state enforcement.
+- Required a new verified backup plus conservative free-space validation before `VACUUM`, restored and checkpointed WAL afterward, and returned bounded before/after hashes, page counts, reclaimed bytes, and integrity evidence.
+- Added `compaction_started` and `compaction_completed` audit events plus disposable-project coverage for success, active-state refusal, busy-database refusal, and redirected-input no-mutation behavior. No compaction tool was added to MCP.
+
 ## 0.10.0 - 2026-07-18
 
 - Added a strict, bounded `.vibebus/responsibility.json` policy that maps Agent roles to validated project-relative paths, while preserving allow-all compatibility only when no policy is configured.

@@ -20,7 +20,7 @@ Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. The br
 | Two independent top-level tasks sharing one service | Complete | Task B `019f73ad-0618-76a1-9c42-e17a8fda1486` and Task A `019f73af-839c-7b03-a62b-09fd7eb07ec0` completed B1/A1/B2/A2 | Do not generalize this into forced model interruption |
 | Directed Inbox, read/ACK/close, and replay-safe delivery | Complete | Three structured handoffs, closed recipient receipts, same-delivery double peek, ACK replay `false` then `true` | Exactly-once consumer side effects remain out of scope |
 | Tasks, dependencies, atomic claim, versions, and terminal bindings | Complete | Dependency unlock, live competing-claim conflict, optimistic-version tests, and four closed desktop bindings | Task reassignment and richer scheduling remain Phase 4 concerns |
-| Artifacts, audit history, backup, and recovery | Complete | Hashed artifacts, ordered events, migrations, online backups, retained-history floor, and a CI-backed isolated restore/import drill | Optional explicitly approved offline compaction remains |
+| Artifacts, audit history, backup, and recovery | Complete | Hashed artifacts, ordered events, migrations, online backups, retained-history floor, CI-backed isolated restore/import, and backup-first CLI-only offline compaction | Live compaction remains a maintainer-controlled maintenance-window decision, not a release requirement |
 | Agent-specific context synchronization | Complete | `context sync` has CLI/MCP parity, authenticated scope isolation, direct-dependency expansion, confirmed decisions, item/byte budgets, bounded previews, and stable continuation | Cursor pagination is deliberately not an atomic database snapshot; restart for fresh concurrent state |
 | File conflict control | Complete for declared operations | Strict role `allowedPaths`, task-scoped expiring overrides, reservation/artifact/Git-path enforcement, plus existing overlap/TTL control | This is application policy, not an OS filesystem sandbox; raw external writes remain outside the bus |
 | Deterministic lifecycle automation | Complete for bounded local facts | PostToolUse records commit identity/path lists and test outcomes; Stop writes a review-only proposal; Hook fixtures run in CI | Specialized host tools may opt out of Hooks; automatic handoff sending is deliberately excluded |
@@ -91,9 +91,15 @@ This closes the former sole partial MVP criterion and makes responsibility-domai
 - Each run verifies the returned SHA-256, schema, WAL, foreign keys, restored Agent authentication, expected task set, secret redaction, and complete temporary-data cleanup.
 - Windows CI runs the drill against the release binary, while the production runbook keeps real cutover offline and maintainer-controlled.
 
+### Completed: explicit offline compaction
+
+- `maintenance compact --backup <new-path>` is CLI-only and absent from MCP.
+- A real terminal exact confirmation and the current vault-backed Operator secret are required before the maintenance connection opens.
+- Current schema, zero active tasks/bindings/reservations, a fail-fast exclusive boundary, a new verified backup, and conservative free-space validation are mandatory before `VACUUM`.
+- WAL restoration/checkpoint, integrity/foreign-key/schema verification, bounded before/after evidence, and start/completion audit events are covered by disposable-project tests. The live coordination database was not compacted.
+
 ### P2: remaining operational maturity
 
-- Add optional, explicitly approved `VACUUM` maintenance rather than coupling it to logical retention.
 - Define Agent lifecycle/offline visibility and stale-identity operational guidance.
 - Decide whether the accepted disposable desktop Agent vault entries should be retained for regression or explicitly deleted.
 
@@ -106,9 +112,8 @@ This closes the former sole partial MVP criterion and makes responsibility-domai
 
 The next repository-owned slice should continue operational maturity without expanding into remote orchestration:
 
-1. Define an explicitly approved offline compaction command instead of coupling `VACUUM` to logical retention.
-2. Add stale-Agent/offline visibility and a safe identity lifecycle runbook without automatic credential deletion.
-3. Consider an optional notification bridge only as best-effort UI delivery over the authoritative SQLite Inbox.
-4. Preserve context scope, responsibility authorization, Hook no-log/no-auto-send boundaries, migration, retained-history floor, concurrency, and secret redaction.
+1. Add stale-Agent/offline visibility and a safe identity lifecycle runbook without automatic credential deletion.
+2. Consider an optional notification bridge only as best-effort UI delivery over the authoritative SQLite Inbox.
+3. Preserve context scope, responsibility authorization, Hook no-log/no-auto-send boundaries, migration, retained-history floor, concurrency, and secret redaction.
 
 The signed release remains the highest-priority external gate and can proceed only after the maintainer supplies the certificate and protected environment. Remote synchronization, automatic merging, Supervisor scheduling, and forced model interruption remain separate product decisions rather than 0.10 gaps.

@@ -183,6 +183,16 @@ Apply must repeat the same custom policy values and provide that ID. In one `BEG
 
 Event candidates form one contiguous prefix that is old enough, at or below the slowest subscription cursor, and outside the recent tail. A pending replay-safe delivery keeps its committed cursor unchanged, so its complete range remains protected. Apply also removes expired idempotency records, old closed receipts, resulting receipt-less messages, and old unbound history belonging to terminal tasks. It preserves active state and appends `retention_applied` as a new audit event. The operation does not run `VACUUM`.
 
+## Offline compaction
+
+| Capability | CLI | MCP |
+| --- | --- | --- |
+| Compact the existing database | `maintenance compact --backup <new-path>` | Deliberately unavailable |
+
+Compaction is separate from logical retention and is not an Agent mutation. Stop all project users first, confirm Operator `ready=true`, choose a backup path that does not exist, and invoke the command from a real terminal. The CLI prints the target project and requires the exact text `compact:<project-id>` before reading the vault-backed Operator secret. Redirected input fails before opening the database through the maintenance path.
+
+The operation never creates or migrates a database. It requires current schema, WAL, the matching project row, zero non-terminal tasks, zero active task/thread bindings, zero unexpired reservations, a fail-fast checkpoint and exclusive lock, a verified pre-`VACUUM` backup, and conservative free space on the database volume. Success restores and checkpoints WAL, verifies integrity/foreign keys/schema, writes bounded `compaction_started`/`compaction_completed` events, and returns hashes, sizes, page/freelist counts, reclaimed bytes, backup identity, Operator generation, and `verified=true`. A valid backup may remain when a later precondition or compaction step fails; never overwrite it on retry.
+
 ## Structured handoff
 
 | Capability | CLI | MCP |
