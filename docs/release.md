@@ -2,6 +2,8 @@
 
 VibeBus 0.10 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
 
+The plugin manifest uses the officially supported `interface.composerIcon` and `interface.logo` fields. Those paths remain relative to the plugin root and point to the transparent PNGs under `plugins/vibebus/assets/`. The release staging step copies the complete plugin tree, while the WiX payload lists all four light/dark icon and logo files explicitly so MSI and ZIP delivery stay aligned.
+
 ## Outputs
 
 `scripts/build-release.ps1` produces these files under ignored `dist/`:
@@ -36,6 +38,8 @@ $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
 ```
 
 The lifecycle acceptance runs deterministic dry-run fixtures for Git commit capture, test-result capture, unknown-outcome refusal, and review-only Stop proposals. The installer acceptance runs the stock MSI ICE checks except ICE91. ICE91 only warns that the intentionally per-user payload would not behave like a per-machine payload. The acceptance then creates an administrative image in a unique temporary directory, verifies the marketplace, manifest, MCP configuration, binary, Hooks, scripts, and Skill, executes the extracted binary, and removes the temporary image.
+
+The plugin validator also checks that the manifest icon and logo references resolve to non-empty PNG files. Visual review remains a human-facing acceptance step: inspect each generated asset on both light and dark surfaces before publishing a package.
 
 Local builds are unsigned unless `-Sign` is supplied with both signing environment variables. This permits PR validation without sharing a private key. A local unsigned package is not a production release.
 
