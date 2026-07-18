@@ -141,6 +141,16 @@ Before the root recipient mutated that final handoff or edited the repository, `
 
 The two desktop Agent vault entries remain stored intentionally for repeatable regression and were not deleted implicitly. Their deletion, if desired, is a separate explicit local-vault decision; the database Agent, task, message, subscription, and binding history remains authoritative audit evidence either way.
 
+## Linux container acceptance
+
+The repository-owned `Dockerfile` produced the local `linux/amd64` image `vibebus:0.10.0-local` on 2026-07-18. Docker reports size 31,240,216 bytes, working directory `/workspace`, and runtime user `10001:10001`. The local image ID is deliberately not used as the release identity because later clean rebuilds produced different IDs while preserving all accepted runtime properties.
+
+`scripts/test-container.ps1 -SkipBuild` accepted the image from disposable host directories. The runtime reported `vibebus 0.10.0`; project initialization and `doctor` confirmed SQLite WAL mode and foreign keys; registration plus an authenticated empty Inbox succeeded through the inherited `VIBEBUS_AGENT_TOKEN` environment variable without printing credentials; and stdio MCP initialization plus `tools/list` returned 47 tools. The script removed its disposable project/data directories after the run.
+
+The accepted image was pushed to Alibaba Cloud ACR as `crpi-21kb7zn8owb85qa2.cn-beijing.personal.cr.aliyuncs.com/for_plugin/vibebus:0.10.0` at 2026-07-18T12:47:55Z. Both the push response and an independent remote `docker buildx imagetools inspect` returned index digest `sha256:71e39f0a3af75e9626dd6d1c313f1edd3ef65d7446c0a8497147043036227118`. A verbose remote manifest inspection confirmed the runnable `linux/amd64` manifest `sha256:8f43d9c7ae26c9eaedc3746b5f1e60c21737fef0d2cc45e579b3ed01a5d4eb94`; the index also contains the BuildKit provenance/attestation manifest.
+
+Repository intake reran the complete build and acceptance after hardening native stderr handling for Windows PowerShell. Repeated local builds again passed all seven container gates with the same size, runtime user, version, WAL/foreign-key state, and 47-tool MCP surface, while their local image IDs differed because build metadata is not bit-for-bit reproducible. They were not pushed and do not replace the recorded remote digest. CI now runs the same repository script on `ubuntu-latest`; both test and push helpers derive their default version/tag from `Cargo.toml` to fail closed on release-version drift.
+
 ## Remaining manual acceptance
 
 1. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.
