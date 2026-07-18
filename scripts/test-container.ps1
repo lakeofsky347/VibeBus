@@ -27,6 +27,44 @@ function Invoke-DockerChecked {
     return @($output)
 }
 
+function Grant-ContainerTestAccess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ParentPath,
+        [Parameter(Mandatory = $true)]
+        [string[]]$WritablePaths
+    )
+
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        return
+    }
+
+    # Linux bind mounts preserve host permissions. Grant only the disposable
+    # acceptance directories to the image's fixed non-root UID.
+    if (Get-Command setfacl -ErrorAction SilentlyContinue) {
+        & setfacl -m "u:10001:--x" -- $ParentPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "failed to grant container traversal access to $ParentPath"
+        }
+        foreach ($path in $WritablePaths) {
+            & setfacl -m "u:10001:rwx" -- $path
+            if ($LASTEXITCODE -ne 0) {
+                throw "failed to grant container write access to $path"
+            }
+        }
+        return
+    }
+
+    & chmod "0701" -- $ParentPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to grant container traversal access to $ParentPath"
+    }
+    & chmod "0707" -- $WritablePaths
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to grant container write access to disposable acceptance directories"
+    }
+}
+
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     throw "docker CLI was not found"
 }
@@ -70,6 +108,7 @@ $projectRoot = Join-Path $acceptanceRoot "project"
 $dataRoot = Join-Path $acceptanceRoot "data"
 [IO.Directory]::CreateDirectory($projectRoot) | Out-Null
 [IO.Directory]::CreateDirectory($dataRoot) | Out-Null
+Grant-ContainerTestAccess -ParentPath $acceptanceRoot -WritablePaths @($projectRoot, $dataRoot)
 
 try {
     $mountProject = "type=bind,source=$projectRoot,target=/workspace"
