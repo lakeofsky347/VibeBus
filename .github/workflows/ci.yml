@@ -66,6 +66,10 @@ jobs:
         shell: pwsh
         run: ./scripts/build-release.ps1
 
+      - name: Test backup restore drill
+        shell: pwsh
+        run: ./scripts/test-backup-restore.ps1 -BinaryPath ./target/release/vibebus.exe
+
       - name: Validate MSI and extracted payload
         shell: pwsh
         run: |
