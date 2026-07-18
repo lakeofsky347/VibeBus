@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0 - 2026-07-18
+
+- Added immutable, task-scoped confirmed decisions with stable semantic keys, task-owner authorization, artifact references, exact replay, payload-drift conflicts, idempotency, and audit events.
+- Added deterministic Agent context sync across active owned tasks, direct dependencies, unread directed messages, relevant artifacts, and confirmed decisions.
+- Added item and serialized-byte budgets, bounded text previews, opaque monotonic continuation cursors, and explicit scope metadata without reading artifact file contents.
+- Excluded unrelated task facts plus acknowledged or closed messages from the default projection.
+- Added schema-v10 migration, CLI/MCP parity, vault-backed MCP coverage, context isolation, semantic deduplication, cursor, budget, and migration tests.
+
 ## 0.8.0 - 2026-07-17
 
 - Added a project-scoped operator credential whose secret digest is isolated from Agent bearer credentials and whose secret is stored under a distinct Windows Credential Manager target.

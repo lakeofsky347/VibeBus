@@ -2,15 +2,15 @@
 
 Assessment date: 2026-07-18.
 
-This document compares the implemented VibeBus 0.8 baseline with the goals and phased roadmap in the 2026-07-17 project startup plan. The comparison uses repository code, tests, release automation, VibeBus durable state, and the completed two-real-task desktop acceptance as evidence.
+This document compares the implemented VibeBus 0.9 baseline with the goals and phased roadmap in the 2026-07-17 project startup plan. The comparison uses repository code, tests, release automation, VibeBus durable state, and the completed two-real-task desktop acceptance as evidence.
 
 ## Executive assessment
 
 The core product definition is achieved: independent Codex top-level tasks can exchange authenticated, structured, durable facts through a local SQLite-backed CLI/MCP plugin without sharing complete conversations. The real desktop run used two user-owned top-level tasks and passed the repository auditor with 178 of 178 checks, zero failures, and zero skips.
 
-Against the original 12 MVP acceptance criteria, 11 are fully covered and one is partial. The remaining partial criterion is the original Agent-specific `sync` context: `handoff snapshot` provides a bounded resume view, but there is no first-class context query with explicit token/byte budget, confirmed-decision filtering, and direct-dependency-only projection.
+All 12 original MVP acceptance criteria are now fully covered. VibeBus 0.9 closes the former Agent-specific `sync` gap with an authenticated deterministic projection of active owned tasks, direct dependencies, unread directed messages, relevant artifacts, and immutable confirmed decisions. Item/byte budgets, bounded previews, semantic deduplication, and continuation cursors keep that projection explicit and bounded.
 
-Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. Phase 2 is mixed: reservations, dependency unlock, idempotency, handoffs, and lease expiry are present, while responsibility-domain enforcement and deterministic Git/test Hooks are not. Phase 4 remains deliberately deferred.
+Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. Phase 2 is mixed: context sync, confirmed decisions, reservations, dependency unlock, idempotency, handoffs, and lease expiry are present, while responsibility-domain enforcement and deterministic Git/test Hooks are not. Phase 4 remains deliberately deferred.
 
 ## Roadmap comparison
 
@@ -21,7 +21,7 @@ Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. Phase 
 | Directed Inbox, read/ACK/close, and replay-safe delivery | Complete | Three structured handoffs, closed recipient receipts, same-delivery double peek, ACK replay `false` then `true` | Exactly-once consumer side effects remain out of scope |
 | Tasks, dependencies, atomic claim, versions, and terminal bindings | Complete | Dependency unlock, live competing-claim conflict, optimistic-version tests, and four closed desktop bindings | Task reassignment and richer scheduling remain Phase 4 concerns |
 | Artifacts, audit history, backup, and recovery | Complete | Hashed project-scoped artifacts, ordered events, schema migrations, online backups, static handoff, retained-history floor | Export/import UX and optional physical compaction can be improved |
-| Agent-specific context synchronization | Partial | Authenticated `handoff snapshot` returns owned work, unread messages, bindings, reservations, artifacts, and bounded events | No explicit context budget, direct-dependency projection, confirmed-decision store, or semantic dedup policy |
+| Agent-specific context synchronization | Complete | `context sync` has CLI/MCP parity, authenticated scope isolation, direct-dependency expansion, confirmed decisions, item/byte budgets, bounded previews, and stable continuation | Cursor pagination is deliberately not an atomic database snapshot; restart for fresh concurrent state |
 | File conflict control | Partial | Exclusive overlapping reservations, renewal, expiry, release, and live conflict proof | No declarative `allowed_paths`/responsibility-domain policy or enforcement |
 | Deterministic lifecycle automation | Partial | Read-only SessionStart discovery Hook and repository CI exist | No Git-commit association Hook, test-result publication Hook, or automatic terminal handoff generation |
 | Codex plugin packaging and Windows delivery | Complete for unsigned acceptance | Plugin manifest, Skill, stdio MCP, Hook, portable ZIP, per-user MSI, validation, and CI | Production certificate, protected release environment, signed tag, and disposable-profile acceptance remain external gates |
@@ -34,7 +34,7 @@ Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. Phase 
 | ---: | --- | --- |
 | 1 | Two independent top-level tasks register distinct identities | Complete in the real desktop run |
 | 2 | A directed message is invisible to an unrelated Agent | Complete in authenticated inbox-isolation tests |
-| 3 | Agent sync returns only its task, dependencies, unread messages, and decisions | Partial; resume snapshot exists, but strict context projection/budgeting does not |
+| 3 | Agent sync returns only its task, dependencies, unread messages, and decisions | Complete through schema-v10 confirmed decisions and budgeted authenticated context projection |
 | 4 | Required messages can be ACKed and stop appearing as unread | Complete in the real desktop run |
 | 5 | Only one Agent can own a competing task claim | Complete in concurrency tests and the real B conflict |
 | 6 | Stale versions cannot overwrite newer task state | Complete in core tests |
@@ -55,15 +55,15 @@ Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. Phase 
 
 This is the only remaining release blocker, but it requires maintainer-owned external credentials and policy.
 
-### P1: context sync and confirmed decisions
+### Completed in 0.9: context sync and confirmed decisions
 
-- Add a first-class Agent context query to CLI and MCP.
-- Project only owned tasks, direct dependencies, unread directed messages, relevant artifacts, and confirmed decisions.
-- Enforce configurable byte/token and item budgets with deterministic ordering and stable pagination.
-- Add semantic deduplication so acknowledged or closed facts do not repeatedly consume context.
-- Keep long content behind artifact references.
+- CLI and MCP call the same first-class Agent context projection.
+- The scope contains only active owned tasks, direct dependencies, unread directed messages, relevant artifacts, and immutable confirmed decisions.
+- Configurable serialized-byte/item budgets, deterministic ordering, and opaque monotonic continuation are enforced.
+- Confirmed decision keys provide durable semantic deduplication; acknowledged/read/closed messages leave the default projection.
+- Long text is a bounded preview and long evidence remains behind artifact references.
 
-This is the highest-value code slice because it closes the sole partial MVP criterion and most directly serves the original context-isolation goal.
+This closes the former sole partial MVP criterion and makes responsibility-domain enforcement the next highest-value product slice.
 
 ### P1: responsibility-domain policy
 
@@ -99,14 +99,14 @@ This is the highest-value code slice because it closes the sole partial MVP crit
 
 ## Recommended next implementation slice
 
-Implement Agent-scoped context sync and confirmed decisions before expanding orchestration. Acceptance for that slice should require:
+Implement responsibility-domain policy and deterministic Git/test Hooks before expanding orchestration. Acceptance for that slice should require:
 
-1. CLI and MCP return the same deterministic projection for one Agent.
-2. Only owned tasks, direct dependencies, unread messages, relevant artifacts, and confirmed decisions appear.
-3. An unrelated Agent's facts are excluded.
-4. Acknowledged/closed messages do not re-enter the default projection.
-5. Byte/item budgets truncate deterministically and expose a continuation cursor.
-6. Long reports remain artifact references.
-7. Concurrency, authentication, migration, retained-history-floor, and secret-redaction tests remain green.
+1. Project configuration maps Agent roles to validated project-relative `allowed_paths` patterns.
+2. Reservation and declared code/artifact changes outside an Agent's responsibility domain conflict unless a durable explicit override exists.
+3. Cross-domain requests are authenticated, task-scoped, idempotent, and auditable.
+4. Git commit association publishes bounded task facts without parsing or copying entire diffs.
+5. Test-result publication stores summaries plus report artifact references, never unbounded logs.
+6. Hook failure is observable and retry-safe without corrupting task, decision, message, or reservation state.
+7. Context projection, authentication, migration, retained-history-floor, concurrency, and secret-redaction tests remain green.
 
-The signed release can proceed in parallel only after the maintainer supplies the external certificate and protected environment. The optional notification bridge should follow, not precede, the authoritative context projection.
+The signed release can proceed in parallel only after the maintainer supplies the external certificate and protected environment. The optional notification bridge may now follow the authoritative context projection, but it remains lower priority than responsibility and lifecycle automation.

@@ -271,6 +271,35 @@ pub struct ArtifactListRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct DecisionConfirmRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    pub key: String,
+    pub task_id: String,
+    pub summary: String,
+    pub artifact_ids: Option<Vec<String>>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSyncRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    #[schemars(description = "Opaque continuation cursor returned by a previous context sync")]
+    pub cursor: Option<String>,
+    #[schemars(description = "Maximum projected facts to return; defaults to 100")]
+    pub item_limit: Option<usize>,
+    #[schemars(description = "Maximum serialized item bytes to return; defaults to 65536")]
+    pub byte_budget: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct EventListRequest {
     #[schemars(description = "Absolute path inside the VibeBus project")]
     pub root: Option<String>,
@@ -926,6 +955,50 @@ impl VibeBusMcp {
         json_text(
             &bus.list_artifacts(request.task_id.as_deref())
                 .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(description = "Confirm one immutable, task-scoped decision using a stable semantic key")]
+    fn vibebus_decision_confirm(
+        &self,
+        Parameters(request): Parameters<DecisionConfirmRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.confirm_decision_idempotent(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                &request.key,
+                &request.task_id,
+                &request.summary,
+                request.artifact_ids.as_deref().unwrap_or(&[]),
+                request.idempotency_key.as_deref(),
+            )
+            .map_err(bus_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Return a deterministic, budgeted Agent context projection with stable continuation"
+    )]
+    fn vibebus_context_sync(
+        &self,
+        Parameters(request): Parameters<ContextSyncRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        json_text(
+            &bus.context_sync(
+                &request.agent,
+                &self
+                    .token(&bus, &request.agent, request.token.as_deref())?
+                    .value,
+                request.cursor.as_deref(),
+                request.item_limit.unwrap_or(100),
+                request.byte_budget.unwrap_or(65_536),
+            )
+            .map_err(bus_error)?,
         )
     }
 

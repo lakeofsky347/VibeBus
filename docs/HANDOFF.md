@@ -2,12 +2,14 @@
 
 ## Current baseline
 
-VibeBus 0.8 is a working native Windows MVP. Rust core, CLI, stdio MCP, Codex Skill, SessionStart Hook, repo marketplace, tests, health check, backup, repeatable Windows CI, per-user MSI/portable packaging, checksums, and fail-closed production signing/publishing automation are present. Windows current-user credential storage and token fallback, Agent recovery, reservation renewal, retry idempotency, ordered events, replay-safe named subscriptions, structured handoffs, message closing, durable task/thread bindings, operator-approved bounded retention, and resume snapshots are implemented. The complete real-terminal operator lifecycle has also passed on a disposable project, including exact-plan consumption/replay, generation invalidation, and explicit vault cleanup. The fixed two-real-task desktop acceptance is now complete: two independent user-owned Codex top-level tasks executed B1/A1/B2/A2, strict preflight passed 68/68, and the clean-checkout auditor passed 178/178 before the final root handoff was ACKed and closed.
+VibeBus 0.9 is a working native Windows MVP. Rust core, CLI, stdio MCP, Codex Skill, SessionStart Hook, repo marketplace, tests, health check, backup, repeatable Windows CI, per-user MSI/portable packaging, checksums, and fail-closed production signing/publishing automation are present. Windows current-user credential storage and token fallback, Agent recovery, reservation renewal, retry idempotency, ordered events, replay-safe named subscriptions, structured handoffs, message closing, durable task/thread bindings, operator-approved bounded retention, resume snapshots, immutable confirmed decisions, and Agent-scoped context sync are implemented. The original MVP comparison now passes 12 of 12 criteria. The complete real-terminal operator lifecycle and fixed two-real-task desktop acceptance remain accepted historical evidence: two independent user-owned Codex top-level tasks executed B1/A1/B2/A2, strict preflight passed 68/68, and the clean-checkout auditor passed 178/178 before the final root handoff was ACKed and closed.
 
 The consumed two-real-task fixture and its accepted evidence are documented in `docs/desktop-acceptance.md`; do not rerun or reuse that fixed fixture. The repository-owned preflight remains useful as a regression template, including its Windows PowerShell 5.1 empty-list hardening, but a future live run must use a new fixture/run ID and regenerated expected state.
 
 Local recovery copies are kept under the ignored `backups/` directory:
 
+- `vibebus-0.9-pre-migration.db` is the schema-v9 recovery point created immediately before the live schema-v10 migration; it is 630,784 bytes with SHA-256 `9780a050226e1add79770205ec36b6f0a3b643ee81d66815984c393f31060681`.
+- `vibebus-0.9-context-sync.db` is the accepted schema-v10 online backup after live confirmed-decision/context-sync and package/plugin acceptance, before closing the implementation task; it is 647,168 bytes with SHA-256 `b273c8f9425cbb210d3ac6e66a9a1b1fa56f6d9cf476edb93b1d51a29301331a`.
 - `vibebus-0.8-pre-desktop-acceptance.db` is the schema-v9 recovery point after creating the deterministic desktop fixture and before either user-owned top-level task exists; it is 512,000 bytes with SHA-256 `0079a09f200dd5c7210c1dbb563da3b77f29b80b17d5c2504168a1bae230611c` and is published under `DESKTOP-ACCEPTANCE-001`.
 - `vibebus-0.8-desktop-acceptance.db` is the accepted post-run online backup after all B1/A1/B2/A2 evidence and the final root handoff ACK/close; it is 589,824 bytes with SHA-256 `5928201fd62fa0d5a7588a91650bfaf86ace173f0c43f2b10eb9f4c8f232d37b` and is published under `DESKTOP-ACCEPTANCE-001`.
 - `vibebus-source-0.8-operator-cleanup.zip` is the committed 0.8 source after adding explicit operator-vault cleanup and its disposable acceptance runbook; SHA-256 `1c75669d8ae107ebcc71c7c0faebda0677bb96db48a258262008d288b6240dbc`.
@@ -32,7 +34,7 @@ git status --short
 cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 powershell -File .\scripts\build-release.ps1
-powershell -File .\scripts\test-installer.ps1 -MsiPath .\dist\VibeBus-0.8.0-windows-x64.msi -ExpectedVersion 0.8.0
+powershell -File .\scripts\test-installer.ps1 -MsiPath .\dist\VibeBus-0.9.0-windows-x64.msi -ExpectedVersion 0.9.0
 ```
 
 The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`, and `docs/acceptance.md`.
@@ -43,6 +45,7 @@ The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`,
 - Plugin MCP calls must pass an explicit absolute project `root`.
 - Agent bearer tokens and recovery keys can be stored under `VibeBus:<project-id>:<agent>` in Windows Credential Manager and omitted from later calls. This protects at rest and against accidental repository/task disclosure, but all processes already running as the same Windows user remain inside the trust boundary.
 - Message polling occurs at safe task boundaries. There is no promise of interrupting an active generation.
+- `context sync` continuation is deterministic and monotonic for a stable database state, but it is not an atomic snapshot across concurrent writes; restart without a cursor when a fresh view is required.
 - The accepted desktop Agent vault entries `desktop-a-20260717-01` and `desktop-b-20260717-01` remain stored intentionally for regression. Deleting them is an explicit, separate local-vault action and does not remove database audit history.
 - Replay-safe subscription peek/ack provides at-least-once batch access, not exactly-once consumer side effects. Legacy poll still consumes and commits in one call.
 - Retention removes bounded logical history but does not automatically run SQLite `VACUUM`; physical file compaction remains an explicit maintenance decision because it requires a more disruptive exclusive operation.
@@ -58,14 +61,13 @@ The project truth is in `README.md`, `docs/architecture.md`, `docs/protocol.md`,
 
 ## Recommended next slice
 
-1. Implement Agent-scoped context sync and confirmed decisions as specified in `docs/plan-gap-analysis.md`; this closes the sole partial original MVP criterion.
-2. Add responsibility-domain policy plus deterministic Git-commit/test-result Hooks without weakening reservations, authentication, idempotency, or bounded payload rules.
-3. Configure the protected `release` environment and a real Windows code-signing certificate, then execute the tag, signed asset, disposable-profile install/uninstall, and downloaded-checksum acceptance in `docs/release.md`.
-4. Decide separately whether the retained desktop A/B vault entries and the live project's intentionally unconfigured Operator state should change; neither decision is implicit in normal development.
-5. Evaluate an optional Codex task notification bridge only after authoritative context projection exists; keep SQLite authoritative and treat UI delivery as best effort.
+1. Add responsibility-domain policy plus deterministic Git-commit/test-result Hooks without weakening reservations, authentication, idempotency, or bounded payload rules.
+2. Configure the protected `release` environment and a real Windows code-signing certificate, then execute the tag, signed asset, disposable-profile install/uninstall, and downloaded-checksum acceptance in `docs/release.md`.
+3. Decide separately whether the retained desktop A/B vault entries and the live project's intentionally unconfigured Operator state should change; neither decision is implicit in normal development.
+4. Evaluate an optional Codex task notification bridge now that authoritative context projection exists; keep SQLite authoritative and treat UI delivery as best effort.
 
 ## Startup prompt
 
 ```text
-Read README.md, docs/architecture.md, docs/protocol.md, docs/acceptance.md, docs/plan-gap-analysis.md, docs/release.md, and docs/HANDOFF.md. Verify the current checkout and run the test, clippy, unsigned release-build, and MSI acceptance commands before changing code. Treat the fixed desktop-20260717-01 fixture as consumed accepted evidence; do not rerun or reuse it. Preserve independent Codex top-level tasks and the single SQLite source of truth. Prefer `storeCredentials=true`, confirm `vibebus_credential_status`, and never place bearer, recovery, operator, PFX, or certificate-password secrets in repository, task, event, message, or logs. Preserve message close, task/thread terminal, retained-history floor, and pending-delivery protection semantics. Never apply retention without a fresh backup, reviewed plan, and user-performed interactive operator approval; never invoke operator mutation through automation. Never publish an unsigned production release or accept third-party legal terms on behalf of the repository owner. Prefer subscription peek/ack for replay-safe delivery, keep consumer side effects idempotent, and use legacy poll only when consume-on-poll loss is acceptable. Start with Agent-scoped context sync and confirmed decisions, and do not claim that VibeBus can interrupt an already-running model generation.
+Read README.md, docs/architecture.md, docs/protocol.md, docs/acceptance.md, docs/plan-gap-analysis.md, docs/release.md, and docs/HANDOFF.md. Verify the current checkout and run the test, clippy, unsigned release-build, and MSI acceptance commands before changing code. Treat the fixed desktop-20260717-01 fixture as consumed accepted evidence; do not rerun or reuse it. Preserve independent Codex top-level tasks and the single SQLite source of truth. Prefer `storeCredentials=true`, confirm `vibebus_credential_status`, and never place bearer, recovery, operator, PFX, or certificate-password secrets in repository, task, event, message, or logs. Preserve context-sync scope/budget/cursor rules, confirmed-decision semantic replay, message close, task/thread terminal, retained-history floor, and pending-delivery protection semantics. Never apply retention without a fresh backup, reviewed plan, and user-performed interactive operator approval; never invoke operator mutation through automation. Never publish an unsigned production release or accept third-party legal terms on behalf of the repository owner. Prefer subscription peek/ack for replay-safe delivery, keep consumer side effects idempotent, and use legacy poll only when consume-on-poll loss is acceptable. Start with responsibility-domain policy and deterministic Git/test Hooks, and do not claim that VibeBus can interrupt an already-running model generation.
 ```

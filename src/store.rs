@@ -14,19 +14,23 @@ use uuid::Uuid;
 
 use crate::error::{BusError, Result};
 use crate::models::{
-    AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, DoctorReport, EventView,
-    HandoffSnapshot, MessageReceipt, MessageView, OperatorCredentialView, OperatorStatusView,
-    ProjectMetadata, RecoveryKeyView, ReleaseResult, ReservationView, RetentionApprovalView,
-    RetentionCounts, RetentionPlan, RetentionPolicy, RetentionProtectionView, RetentionReport,
-    RetentionStateView, SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek,
-    SubscriptionPoll, SubscriptionView, TaskThreadBindingView, TaskView,
+    AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, ContextItemView,
+    ContextScopeView, ContextSyncView, DecisionView, DoctorReport, EventView, HandoffSnapshot,
+    MessageReceipt, MessageView, OperatorCredentialView, OperatorStatusView, ProjectMetadata,
+    RecoveryKeyView, ReleaseResult, ReservationView, RetentionApprovalView, RetentionCounts,
+    RetentionPlan, RetentionPolicy, RetentionProtectionView, RetentionReport, RetentionStateView,
+    SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll,
+    SubscriptionView, TaskThreadBindingView, TaskView,
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const DAY_MS: i64 = 86_400_000;
 const MIN_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 60;
 const MAX_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 3_600;
+const MIN_CONTEXT_BYTE_BUDGET: usize = 4_096;
+const MAX_CONTEXT_BYTE_BUDGET: usize = 1_048_576;
+const MAX_CONTEXT_ITEM_LIMIT: usize = 500;
 const TASK_STATUSES: &[&str] = &[
     "pending",
     "ready",
@@ -61,6 +65,12 @@ struct TaskRecord {
     blocked_reason: Option<String>,
     created_at: i64,
     updated_at: i64,
+}
+
+struct ContextCandidate {
+    sort_key: String,
+    kind: &'static str,
+    value: serde_json::Value,
 }
 
 struct SubscriptionRecord {
@@ -1591,6 +1601,375 @@ impl Bus {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirm_decision_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        key: &str,
+        task_id: &str,
+        summary: &str,
+        artifact_ids: &[String],
+        idempotency_key: Option<&str>,
+    ) -> Result<DecisionView> {
+        validate_decision_key(key)?;
+        validate_task_id(task_id)?;
+        let summary = summary.trim();
+        if summary.is_empty() || summary.len() > 1_024 {
+            return Err(BusError::Validation(
+                "decision summary must be 1-1024 UTF-8 bytes".into(),
+            ));
+        }
+        if artifact_ids.len() > 50 {
+            return Err(BusError::Validation(
+                "a decision can reference at most 50 artifacts".into(),
+            ));
+        }
+        let mut artifact_ids = artifact_ids.to_vec();
+        artifact_ids.sort();
+        artifact_ids.dedup();
+
+        let actor = self.authenticate(agent, token)?;
+        let request_hash = idempotency_key
+            .map(|idempotency_key| {
+                validate_idempotency_key(idempotency_key)?;
+                hash_json(&json!({
+                    "key": key,
+                    "taskId": task_id,
+                    "summary": summary,
+                    "artifactIds": artifact_ids
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(idempotency_key), Some(request_hash)) =
+            (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<DecisionView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "decision.confirm",
+                idempotency_key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+
+        let task: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT owner_agent_id, status FROM tasks WHERE project_id = ?1 AND id = ?2",
+                params![self.project.project_id, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (owner, status) =
+            task.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+        if owner.as_deref() != Some(actor.id.as_str()) {
+            return Err(BusError::Unauthorized(format!(
+                "agent '{}' must own task '{task_id}' to confirm its decisions",
+                actor.name
+            )));
+        }
+        if matches!(status.as_str(), "completed" | "abandoned") {
+            return Err(BusError::Conflict(format!(
+                "terminal task '{task_id}' cannot accept new confirmed decisions"
+            )));
+        }
+        for artifact_id in &artifact_ids {
+            let artifact_task: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT task_id FROM artifacts WHERE project_id = ?1 AND id = ?2",
+                    params![self.project.project_id, artifact_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let artifact_task = artifact_task.ok_or_else(|| {
+                BusError::Validation(format!("decision artifact '{artifact_id}' does not exist"))
+            })?;
+            if artifact_task
+                .as_deref()
+                .is_some_and(|value| value != task_id)
+            {
+                return Err(BusError::Validation(format!(
+                    "decision artifact '{artifact_id}' belongs to another task"
+                )));
+            }
+        }
+
+        let existing = tx
+            .query_row(
+                "SELECT d.id, d.decision_key, d.task_id, author.name, d.summary,
+                        d.artifact_ids_json, d.confirmed_at
+                 FROM decisions d JOIN agents author ON author.id = d.author_agent_id
+                 WHERE d.project_id = ?1 AND d.decision_key = ?2",
+                params![self.project.project_id, key],
+                map_decision,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.task_id != task_id
+                || existing.author != actor.name
+                || existing.summary != summary
+                || existing.artifact_ids != artifact_ids
+            {
+                return Err(BusError::Conflict(format!(
+                    "decision key '{key}' already identifies a different confirmed fact"
+                )));
+            }
+            if let (Some(idempotency_key), Some(request_hash)) =
+                (idempotency_key, request_hash.as_deref())
+            {
+                store_idempotent(
+                    &tx,
+                    &self.project.project_id,
+                    &actor.id,
+                    "decision.confirm",
+                    idempotency_key,
+                    request_hash,
+                    &existing,
+                )?;
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+
+        let decision_id = format!("dec_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO decisions
+             (id, project_id, decision_key, task_id, author_agent_id, summary,
+              artifact_ids_json, confirmed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                decision_id,
+                self.project.project_id,
+                key,
+                task_id,
+                actor.id,
+                summary,
+                serde_json::to_string(&artifact_ids)?,
+                now
+            ],
+        )?;
+        let response = DecisionView {
+            decision_id: decision_id.clone(),
+            key: key.to_owned(),
+            task_id: task_id.to_owned(),
+            author: actor.name.clone(),
+            summary: summary.to_owned(),
+            artifact_ids: artifact_ids.clone(),
+            confirmed_at: now,
+        };
+        if let (Some(idempotency_key), Some(request_hash)) =
+            (idempotency_key, request_hash.as_deref())
+        {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "decision.confirm",
+                idempotency_key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "decision_confirmed",
+            "decision",
+            &decision_id,
+            json!({
+                "key": key,
+                "taskId": task_id,
+                "artifactIds": artifact_ids
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    pub fn context_sync(
+        &self,
+        agent: &str,
+        token: &str,
+        cursor: Option<&str>,
+        item_limit: usize,
+        byte_budget: usize,
+    ) -> Result<ContextSyncView> {
+        validate_context_budget(item_limit, byte_budget)?;
+        self.authenticate(agent, token)?;
+
+        let mut owned_tasks = self
+            .list_tasks()?
+            .into_iter()
+            .filter(|task| {
+                task.owner.as_deref() == Some(agent)
+                    && !matches!(task.status.as_str(), "completed" | "abandoned")
+            })
+            .collect::<Vec<_>>();
+        owned_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        let owned_task_ids = owned_tasks
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        let owned_task_set = owned_task_ids.iter().cloned().collect::<HashSet<_>>();
+
+        let mut dependency_ids = owned_tasks
+            .iter()
+            .flat_map(|task| task.depends_on.iter().cloned())
+            .filter(|task_id| !owned_task_set.contains(task_id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        dependency_ids.sort();
+        let direct_dependencies = dependency_ids
+            .iter()
+            .map(|task_id| self.get_task(task_id))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut relevant_task_ids = owned_task_set;
+        relevant_task_ids.extend(dependency_ids.iter().cloned());
+        let mut candidates = Vec::new();
+        for task in &owned_tasks {
+            candidates.push(context_task_candidate("1", "ownedTask", task));
+        }
+        for task in &direct_dependencies {
+            candidates.push(context_task_candidate("2", "directDependency", task));
+        }
+
+        for message in self.inbox(agent, token, true)? {
+            let (subject, subject_truncated) = text_preview(&message.subject, 128);
+            let (body_preview, body_truncated) = text_preview(&message.body, 256);
+            candidates.push(ContextCandidate {
+                sort_key: format!("3|{:020}|{}", message.created_at.max(0), message.message_id),
+                kind: "unreadMessage",
+                value: json!({
+                    "messageId": message.message_id,
+                    "sender": message.sender,
+                    "threadId": message.thread_id,
+                    "priority": message.priority,
+                    "subject": subject,
+                    "subjectTruncated": subject_truncated,
+                    "bodyPreview": body_preview,
+                    "bodyTruncated": body_truncated,
+                    "requiresAck": message.requires_ack,
+                    "createdAt": message.created_at
+                }),
+            });
+        }
+
+        for decision in self.list_confirmed_decisions()? {
+            if relevant_task_ids.contains(&decision.task_id) {
+                candidates.push(ContextCandidate {
+                    sort_key: format!(
+                        "4|{:020}|{}",
+                        decision.confirmed_at.max(0),
+                        decision.decision_id
+                    ),
+                    kind: "confirmedDecision",
+                    value: serde_json::to_value(decision)?,
+                });
+            }
+        }
+        for artifact in self.list_artifacts(None)? {
+            if artifact
+                .task_id
+                .as_ref()
+                .is_some_and(|task_id| relevant_task_ids.contains(task_id))
+            {
+                let (summary, summary_truncated) = text_preview(&artifact.summary, 256);
+                candidates.push(ContextCandidate {
+                    sort_key: format!(
+                        "5|{:020}|{}",
+                        artifact.created_at.max(0),
+                        artifact.artifact_id
+                    ),
+                    kind: "relevantArtifact",
+                    value: json!({
+                        "artifactId": artifact.artifact_id,
+                        "publisher": artifact.publisher,
+                        "taskId": artifact.task_id,
+                        "kind": artifact.kind,
+                        "path": artifact.path,
+                        "sha256": artifact.sha256,
+                        "summary": summary,
+                        "summaryTruncated": summary_truncated,
+                        "createdAt": artifact.created_at
+                    }),
+                });
+            }
+        }
+        candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+
+        let after_key = cursor.map(decode_context_cursor).transpose()?;
+        let available = candidates
+            .into_iter()
+            .filter(|candidate| {
+                after_key
+                    .as_ref()
+                    .is_none_or(|after_key| candidate.sort_key.as_str() > after_key.as_str())
+            })
+            .collect::<Vec<_>>();
+        let mut items = Vec::new();
+        let mut bytes_used = 0usize;
+        for candidate in &available {
+            if items.len() == item_limit {
+                break;
+            }
+            let item = ContextItemView {
+                cursor: encode_context_cursor(&candidate.sort_key),
+                kind: candidate.kind.to_owned(),
+                value: candidate.value.clone(),
+            };
+            let item_bytes = serde_json::to_vec(&item)?.len();
+            if bytes_used + item_bytes > byte_budget {
+                if items.is_empty() {
+                    return Err(BusError::Validation(format!(
+                        "context byte budget {byte_budget} is too small for the next projected item ({item_bytes} bytes)"
+                    )));
+                }
+                break;
+            }
+            bytes_used += item_bytes;
+            items.push(item);
+        }
+        let has_more = items.len() < available.len();
+        let next_cursor = has_more
+            .then(|| items.last().map(|item| item.cursor.clone()))
+            .flatten();
+        Ok(ContextSyncView {
+            agent: agent.to_owned(),
+            scope: ContextScopeView {
+                owned_task_ids,
+                direct_dependency_task_ids: dependency_ids,
+            },
+            item_count: items.len(),
+            items,
+            item_limit,
+            byte_budget,
+            bytes_used,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    fn list_confirmed_decisions(&self) -> Result<Vec<DecisionView>> {
+        let mut statement = self.conn.prepare(
+            "SELECT d.id, d.decision_key, d.task_id, author.name, d.summary,
+                    d.artifact_ids_json, d.confirmed_at
+             FROM decisions d JOIN agents author ON author.id = d.author_agent_id
+             WHERE d.project_id = ?1 ORDER BY d.confirmed_at, d.id",
+        )?;
+        let rows = statement.query_map(params![self.project.project_id], map_decision)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_events(
         &self,
         after_sequence: i64,
@@ -2477,14 +2856,15 @@ impl Bus {
             [],
             |row| row.get(0),
         )?;
-        let counts: (i64, i64, i64, i64, i64) = self.conn.query_row(
+        let counts: (i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM agents WHERE project_id = ?1),
                (SELECT COUNT(*) FROM messages WHERE project_id = ?1),
                (SELECT COUNT(*) FROM tasks WHERE project_id = ?1),
                (SELECT COUNT(*) FROM reservations
                  WHERE project_id = ?1 AND released_at IS NULL AND expires_at > ?2),
-               (SELECT COUNT(*) FROM artifacts WHERE project_id = ?1)",
+               (SELECT COUNT(*) FROM artifacts WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM decisions WHERE project_id = ?1)",
             params![self.project.project_id, now_ms()],
             |row| {
                 Ok((
@@ -2493,6 +2873,7 @@ impl Bus {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
@@ -2512,6 +2893,7 @@ impl Bus {
             tasks: counts.2,
             active_reservations: counts.3,
             artifacts: counts.4,
+            decisions: counts.5,
         })
     }
 
@@ -2786,6 +3168,20 @@ impl Bus {
                 FOREIGN KEY(publisher_agent_id) REFERENCES agents(id),
                 FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
              );
+             CREATE TABLE IF NOT EXISTS decisions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                decision_key TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                author_agent_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                artifact_ids_json TEXT NOT NULL,
+                confirmed_at INTEGER NOT NULL,
+                UNIQUE(project_id, decision_key),
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(author_agent_id) REFERENCES agents(id)
+             );
              CREATE TABLE IF NOT EXISTS idempotency_records (
                 project_id TEXT NOT NULL,
                 actor_agent_id TEXT NOT NULL,
@@ -2886,6 +3282,8 @@ impl Bus {
                 ON reservations(project_id, released_at, expires_at);
              CREATE INDEX IF NOT EXISTS idx_artifacts_task
                 ON artifacts(project_id, task_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_decisions_task
+                ON decisions(project_id, task_id, confirmed_at);
              CREATE INDEX IF NOT EXISTS idx_idempotency_created
                 ON idempotency_records(project_id, created_at);
              CREATE INDEX IF NOT EXISTS idx_subscriptions_agent
@@ -2964,6 +3362,22 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         read_at: row.get(9)?,
         ack_at: row.get(10)?,
         closed_at: row.get(11)?,
+    })
+}
+
+fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionView> {
+    let artifact_ids_json: String = row.get(5)?;
+    let artifact_ids = serde_json::from_str(&artifact_ids_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(DecisionView {
+        decision_id: row.get(0)?,
+        key: row.get(1)?,
+        task_id: row.get(2)?,
+        author: row.get(3)?,
+        summary: row.get(4)?,
+        artifact_ids,
+        confirmed_at: row.get(6)?,
     })
 }
 
@@ -3616,6 +4030,113 @@ fn validate_task_id(task_id: &str) -> Result<()> {
             "task id must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
         ))
     }
+}
+
+fn validate_decision_key(key: &str) -> Result<()> {
+    let valid = !key.is_empty()
+        && key.len() <= 96
+        && key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "decision key must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
+        ))
+    }
+}
+
+fn validate_context_budget(item_limit: usize, byte_budget: usize) -> Result<()> {
+    if item_limit == 0 || item_limit > MAX_CONTEXT_ITEM_LIMIT {
+        return Err(BusError::Validation(format!(
+            "context item limit must be between 1 and {MAX_CONTEXT_ITEM_LIMIT}"
+        )));
+    }
+    if !(MIN_CONTEXT_BYTE_BUDGET..=MAX_CONTEXT_BYTE_BUDGET).contains(&byte_budget) {
+        return Err(BusError::Validation(format!(
+            "context byte budget must be between {MIN_CONTEXT_BYTE_BUDGET} and {MAX_CONTEXT_BYTE_BUDGET} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn context_task_candidate(category: &str, kind: &'static str, task: &TaskView) -> ContextCandidate {
+    let (title, title_truncated) = text_preview(&task.title, 128);
+    let (description_preview, description_truncated) = task
+        .description
+        .as_deref()
+        .map(|description| text_preview(description, 256))
+        .unwrap_or_default();
+    let (blocked_reason, blocked_reason_truncated) = task
+        .blocked_reason
+        .as_deref()
+        .map(|reason| text_preview(reason, 128))
+        .unwrap_or_default();
+    let depends_on = task.depends_on.iter().take(8).cloned().collect::<Vec<_>>();
+    ContextCandidate {
+        sort_key: format!("{category}|{}", task.task_id),
+        kind,
+        value: json!({
+            "taskId": task.task_id,
+            "title": title,
+            "titleTruncated": title_truncated,
+            "descriptionPreview": description_preview,
+            "descriptionTruncated": description_truncated,
+            "status": task.status,
+            "owner": task.owner,
+            "version": task.version,
+            "blockedReason": blocked_reason,
+            "blockedReasonTruncated": blocked_reason_truncated,
+            "dependsOn": depends_on,
+            "dependsOnTruncated": task.depends_on.len() > 8,
+            "createdAt": task.created_at,
+            "updatedAt": task.updated_at
+        }),
+    }
+}
+
+fn text_preview(value: &str, max_chars: usize) -> (String, bool) {
+    let preview = value.chars().take(max_chars).collect::<String>();
+    let truncated = value.chars().count() > max_chars;
+    (preview, truncated)
+}
+
+fn encode_context_cursor(sort_key: &str) -> String {
+    let encoded = sort_key
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("ctx1:{encoded}")
+}
+
+fn decode_context_cursor(cursor: &str) -> Result<String> {
+    let encoded = cursor
+        .strip_prefix("ctx1:")
+        .ok_or_else(|| BusError::Validation("context cursor has an unsupported version".into()))?;
+    if encoded.is_empty() || encoded.len() > 1_024 || encoded.len() % 2 != 0 {
+        return Err(BusError::Validation("context cursor is malformed".into()));
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| BusError::Validation("context cursor is malformed".into()))?;
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| BusError::Validation("context cursor is malformed".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sort_key = String::from_utf8(bytes)
+        .map_err(|_| BusError::Validation("context cursor is malformed".into()))?;
+    if !matches!(
+        sort_key.as_bytes(),
+        [b'1' | b'2' | b'3' | b'4' | b'5', b'|', ..]
+    ) {
+        return Err(BusError::Validation("context cursor is malformed".into()));
+    }
+    Ok(sort_key)
 }
 
 fn validate_thread_id(thread_id: &str) -> Result<()> {

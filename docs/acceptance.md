@@ -1,6 +1,6 @@
 # Acceptance record
 
-Acceptance date: 2026-07-17.
+Acceptance date: 2026-07-18.
 
 ## Automated checks
 
@@ -11,7 +11,7 @@ cargo fmt --all -- --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ./scripts/build-release.ps1
-./scripts/test-installer.ps1 -MsiPath ./dist/VibeBus-0.8.0-windows-x64.msi -ExpectedVersion 0.8.0
+./scripts/test-installer.ps1 -MsiPath ./dist/VibeBus-0.9.0-windows-x64.msi -ExpectedVersion 0.9.0
 python C:\Users\17430\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py D:\MyProjects\CoWork\plugins\vibebus
 ```
 
@@ -27,6 +27,8 @@ Covered behaviors:
 - overlapping reservation conflict and release;
 - absolute-path rejection and task transition rules;
 - artifact project scope, SHA-256, metadata, and task filtering;
+- immutable task-owner confirmed decisions, semantic-key exact replay, payload-drift conflicts, artifact/task validation, idempotency, and audit events;
+- authenticated Agent context isolation across active owned tasks, direct dependencies, unread directed messages, relevant decisions/artifacts, bounded previews, byte/item budgets, and cursor pagination;
 - SQLite integrity, WAL, foreign keys, schema version, and online backup;
 - ancestor project discovery;
 - single-use recovery-key rotation, legacy-agent migration, and invalidation of old secrets;
@@ -43,11 +45,11 @@ Covered behaviors:
 - CLI end-to-end subscription/handoff, message/thread lifecycle, and retention plan/apply flows;
 - MCP initialize negotiation, expanded tool listing, explicit absence of operator mutation tools, stored registration, no-token inbox access, vault-backed recovery, unapproved retention rejection, credential deletion, and rejection after deletion.
 
-The suite contains 30 tests: 5 CLI workflows, 20 core workflows, 4 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.8 checkout together with formatting and clippy-as-error checks.
+The suite contains 32 tests: 6 CLI workflows, 21 core workflows, 4 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted 0.9 checkout together with formatting and clippy-as-error checks.
 
-The 0.8 release layer additionally covers Cargo/plugin version agreement, repository-owned and Codex plugin validation, pinned release tools, per-user MSI ICE validation, administrative extraction, required payload presence, extracted binary execution/version, portable/plugin archives, post-build SHA-256 checksums, and a machine-readable signed-state manifest. Production publishing remains configured to fail before packaging when either signing Secret is absent.
+The 0.9 release layer additionally covers Cargo/plugin version agreement, repository-owned and Codex plugin validation, pinned release tools, per-user MSI ICE validation, administrative extraction, required payload presence, extracted binary execution/version, portable/plugin archives, post-build SHA-256 checksums, and a machine-readable signed-state manifest. Production publishing remains configured to fail before packaging when either signing Secret is absent.
 
-The accepted local 0.8 package is intentionally unsigned because no production certificate was placed in the workspace or process environment. Its MSI reports `NotSigned`; this verifies the PR/CI acceptance state, not the production signing path. Real certificate timestamping and final install/uninstall on a disposable Windows user profile remain maintainer release acceptance items.
+The accepted local 0.9 package is intentionally unsigned because no production certificate was placed in the workspace or process environment. Its MSI reports `NotSigned`; this verifies the PR/CI acceptance state, not the production signing path. Real certificate timestamping and final install/uninstall on a disposable Windows user profile remain maintainer release acceptance items.
 
 ## Plugin checks
 
@@ -55,9 +57,9 @@ The accepted local 0.8 package is intentionally unsigned because no production c
 - `.mcp.json` launches `./bin/vibebus.exe mcp` from the plugin root.
 - SessionStart is read-only and requires normal Codex hook trust review.
 - The Skill states the root, `storeCredentials=true`, vault-status and failure-fallback handling, snapshot, message close lifecycle, task/thread association, operator-approved retention discipline, replay-safe peek/ACK, legacy polling, claim, renewal, idempotency, handoff, conflict, and non-interruption boundaries.
-- The repository plugin manifest is version 0.8.0 and passes both the repository validator and the Codex plugin/Skill validators.
-- The development reinstall uses cachebuster version `0.8.0+codex.20260717124544`; `codex plugin list` reports it installed and enabled from `vibebus-local`.
-- The installed and packaged binaries both report `vibebus 0.8.0` and share SHA-256 `f2809d9828d571a14649929cd59c348ea9babc0fa8141dece90356330f2f47e7`; the installed Skill contains the operator-approval and explicit operator-credential-deletion rules, and the installed CLI exposes `operator delete-credential`.
+- The repository plugin manifest is version 0.9.0 and passes the repository validator.
+- `codex plugin add vibebus@vibebus-local` refreshed the development install; `codex plugin list` reports version 0.9.0 installed and enabled from `vibebus-local`.
+- The installed and packaged binaries both report `vibebus 0.9.0`, are 7,264,256 bytes, and share SHA-256 `8e806b76dcb694830021b60a69f45e359d354b0becc5ee1831bf08fabd8c5e6f`. The installed Skill documents `vibebus_context_sync`, `vibebus_decision_confirm`, operator approval, and explicit operator-credential deletion.
 
 ## Release package acceptance
 
@@ -65,11 +67,11 @@ The accepted unsigned local artifacts are:
 
 | Artifact | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `VibeBus-0.8.0-windows-x64.msi` | 2,039,808 | `0cccfbffd79789f0c4349625b5020d3db340bf798d9cea6fe7198404718021e4` |
-| `VibeBus-0.8.0-windows-x64.zip` | 2,662,643 | `6c0ca1d21088377c24ce5e5f338aa6f8e80788f0e111ac2359506b1914db1220` |
-| `VibeBus-Codex-plugin-0.8.0.zip` | 2,656,496 | `144b7046775e163673befbf0ce2277fdc55ad0e16d736a3fb651c47594c65943` |
+| `VibeBus-0.9.0-windows-x64.msi` | 2,080,768 | `dde13e31b363a4606ecb964d161d8180e78e452194320017f3bc287504893a17` |
+| `VibeBus-0.9.0-windows-x64.zip` | 2,723,736 | `9a4109e526f7017a9249d890355c1bc35f66f311904bb6a6129ace28648b88ba` |
+| `VibeBus-Codex-plugin-0.9.0.zip` | 2,717,048 | `a3936ff595c6012a771969717ced57417831e3dd5dda855370d5bad106de68b7` |
 
-The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, seven critical payload paths are present, and the extracted binary reports 0.8.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
+The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, seven critical payload paths are present, and the extracted binary reports 0.9.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
 
 ## Live project migration
 
@@ -90,6 +92,12 @@ The existing live coordination identity was also migrated with stored recovery-k
 The accepted post-migration online backup `vibebus-0.6-final.db` is 290,816 bytes with SHA-256 `86a77a9e07bf4d0246223c912fe7bc54d3d97c7568ad307086749f9f7233fe2f`.
 
 Before the 0.8 live migration, the 0.7 binary created `vibebus-0.8-pre-migration.db` (372,736 bytes, SHA-256 `78d9479ec2b394cc247e6078aac89beea7fe615942aa367e6b1d848ea4a58ee5`). The packaged 0.8 binary then opened the same project in place. `doctor` reports schema version 9, integrity `ok`, WAL, foreign keys enabled, and `ok=true`; all eight tasks, five Agents, existing artifacts, the current task/thread binding, and active reservations remained present.
+
+Before the 0.9 live migration, the installed 0.8 service created `vibebus-0.9-pre-migration.db` (630,784 bytes, SHA-256 `9780a050226e1add79770205ec36b6f0a3b643ee81d66815984c393f31060681`). The packaged 0.9 binary then migrated that same project in place from schema 9 to schema 10. `doctor` reports integrity `ok`, WAL, foreign keys enabled, and `ok=true`; pre-existing Agents, 18 tasks, 54 artifacts, bindings, reservations, messages, subscriptions, events, and retention state remained readable.
+
+The live schema-10 acceptance confirmed decision `context-sync.v09.design` for `CONTEXT-SYNC-001`. An exact retry returned the original decision ID `dec_6c2e02ee47104c41b4d0c64a6584b05e`, while automated tests reject payload drift under the same semantic key. A vault-authenticated `context sync` returned the active owned task, its related confirmed decision, and scoped evidence as 15 deterministic items using 8,991 serialized item bytes with no continuation required; unrelated project facts were excluded. CLI/core serialization parity, item and byte budgets, opaque cursor continuation, wrong-token rejection, ACK/read/close exclusion, direct-dependency expansion, and artifact-reference-only behavior are covered by the 32-test suite.
+
+The accepted post-feature online backup `vibebus-0.9-context-sync.db` is 647,168 bytes with SHA-256 `b273c8f9425cbb210d3ac6e66a9a1b1fa56f6d9cf476edb93b1d51a29301331a`. The packaged 0.9 `doctor` reports schema 10, one confirmed decision, integrity `ok`, WAL, foreign keys enabled, and overall `ok=true`.
 
 `operator status` on the live project reports DB configuration `false`, vault storage `false`, and `ready=false` with the isolated target `VibeBusOperator:prj_51ac137e4aa342a7a80bda77d94cfbc5`. No operator credential was initialized on the user's behalf. This proves the safe migration/default-deny state; interactive initialization, rotation, restoration, and a real operator-approved live cleanup remain explicit maintainer actions.
 
