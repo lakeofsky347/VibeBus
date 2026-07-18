@@ -151,6 +151,14 @@ The accepted image was pushed to Alibaba Cloud ACR as `crpi-21kb7zn8owb85qa2.cn-
 
 Repository intake reran the complete build and acceptance after hardening native stderr handling for Windows PowerShell. Repeated local builds again passed all seven container gates with the same size, runtime user, version, WAL/foreign-key state, and 47-tool MCP surface, while their local image IDs differed because build metadata is not bit-for-bit reproducible. They were not pushed and do not replace the recorded remote digest. CI now runs the same repository script on `ubuntu-latest`; both test and push helpers derive their default version/tag from `Cargo.toml` to fail closed on release-version drift.
 
+## Backup restore drill
+
+`scripts/test-backup-restore.ps1` now exercises online backup, export identity, isolated import, point-in-time recovery, authenticated reads, and cleanup without touching the live project. The local 2026-07-18 run created disposable project `prj_b9a1ffd18c8942cc93829c23163e369b`; its 278,528-byte backup and imported copy both hashed to `8040cf3ffafec017bc8c8beffe9829a143cc202cbfea81a797456966e0d53715` before the restored database was opened.
+
+The source contained one Agent and one task at backup time, then received a second task after the backup. The isolated restore reported schema 11, WAL, foreign keys, one Agent, and exactly the pre-backup task; the post-backup mutation was absent. The original in-process Agent token authenticated an empty restored Inbox without being printed, and the temporary source, export, and restored data trees were removed. Every run uses a new project ID and therefore a new artifact hash; acceptance compares each imported copy with the hash returned by that run's online backup rather than pinning the sample hash.
+
+Windows CI runs the same drill against the just-built release binary before MSI acceptance. The production runbook in `docs/backup-restore.md` requires an isolated verification root and an explicit maintainer-controlled offline cutover; no automated live-database overwrite or `VACUUM` path was added.
+
 ## Remaining manual acceptance
 
 1. Execute a signed production release and disposable-profile installer test after a real certificate and protected release environment are available.
