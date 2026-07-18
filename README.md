@@ -101,7 +101,9 @@ git diff --check
 - [企划差距分析](docs/plan-gap-analysis.md)
 - [发布工程](docs/release.md)
 - [容器交付](docs/container.md)
+- [备份、导出与恢复演练](docs/backup-restore.md)
 - [双顶层任务桌面验收](docs/desktop-acceptance.md)
+- [安全策略与漏洞报告](SECURITY.md)
 - [后续接手](docs/HANDOFF.md)
 - [插件 README](plugins/vibebus/README.md)
 
