@@ -1,6 +1,6 @@
 # Acceptance record
 
-Acceptance date: 2026-07-18.
+Acceptance date: 2026-07-19.
 
 ## Automated checks
 
