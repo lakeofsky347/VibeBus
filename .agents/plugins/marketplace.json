@@ -1,7 +1,7 @@
 {
   "name": "vibebus-local",
   "interface": {
-    "displayName": "VibeBus Local"
+    "displayName": "VibeBus Local Coordination"
   },
   "plugins": [
     {
