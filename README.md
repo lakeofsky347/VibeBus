@@ -45,6 +45,8 @@ $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
 
 发布脚本会生成 `plugins\vibebus\bin\vibebus.exe`、当前用户级 MSI、便携 marketplace 包、独立插件包、SHA-256 校验和与发布清单。插件的 `.mcp.json` 从打包后的二进制路径启动 stdio MCP 服务。单独更新插件二进制仍可运行 `powershell -File .\scripts\package-plugin.ps1`。
 
+Linux 容器交付使用多阶段 `Dockerfile`、非 root 运行时、独立 `/data` volume 和 `/workspace` 项目挂载。运行 `./scripts/test-container.ps1` 可完成 build、CLI、SQLite、认证 Inbox 与 stdio MCP 验收。Linux 容器不支持 Windows Credential Manager，必须使用显式 token 或 `VIBEBUS_AGENT_TOKEN`，且不得使用 `--store-credentials`。阿里云 ACR 登录与推送流程见[容器交付](docs/container.md)。
+
 2026-07-18 已完成真实桌面验收：严格预检 68/68，通过两个独立、用户拥有的 Codex 顶层任务按 B1/A1/B2/A2 协作，最终审计 178/178（0 失败、0 跳过）。完整证据见[双顶层任务桌面验收](docs/desktop-acceptance.md)，企划差距与后续优先级见[企划差距分析](docs/plan-gap-analysis.md)。
 
 ## 初始化项目
@@ -124,6 +126,7 @@ MSI 安装到 `%LOCALAPPDATA%\Programs\VibeBus`，并将其中的 `plugins\vibeb
 - [双顶层任务桌面验收](docs/desktop-acceptance.md)
 - [企划差距分析](docs/plan-gap-analysis.md)
 - [发布工程](docs/release.md)
+- [Docker 与阿里云 ACR 交付](docs/container.md)
 - [后续接手](docs/HANDOFF.md)
 
 ## 安全边界
