@@ -77,6 +77,14 @@ enum Command {
         #[command(subcommand)]
         command: ArtifactCommand,
     },
+    Decision {
+        #[command(subcommand)]
+        command: DecisionCommand,
+    },
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
     Event {
         #[command(subcommand)]
         command: EventCommand,
@@ -346,6 +354,42 @@ enum ArtifactCommand {
     List {
         #[arg(long)]
         task: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DecisionCommand {
+    Confirm {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long, value_delimiter = ',')]
+        artifacts: Vec<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextCommand {
+    Sync {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        item_limit: usize,
+        #[arg(long, default_value_t = 65_536)]
+        byte_budget: usize,
     },
 }
 
@@ -876,6 +920,46 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 )?)
             }
             ArtifactCommand::List { task } => json!(bus.list_artifacts(task.as_deref())?),
+        },
+        Command::Decision { command } => match command {
+            DecisionCommand::Confirm {
+                agent,
+                token,
+                key,
+                task,
+                summary,
+                artifacts,
+                idempotency_key,
+            } => {
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
+                json!(bus.confirm_decision_idempotent(
+                    &agent,
+                    &token,
+                    &key,
+                    &task,
+                    &summary,
+                    &artifacts,
+                    idempotency_key.as_deref(),
+                )?)
+            }
+        },
+        Command::Context { command } => match command {
+            ContextCommand::Sync {
+                agent,
+                token,
+                cursor,
+                item_limit,
+                byte_budget,
+            } => {
+                let token = resolve_token(vault.as_ref(), &project_id, &agent, token)?;
+                json!(bus.context_sync(
+                    &agent,
+                    &token,
+                    cursor.as_deref(),
+                    item_limit,
+                    byte_budget,
+                )?)
+            }
         },
         Command::Event { command } => match command {
             EventCommand::List {

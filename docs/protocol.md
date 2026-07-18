@@ -107,6 +107,27 @@ For Windows CLI calls, `--metadata-file <path>` is the stable form for complex J
 
 Artifact publication accepts an idempotency key. The request identity includes the current file SHA-256, so changing the file and reusing the key produces a conflict instead of returning a stale artifact.
 
+## Confirmed decisions and Agent context
+
+| Capability | CLI | MCP |
+| --- | --- | --- |
+| Confirm immutable decision | `decision confirm` | `vibebus_decision_confirm` |
+| Synchronize scoped context | `context sync` | `vibebus_context_sync` |
+
+`decision confirm` requires an authenticated owner, a non-terminal task, a project-wide semantic `key`, a 1–1,024 UTF-8 byte summary, and optional artifact IDs. Task-scoped artifacts must belong to the same task; project-level artifacts may be referenced without being copied. The first confirmation appends one `decision_confirmed` event. Repeating the exact key/payload returns the original decision even without an idempotency key, while changing the task, author, summary, or normalized artifact set conflicts. An idempotency key additionally protects an ambiguous first response.
+
+`context sync` returns one authenticated deterministic projection containing only:
+
+1. the Agent's active owned tasks;
+2. those tasks' direct dependencies;
+3. unread messages directed to the Agent;
+4. confirmed decisions related to the owned/dependency task scope; and
+5. artifacts related to the same scope.
+
+Unrelated task facts and acknowledged, read, or closed messages are excluded. Artifacts expose identity, task, kind, path, SHA-256, and a bounded summary; VibeBus never reads artifact contents into context. Long task/message fields are bounded previews with explicit truncation flags.
+
+CLI defaults are `--item-limit 100 --byte-budget 65536`; MCP uses `itemLimit` and `byteBudget`. Item limits accept 1–500 and byte budgets accept 4,096–1,048,576. `bytesUsed` is the exact sum of serialized context items, not the response envelope. A truncated page returns `hasMore=true` and an opaque `nextCursor`; pass it as `--cursor`/`cursor` to continue. Cursors encode the last deterministic fact key rather than a SQL offset, so an unchanged projection paginates without duplicates or omissions. A cursor is not an atomic database snapshot: restart from the beginning when concurrent task/message state must be reflected consistently.
+
 ## Events and subscriptions
 
 | Capability | CLI | MCP |
@@ -154,11 +175,11 @@ Event candidates form one contiguous prefix that is old enough, at or below the 
 
 A handoff is a directed message with a JSON body containing `summary`, optional `taskId`, `decisions`, `artifacts`, `blockers`, and `nextActions`. VibeBus forces `high` priority and `requiresAck=true`, verifies referenced tasks and artifacts, and supports retry deduplication with an idempotency key. The recipient should read the body, act on it, and call `ack`.
 
-The authenticated snapshot combines unread messages, non-terminal owned tasks, their active task/thread bindings, active owned reservations, the agent's recent artifacts, recent available events after a supplied sequence, the latest event sequence, and retention state. It clamps an obsolete supplied sequence to the retained-history floor so recovery remains available. It is a compact resume view, not a replacement for direct task/message reads when more than the bounded recent window is needed.
+The authenticated snapshot combines unread messages, non-terminal owned tasks, their active task/thread bindings, active owned reservations, the agent's recent artifacts, recent available events after a supplied sequence, the latest event sequence, and retention state. It clamps an obsolete supplied sequence to the retained-history floor so recovery remains available. It is an operational resume view. Use `context sync` for the deterministic, task-scoped, budgeted projection of dependencies, decisions, and relevant artifacts.
 
 ## Idempotency rules
 
-Idempotency keys are scoped by project, authenticated agent, and operation. Valid keys are 1-128 ASCII letters, digits, `-`, `_`, `.`, or `:`. They are available on message/handoff send, reservation acquire/renew, and artifact publish. Same key plus same effective request returns the stored response; same key plus different request returns a conflict while the record remains inside the configured retention window. Task creation already has a stable caller-selected task ID, while task claim and update rely on atomic state/version checks.
+Idempotency keys are scoped by project, authenticated agent, and operation. Valid keys are 1-128 ASCII letters, digits, `-`, `_`, `.`, or `:`. They are available on message/handoff send, reservation acquire/renew, artifact publish, and decision confirmation. Same key plus same effective request returns the stored response; same key plus different request returns a conflict while the record remains inside the configured retention window. Confirmed decisions also retain semantic deduplication through their immutable project-wide decision key. Task creation already has a stable caller-selected task ID, while task claim and update rely on atomic state/version checks.
 
 ## MCP root rule
 

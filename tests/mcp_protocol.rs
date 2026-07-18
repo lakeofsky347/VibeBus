@@ -80,6 +80,8 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     assert!(names.contains(&"vibebus_subscription_ack"));
     assert!(names.contains(&"vibebus_handoff_send"));
     assert!(names.contains(&"vibebus_handoff_snapshot"));
+    assert!(names.contains(&"vibebus_decision_confirm"));
+    assert!(names.contains(&"vibebus_context_sync"));
     assert!(names.contains(&"vibebus_close"));
     assert!(names.contains(&"vibebus_thread_bind"));
     assert!(names.contains(&"vibebus_thread_unbind"));
@@ -166,6 +168,96 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
             "id": 6,
             "method": "tools/call",
             "params": {
+                "name": "vibebus_task_create",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "title": "MCP context projection"
+                }
+            }
+        }),
+    )
+    .await;
+    let created = tool_text(&response(&mut lines, 6).await);
+    assert_eq!(created["status"], "ready");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_task_claim",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001"
+                }
+            }
+        }),
+    )
+    .await;
+    let claimed = tool_text(&response(&mut lines, 7).await);
+    assert_eq!(claimed["owner"], "mcp-vault-agent");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_decision_confirm",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "key": "mcp.context",
+                    "taskId": "MCP-CONTEXT-001",
+                    "summary": "MCP uses the authoritative context projection.",
+                    "idempotencyKey": "mcp-context-decision"
+                }
+            }
+        }),
+    )
+    .await;
+    let decision = tool_text(&response(&mut lines, 8).await);
+    assert_eq!(decision["key"], "mcp.context");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_context_sync",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "itemLimit": 100,
+                    "byteBudget": 65536
+                }
+            }
+        }),
+    )
+    .await;
+    let context = tool_text(&response(&mut lines, 9).await);
+    assert_eq!(context["scope"]["ownedTaskIds"][0], "MCP-CONTEXT-001");
+    assert!(
+        context["items"].as_array().unwrap().iter().any(
+            |item| item["kind"] == "confirmedDecision" && item["value"]["key"] == "mcp.context"
+        )
+    );
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
                 "name": "vibebus_agent_recover",
                 "arguments": {
                     "root": path_text(project.path()),
@@ -175,7 +267,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         }),
     )
     .await;
-    let recovered = tool_text(&response(&mut lines, 6).await);
+    let recovered = tool_text(&response(&mut lines, 10).await);
     assert_eq!(recovered["secretsRedacted"], true);
     assert_eq!(recovered["tokenGeneration"], 2);
     assert!(recovered.get("recoveryKey").is_none());
@@ -184,7 +276,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         &mut writer,
         json!({
             "jsonrpc": "2.0",
-            "id": 7,
+            "id": 11,
             "method": "tools/call",
             "params": {
                 "name": "vibebus_retention_plan",
@@ -196,14 +288,14 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         }),
     )
     .await;
-    let plan = tool_text(&response(&mut lines, 7).await);
+    let plan = tool_text(&response(&mut lines, 11).await);
     let plan_id = plan["planId"].as_str().unwrap();
 
     send(
         &mut writer,
         json!({
             "jsonrpc": "2.0",
-            "id": 8,
+            "id": 12,
             "method": "tools/call",
             "params": {
                 "name": "vibebus_retention_apply",
@@ -216,7 +308,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         }),
     )
     .await;
-    let unapproved = response(&mut lines, 8).await;
+    let unapproved = response(&mut lines, 12).await;
     assert!(unapproved["error"].is_object());
     assert!(
         unapproved["error"]["message"]
@@ -229,7 +321,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         &mut writer,
         json!({
             "jsonrpc": "2.0",
-            "id": 9,
+            "id": 13,
             "method": "tools/call",
             "params": {
                 "name": "vibebus_credential_delete",
@@ -242,7 +334,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         }),
     )
     .await;
-    let deleted = tool_text(&response(&mut lines, 9).await);
+    let deleted = tool_text(&response(&mut lines, 13).await);
     assert_eq!(deleted["deleted"], true);
     assert_eq!(deleted["credentials"]["stored"], false);
 
@@ -250,7 +342,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         &mut writer,
         json!({
             "jsonrpc": "2.0",
-            "id": 10,
+            "id": 14,
             "method": "tools/call",
             "params": {
                 "name": "vibebus_inbox",
@@ -262,7 +354,7 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
         }),
     )
     .await;
-    let missing = response(&mut lines, 10).await;
+    let missing = response(&mut lines, 14).await;
     assert!(missing["error"].is_object());
     assert!(
         missing["error"]["message"]

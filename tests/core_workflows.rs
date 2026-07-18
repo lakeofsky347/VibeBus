@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -994,7 +995,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 9);
+    assert_eq!(doctor.schema_version, 10);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -1183,7 +1184,16 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
         .unwrap();
     assert!(approval_columns.contains(&"operator_generation".to_owned()));
     assert!(approval_columns.contains(&"consumed_at".to_owned()));
-    assert_eq!(bus.doctor().unwrap().schema_version, 9);
+    let decision_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(decisions)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(decision_columns.contains(&"decision_key".to_owned()));
+    assert!(decision_columns.contains(&"artifact_ids_json".to_owned()));
+    assert_eq!(bus.doctor().unwrap().schema_version, 10);
 }
 
 #[test]
@@ -1663,6 +1673,351 @@ fn concurrent_subscription_peek_and_ack_converge_on_one_delivery() {
         acknowledgements.iter().filter(|ack| ack.replayed).count(),
         1
     );
+}
+
+#[test]
+fn context_sync_is_scoped_budgeted_paginated_and_semantically_deduplicated() {
+    let harness = Harness::new();
+    fs::write(
+        harness.project.path().join("dependency.txt"),
+        "DEPENDENCY FILE CONTENT MUST NOT ENTER CONTEXT\n",
+    )
+    .unwrap();
+    fs::write(
+        harness.project.path().join("owned.txt"),
+        "OWNED FILE CONTENT MUST NOT ENTER CONTEXT\n",
+    )
+    .unwrap();
+    fs::write(
+        harness.project.path().join("unrelated.txt"),
+        "UNRELATED FILE CONTENT\n",
+    )
+    .unwrap();
+
+    let mut bus = harness.bus();
+    let owner = bus
+        .register_agent("context-owner", "implementation")
+        .unwrap();
+    let dependency_owner = bus
+        .register_agent("context-dependency", "implementation")
+        .unwrap();
+    let unrelated = bus
+        .register_agent("context-unrelated", "implementation")
+        .unwrap();
+    let sender = bus
+        .register_agent("context-sender", "coordination")
+        .unwrap();
+
+    let dependency = bus
+        .create_task(
+            "context-dependency",
+            &dependency_owner.token,
+            "CTX-DEPENDENCY",
+            "Direct dependency",
+            Some("A bounded dependency description"),
+            &[],
+        )
+        .unwrap();
+    let dependency = bus
+        .claim_task(
+            "context-dependency",
+            &dependency_owner.token,
+            &dependency.task_id,
+        )
+        .unwrap();
+    let dependency = bus
+        .update_task(
+            "context-dependency",
+            &dependency_owner.token,
+            &dependency.task_id,
+            dependency.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    let dependency_artifact = bus
+        .publish_artifact(
+            "context-dependency",
+            &dependency_owner.token,
+            "report",
+            "dependency.txt",
+            "Dependency report reference",
+            Some(&dependency.task_id),
+            None,
+        )
+        .unwrap();
+    let dependency_decision = bus
+        .confirm_decision_idempotent(
+            "context-dependency",
+            &dependency_owner.token,
+            "dependency.contract",
+            &dependency.task_id,
+            "The dependency contract is stable.",
+            std::slice::from_ref(&dependency_artifact.artifact_id),
+            Some("context-decision-dependency"),
+        )
+        .unwrap();
+    let dependency_decision_retry = bus
+        .confirm_decision_idempotent(
+            "context-dependency",
+            &dependency_owner.token,
+            "dependency.contract",
+            &dependency.task_id,
+            "The dependency contract is stable.",
+            std::slice::from_ref(&dependency_artifact.artifact_id),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        dependency_decision.decision_id,
+        dependency_decision_retry.decision_id
+    );
+    assert!(matches!(
+        bus.confirm_decision_idempotent(
+            "context-dependency",
+            &dependency_owner.token,
+            "dependency.contract",
+            &dependency.task_id,
+            "A conflicting semantic payload.",
+            &[],
+            Some("context-decision-conflict"),
+        ),
+        Err(BusError::Conflict(_))
+    ));
+    bus.update_task(
+        "context-dependency",
+        &dependency_owner.token,
+        &dependency.task_id,
+        dependency.version,
+        "completed",
+        None,
+    )
+    .unwrap();
+
+    let owned = bus
+        .create_task(
+            "context-owner",
+            &owner.token,
+            "CTX-OWNED",
+            "Owned context task",
+            Some(&"bounded ".repeat(200)),
+            std::slice::from_ref(&dependency.task_id),
+        )
+        .unwrap();
+    let owned = bus
+        .claim_task("context-owner", &owner.token, &owned.task_id)
+        .unwrap();
+    let owned = bus
+        .update_task(
+            "context-owner",
+            &owner.token,
+            &owned.task_id,
+            owned.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    let owned_artifact = bus
+        .publish_artifact(
+            "context-owner",
+            &owner.token,
+            "report",
+            "owned.txt",
+            "Owned report reference",
+            Some(&owned.task_id),
+            None,
+        )
+        .unwrap();
+    let owned_decision = bus
+        .confirm_decision_idempotent(
+            "context-owner",
+            &owner.token,
+            "owned.storage",
+            &owned.task_id,
+            "SQLite remains authoritative.",
+            std::slice::from_ref(&owned_artifact.artifact_id),
+            Some("context-decision-owned"),
+        )
+        .unwrap();
+    assert!(matches!(
+        bus.confirm_decision_idempotent(
+            "context-unrelated",
+            &unrelated.token,
+            "owned.unauthorized",
+            &owned.task_id,
+            "This must be rejected.",
+            &[],
+            None,
+        ),
+        Err(BusError::Unauthorized(_))
+    ));
+
+    let unrelated_task = bus
+        .create_task(
+            "context-unrelated",
+            &unrelated.token,
+            "CTX-UNRELATED",
+            "Unrelated task",
+            None,
+            &[],
+        )
+        .unwrap();
+    let unrelated_task = bus
+        .claim_task(
+            "context-unrelated",
+            &unrelated.token,
+            &unrelated_task.task_id,
+        )
+        .unwrap();
+    let unrelated_artifact = bus
+        .publish_artifact(
+            "context-unrelated",
+            &unrelated.token,
+            "report",
+            "unrelated.txt",
+            "Unrelated report",
+            Some(&unrelated_task.task_id),
+            None,
+        )
+        .unwrap();
+    let unrelated_decision = bus
+        .confirm_decision_idempotent(
+            "context-unrelated",
+            &unrelated.token,
+            "unrelated.choice",
+            &unrelated_task.task_id,
+            "This fact belongs only to the unrelated task.",
+            std::slice::from_ref(&unrelated_artifact.artifact_id),
+            None,
+        )
+        .unwrap();
+    assert_eq!(bus.doctor().unwrap().decisions, 3);
+
+    let acknowledged = bus
+        .send_message(
+            "context-sender",
+            &sender.token,
+            std::slice::from_ref(&owner.name),
+            "Already handled",
+            "ACKNOWLEDGED MESSAGE MUST NOT ENTER CONTEXT",
+            Some(&owned.task_id),
+            "normal",
+            true,
+        )
+        .unwrap();
+    bus.acknowledge_message("context-owner", &owner.token, &acknowledged.message_id)
+        .unwrap();
+    bus.close_message("context-owner", &owner.token, &acknowledged.message_id)
+        .unwrap();
+    let unread = bus
+        .send_message(
+            "context-sender",
+            &sender.token,
+            std::slice::from_ref(&owner.name),
+            "Action required",
+            "This unread directed fact is relevant.",
+            Some(&owned.task_id),
+            "high",
+            true,
+        )
+        .unwrap();
+    for index in 0..12 {
+        bus.send_message(
+            "context-sender",
+            &sender.token,
+            std::slice::from_ref(&owner.name),
+            &format!("Budget fact {index:02}"),
+            &format!("{}-{index:02}", "x".repeat(300)),
+            Some(&owned.task_id),
+            "normal",
+            false,
+        )
+        .unwrap();
+    }
+
+    let full = bus
+        .context_sync("context-owner", &owner.token, None, 500, 1_048_576)
+        .unwrap();
+    assert_eq!(full.scope.owned_task_ids, vec![owned.task_id.clone()]);
+    assert_eq!(
+        full.scope.direct_dependency_task_ids,
+        vec![dependency.task_id.clone()]
+    );
+    assert!(full.items.iter().any(|item| {
+        item.kind == "confirmedDecision"
+            && item.value["decisionId"] == dependency_decision.decision_id
+    }));
+    assert!(full.items.iter().any(|item| {
+        item.kind == "confirmedDecision" && item.value["decisionId"] == owned_decision.decision_id
+    }));
+    assert!(full.items.iter().any(|item| {
+        item.kind == "relevantArtifact"
+            && item.value["artifactId"] == dependency_artifact.artifact_id
+    }));
+    assert!(full.items.iter().any(|item| {
+        item.kind == "unreadMessage" && item.value["messageId"] == unread.message_id
+    }));
+    let serialized = serde_json::to_string(&full).unwrap();
+    assert!(!serialized.contains(&unrelated_task.task_id));
+    assert!(!serialized.contains(&unrelated_decision.decision_id));
+    assert!(!serialized.contains(&unrelated_artifact.artifact_id));
+    assert!(!serialized.contains(&acknowledged.message_id));
+    assert!(!serialized.contains("MUST NOT ENTER CONTEXT"));
+    assert_eq!(full.item_count, full.items.len());
+    assert!(full.bytes_used <= full.byte_budget);
+
+    let mut cursor = None;
+    let mut seen = HashSet::new();
+    loop {
+        let page = bus
+            .context_sync("context-owner", &owner.token, cursor.as_deref(), 2, 4_096)
+            .unwrap();
+        assert!(page.items.len() <= 2);
+        assert!(page.bytes_used <= 4_096);
+        for item in &page.items {
+            assert!(seen.insert(item.cursor.clone()), "cursor must not repeat");
+        }
+        if page.has_more {
+            cursor = page.next_cursor;
+            assert!(cursor.is_some());
+        } else {
+            assert!(page.next_cursor.is_none());
+            break;
+        }
+    }
+    assert_eq!(seen.len(), full.items.len());
+    let byte_limited = bus
+        .context_sync("context-owner", &owner.token, None, 500, 4_096)
+        .unwrap();
+    assert!(byte_limited.has_more);
+    assert!(byte_limited.bytes_used <= 4_096);
+    assert!(matches!(
+        bus.context_sync("context-owner", &owner.token, None, 10, 4_095),
+        Err(BusError::Validation(_))
+    ));
+    assert!(matches!(
+        bus.context_sync(
+            "context-owner",
+            &owner.token,
+            Some("not-a-context-cursor"),
+            10,
+            4_096,
+        ),
+        Err(BusError::Validation(_))
+    ));
+    assert!(matches!(
+        bus.context_sync("context-owner", &unrelated.token, None, 10, 4_096),
+        Err(BusError::Unauthorized(_))
+    ));
+
+    bus.acknowledge_message("context-owner", &owner.token, &unread.message_id)
+        .unwrap();
+    let after_ack = bus
+        .context_sync("context-owner", &owner.token, None, 500, 1_048_576)
+        .unwrap();
+    assert!(!after_ack.items.iter().any(|item| {
+        item.kind == "unreadMessage" && item.value["messageId"] == unread.message_id
+    }));
 }
 
 #[test]

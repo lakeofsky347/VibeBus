@@ -1,6 +1,6 @@
 {
   "name": "vibebus",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Project-scoped coordination for independent Codex tasks.",
   "author": {
     "name": "VibeBus Contributors"

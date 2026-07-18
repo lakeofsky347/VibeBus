@@ -48,6 +48,155 @@ fn cli_accepts_metadata_file_on_windows_safe_path() {
 }
 
 #[test]
+fn cli_context_sync_matches_the_core_projection() {
+    let project = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    initialize_project(project.path(), "CLI context", Some(data.path())).unwrap();
+    fs::write(
+        project.path().join("context.txt"),
+        "large report stays external\n",
+    )
+    .unwrap();
+
+    let registration = run_cli(
+        project.path(),
+        data.path(),
+        &["register", "--name", "cli-context", "--role", "test"],
+    );
+    let token = registration["result"]["token"].as_str().unwrap();
+    run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "task",
+            "create",
+            "--agent",
+            "cli-context",
+            "--token",
+            token,
+            "--id",
+            "CLI-CONTEXT-001",
+            "--title",
+            "CLI context task",
+        ],
+    );
+    run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "task",
+            "claim",
+            "--agent",
+            "cli-context",
+            "--token",
+            token,
+            "--id",
+            "CLI-CONTEXT-001",
+        ],
+    );
+    let artifact = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "artifact",
+            "publish",
+            "--agent",
+            "cli-context",
+            "--token",
+            token,
+            "--kind",
+            "report",
+            "--path",
+            "context.txt",
+            "--summary",
+            "CLI context artifact",
+            "--task",
+            "CLI-CONTEXT-001",
+        ],
+    );
+    let artifact_id = artifact["result"]["artifactId"].as_str().unwrap();
+    let confirmed = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "decision",
+            "confirm",
+            "--agent",
+            "cli-context",
+            "--token",
+            token,
+            "--key",
+            "cli.context",
+            "--task",
+            "CLI-CONTEXT-001",
+            "--summary",
+            "CLI and MCP share one projection.",
+            "--artifacts",
+            artifact_id,
+            "--idempotency-key",
+            "cli-context-decision",
+        ],
+    );
+    let replayed = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "decision",
+            "confirm",
+            "--agent",
+            "cli-context",
+            "--token",
+            token,
+            "--key",
+            "cli.context",
+            "--task",
+            "CLI-CONTEXT-001",
+            "--summary",
+            "CLI and MCP share one projection.",
+            "--artifacts",
+            artifact_id,
+            "--idempotency-key",
+            "cli-context-decision",
+        ],
+    );
+    assert_eq!(
+        confirmed["result"]["decisionId"],
+        replayed["result"]["decisionId"]
+    );
+
+    let projected = run_cli(
+        project.path(),
+        data.path(),
+        &[
+            "context",
+            "sync",
+            "--agent",
+            "cli-context",
+            "--token",
+            token,
+            "--item-limit",
+            "500",
+            "--byte-budget",
+            "1048576",
+        ],
+    );
+    let bus = Bus::open(project.path(), Some(data.path())).unwrap();
+    let direct = bus
+        .context_sync("cli-context", token, None, 500, 1_048_576)
+        .unwrap();
+    assert_eq!(projected["result"], serde_json::to_value(direct).unwrap());
+    assert!(
+        projected["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |item| item["kind"] == "confirmedDecision" && item["value"]["key"] == "cli.context"
+            )
+    );
+}
+
+#[test]
 fn cli_exposes_subscription_and_structured_handoff_workflows() {
     let project = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();

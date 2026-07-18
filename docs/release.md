@@ -1,6 +1,6 @@
 # Release engineering
 
-VibeBus 0.8 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
+VibeBus 0.9 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
 
 ## Outputs
 

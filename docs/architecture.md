@@ -2,7 +2,7 @@
 
 ## Goal
 
-VibeBus coordinates independent Codex top-level tasks without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, task/thread associations, dependencies, reservations, artifacts, subscriptions, and audit events.
+VibeBus coordinates independent Codex top-level tasks without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, task/thread associations, dependencies, reservations, artifacts, confirmed decisions, subscriptions, and audit events.
 
 ## Runtime shape
 
@@ -68,6 +68,7 @@ The serialized secret pair includes a format version and token generation and st
 | `task_thread_bindings` | Historical task-to-Codex-thread associations and unbind time |
 | `reservations` | TTL-backed path intent |
 | `artifacts` | File path, hash, summary, task relation, metadata |
+| `decisions` | Immutable task-scoped confirmed facts, semantic keys, artifact references, and author/timestamp evidence |
 | `idempotency_records` | Operation-scoped request hashes and cached responses |
 | `subscriptions` | Agent-owned filters, committed cursors, pending deliveries, and last-ACK state |
 | `events` | Append-only audit facts |
@@ -107,6 +108,10 @@ The serialized secret pair includes a format version and token generation and st
 26. Operator mutation is CLI-only, requires a real terminal plus exact typed confirmation, and has no MCP tool.
 27. A new retention run requires one unexpired, unconsumed approval for the exact plan and current operator generation.
 28. Approval consumption, retention deletion, audit append, and immutable report storage commit atomically; a completed retry needs no second approval.
+29. A confirmed-decision key identifies one immutable semantic payload project-wide; exact retries return that fact and payload drift conflicts.
+30. Only the owner of a non-terminal task may confirm a decision for it, and referenced task-scoped artifacts cannot belong to another task.
+31. Agent context sync contains only active owned tasks, their direct dependencies, unread directed messages, artifacts related to that scope, and confirmed decisions related to that scope.
+32. Context pagination uses deterministic fact keys rather than database offsets; every returned page obeys both its item limit and serialized-item byte budget.
 
 ## Recovery and retry boundaries
 
@@ -118,7 +123,15 @@ The Windows backend calls `CredWriteW`, `CredReadW`, `CredDeleteW`, and `CredFre
 
 Operator initialization and rotation use the same digest-first/vault-second recovery rule as Agent credentials. Successful storage redacts the operator secret. If the vault write fails after the authoritative generation changes, the interactive response exposes the only usable secret once with an explicit error. `operator restore-credential` accepts that secret through a no-echo TTY prompt, verifies it against the database digest, and repairs the separate vault entry. An operator rotation invalidates every outstanding approval from the previous generation without deleting its audit record. Explicit `operator delete-credential` removes only the current-user vault entry after a real-terminal `delete:<project-id>` confirmation. It deliberately preserves the database digest and generation, causing `ready=false`; this supports verifiable disposable-project cleanup without adding a remote or MCP deletion capability.
 
-Externally retried writes record a canonical JSON request hash and serialized response in the same `BEGIN IMMEDIATE` transaction as the domain mutation. This prevents the common ambiguous-result retry from creating duplicate messages, leases, renewals, or artifacts. Records are deliberately scoped by operation so unrelated APIs may reuse a caller's key. After an explicitly configured idempotency retention window expires, that historical retry guarantee also expires; the cleanup plan reports how many records are affected.
+Externally retried writes record a canonical JSON request hash and serialized response in the same `BEGIN IMMEDIATE` transaction as the domain mutation. This prevents the common ambiguous-result retry from creating duplicate messages, leases, renewals, artifacts, or decisions. Records are deliberately scoped by operation so unrelated APIs may reuse a caller's key. Confirmed decisions retain a second durable semantic-deduplication boundary through their unique project/key pair even after the generic idempotency record expires. After an explicitly configured idempotency retention window expires, the historical request-key guarantee for other operations also expires; the cleanup plan reports how many records are affected.
+
+## Agent context projection
+
+`context sync` is the authenticated task-specific read model. It starts from the Agent's active owned tasks, expands exactly one dependency edge, and then selects unread directed messages plus artifacts and immutable confirmed decisions associated with that task scope. It never returns unrelated tasks, project-global event history, artifact metadata blobs, or artifact file contents. ACKed, read, or closed messages leave the default projection because their receipt state remains durable outside the context page.
+
+Every projected fact has a deterministic category/order key. The continuation cursor encodes the last emitted key, so static pagination does not repeat or skip facts and does not depend on a mutable SQL offset. Concurrent state changes can add or remove later facts; callers should restart from the beginning when they require a fresh atomic view rather than treating a cursor as a database snapshot.
+
+The caller supplies item and serialized-item byte budgets. Task descriptions, blockers, message bodies, and artifact summaries are bounded previews with explicit truncation flags. Decision summaries are bounded at confirmation time, while long evidence stays behind artifact ID/path/hash references. The response reports exact item bytes consumed, whether more facts remain, and the next cursor only when continuation is required.
 
 ## Event consumption
 
@@ -142,7 +155,7 @@ The accepted approval is consumed in the same transaction as deletion, the `rete
 
 Events are pruned only as a contiguous prefix. The planned boundary is the minimum of the age boundary, the slowest committed subscription cursor, and the sequence immediately before the configured recent-event tail. A subscription with cursor `0` therefore blocks event deletion; an unacknowledged pending delivery keeps the same protection until ACK. Each successful cleanup appends a new `retention_applied` audit event after deletion and advances a persistent history floor. Event queries or deliberate subscription replays older than that floor conflict instead of silently returning incomplete history; compact handoff snapshots clamp to the available floor.
 
-Other cleanup domains are independent and age-bounded: idempotency records, closed per-recipient receipts, messages left with no receipts, and unbound history for terminal tasks. Active messages, active task bindings, non-terminal task history, subscriptions, tasks, artifacts, agents, reservations, retention reports, and schema records are not removed. Physical `VACUUM` is deliberately not automatic because it requires a more disruptive exclusive database operation; online backups remain the recovery boundary.
+Other cleanup domains are independent and age-bounded: idempotency records, closed per-recipient receipts, messages left with no receipts, and unbound history for terminal tasks. Active messages, active task bindings, non-terminal task history, subscriptions, tasks, artifacts, confirmed decisions, agents, reservations, retention reports, and schema records are not removed. Physical `VACUUM` is deliberately not automatic because it requires a more disruptive exclusive database operation; online backups remain the recovery boundary.
 
 ## Codex plugin lifecycle
 
@@ -162,7 +175,7 @@ Pull-request CI has read-only repository permission and produces explicitly unsi
 
 Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z` tag must match Cargo and plugin versions. SignTool signs and verifies the binary before staging and the MSI after construction using SHA-256 and an RFC 3161 timestamp. Checksums are calculated only after signing. A job-scoped `GITHUB_TOKEN` with `contents: write` publishes assets; signing material remains only in repository or protected-environment Secrets.
 
-## Deliberate non-goals for 0.8
+## Deliberate non-goals for 0.9
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;

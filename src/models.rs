@@ -164,6 +164,47 @@ pub struct ArtifactView {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionView {
+    pub decision_id: String,
+    pub key: String,
+    pub task_id: String,
+    pub author: String,
+    pub summary: String,
+    pub artifact_ids: Vec<String>,
+    pub confirmed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextScopeView {
+    pub owned_task_ids: Vec<String>,
+    pub direct_dependency_task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextItemView {
+    pub cursor: String,
+    pub kind: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSyncView {
+    pub agent: String,
+    pub scope: ContextScopeView,
+    pub items: Vec<ContextItemView>,
+    pub item_limit: usize,
+    pub byte_budget: usize,
+    pub item_count: usize,
+    pub bytes_used: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorReport {
@@ -179,6 +220,7 @@ pub struct DoctorReport {
     pub tasks: i64,
     pub active_reservations: i64,
     pub artifacts: i64,
+    pub decisions: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
