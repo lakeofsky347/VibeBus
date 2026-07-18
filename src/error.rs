@@ -23,6 +23,12 @@ pub enum BusError {
     #[error("authentication failed for agent: {0}")]
     Unauthorized(String),
 
+    #[error("operator authentication failed")]
+    OperatorUnauthorized,
+
+    #[error("operator approval required: {0}")]
+    OperatorApprovalRequired(String),
+
     #[error("conflict: {0}")]
     Conflict(String),
 

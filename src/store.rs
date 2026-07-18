@@ -15,15 +15,18 @@ use uuid::Uuid;
 use crate::error::{BusError, Result};
 use crate::models::{
     AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, DoctorReport, EventView,
-    HandoffSnapshot, MessageReceipt, MessageView, ProjectMetadata, RecoveryKeyView, ReleaseResult,
-    ReservationView, RetentionCounts, RetentionPlan, RetentionPolicy, RetentionProtectionView,
-    RetentionReport, RetentionStateView, SubscriptionAck, SubscriptionDeliveryView,
-    SubscriptionPeek, SubscriptionPoll, SubscriptionView, TaskThreadBindingView, TaskView,
+    HandoffSnapshot, MessageReceipt, MessageView, OperatorCredentialView, OperatorStatusView,
+    ProjectMetadata, RecoveryKeyView, ReleaseResult, ReservationView, RetentionApprovalView,
+    RetentionCounts, RetentionPlan, RetentionPolicy, RetentionProtectionView, RetentionReport,
+    RetentionStateView, SubscriptionAck, SubscriptionDeliveryView, SubscriptionPeek,
+    SubscriptionPoll, SubscriptionView, TaskThreadBindingView, TaskView,
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const DAY_MS: i64 = 86_400_000;
+const MIN_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 60;
+const MAX_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 3_600;
 const TASK_STATUSES: &[&str] = &[
     "pending",
     "ready",
@@ -2078,6 +2081,179 @@ impl Bus {
         load_retention_state(&self.conn, &self.project.project_id)
     }
 
+    pub fn operator_status(&self) -> Result<OperatorStatusView> {
+        let row: Option<(i64, i64, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT generation, configured_at, rotated_at
+                 FROM operator_credentials WHERE project_id = ?1",
+                params![self.project.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((generation, configured_at, rotated_at)) => OperatorStatusView {
+                configured: true,
+                generation: Some(generation),
+                configured_at: Some(configured_at),
+                rotated_at,
+            },
+            None => OperatorStatusView {
+                configured: false,
+                generation: None,
+                configured_at: None,
+                rotated_at: None,
+            },
+        })
+    }
+
+    pub fn verify_operator_secret(&self, secret: &str) -> Result<i64> {
+        authenticate_operator(&self.conn, &self.project.project_id, secret)
+    }
+
+    pub fn initialize_operator(&mut self) -> Result<OperatorCredentialView> {
+        let now = now_ms();
+        let secret = generate_secret("vbo");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operator_credentials WHERE project_id = ?1)",
+            params![self.project.project_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(BusError::Conflict(
+                "an operator credential is already configured; rotate it instead".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO operator_credentials
+             (project_id, secret_hash, generation, configured_at, rotated_at)
+             VALUES (?1, ?2, 1, ?3, NULL)",
+            params![self.project.project_id, hash_secret(&secret), now],
+        )?;
+        tx.commit()?;
+        Ok(OperatorCredentialView {
+            operator_secret: secret,
+            generation: 1,
+            issued_at: now,
+        })
+    }
+
+    pub fn rotate_operator(&mut self, current_secret: &str) -> Result<OperatorCredentialView> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (secret_hash, generation): (String, i64) = tx
+            .query_row(
+                "SELECT secret_hash, generation FROM operator_credentials WHERE project_id = ?1",
+                params![self.project.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| BusError::Conflict("operator credential is not configured".into()))?;
+        if current_secret.is_empty() || !secret_matches(current_secret, &secret_hash) {
+            return Err(BusError::OperatorUnauthorized);
+        }
+        let secret = generate_secret("vbo");
+        let next_generation = generation + 1;
+        let changed = tx.execute(
+            "UPDATE operator_credentials
+             SET secret_hash = ?1, generation = ?2, rotated_at = ?3
+             WHERE project_id = ?4 AND generation = ?5",
+            params![
+                hash_secret(&secret),
+                next_generation,
+                now,
+                self.project.project_id,
+                generation
+            ],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(
+                "operator credential changed concurrently".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(OperatorCredentialView {
+            operator_secret: secret,
+            generation: next_generation,
+            issued_at: now,
+        })
+    }
+
+    pub fn approve_retention(
+        &mut self,
+        operator_secret: &str,
+        policy: &RetentionPolicy,
+        confirmed_plan_id: &str,
+        ttl_seconds: i64,
+    ) -> Result<RetentionApprovalView> {
+        validate_retention_policy(policy)?;
+        validate_retention_plan_id(confirmed_plan_id)?;
+        validate_operator_approval_ttl(ttl_seconds)?;
+        let now = now_ms();
+        let expires_at = now
+            .checked_add(ttl_seconds.checked_mul(1_000).ok_or_else(|| {
+                BusError::Validation("operator approval TTL is outside timestamp range".into())
+            })?)
+            .ok_or_else(|| {
+                BusError::Validation("operator approval expiry is outside timestamp range".into())
+            })?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation = authenticate_operator(&tx, &self.project.project_id, operator_secret)?;
+        let already_applied: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM retention_runs WHERE project_id = ?1 AND plan_id = ?2
+             )",
+            params![self.project.project_id, confirmed_plan_id],
+            |row| row.get(0),
+        )?;
+        if already_applied {
+            return Err(BusError::Conflict(format!(
+                "retention plan '{confirmed_plan_id}' has already been applied"
+            )));
+        }
+        let plan = build_retention_plan(&tx, &self.project.project_id, policy, now)?;
+        if plan.plan_id != confirmed_plan_id {
+            return Err(BusError::Conflict(format!(
+                "retention plan is stale: confirmed '{confirmed_plan_id}', current '{}'",
+                plan.plan_id
+            )));
+        }
+        let approval_id = format!("rap_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO retention_approvals
+             (id, project_id, plan_id, operator_generation, policy_json, approved_at,
+              expires_at, consumed_at, consumed_by_agent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+            params![
+                approval_id,
+                self.project.project_id,
+                confirmed_plan_id,
+                generation,
+                serde_json::to_string(policy)?,
+                now,
+                expires_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(RetentionApprovalView {
+            approval_id,
+            plan_id: confirmed_plan_id.to_owned(),
+            operator_generation: generation,
+            approved_at: now,
+            expires_at,
+            consumed_at: None,
+            consumed_by: None,
+            plan,
+        })
+    }
+
     pub fn plan_retention(
         &self,
         agent: &str,
@@ -2085,6 +2261,14 @@ impl Bus {
         policy: &RetentionPolicy,
     ) -> Result<RetentionPlan> {
         self.authenticate(agent, token)?;
+        validate_retention_policy(policy)?;
+        build_retention_plan(&self.conn, &self.project.project_id, policy, now_ms())
+    }
+
+    pub fn preview_retention_for_operator(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<RetentionPlan> {
         validate_retention_policy(policy)?;
         build_retention_plan(&self.conn, &self.project.project_id, policy, now_ms())
     }
@@ -2097,11 +2281,7 @@ impl Bus {
         confirmed_plan_id: &str,
     ) -> Result<RetentionReport> {
         validate_retention_policy(policy)?;
-        if !confirmed_plan_id.starts_with("rtp_") || confirmed_plan_id.len() != 68 {
-            return Err(BusError::Validation(
-                "retention confirmation must be a plan ID returned by retention plan".into(),
-            ));
-        }
+        validate_retention_plan_id(confirmed_plan_id)?;
         let actor = self.authenticate(agent, token)?;
         let now = now_ms();
         let tx = self
@@ -2135,6 +2315,27 @@ impl Bus {
                 plan.plan_id
             )));
         }
+
+        let approval: Option<String> = tx
+            .query_row(
+                "SELECT approval.id
+                 FROM retention_approvals approval
+                 JOIN operator_credentials operator
+                   ON operator.project_id = approval.project_id
+                  AND operator.generation = approval.operator_generation
+                 WHERE approval.project_id = ?1 AND approval.plan_id = ?2
+                   AND approval.consumed_at IS NULL AND approval.expires_at >= ?3
+                 ORDER BY approval.approved_at DESC, approval.id DESC
+                 LIMIT 1",
+                params![self.project.project_id, confirmed_plan_id, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let approval_id = approval.ok_or_else(|| {
+            BusError::OperatorApprovalRequired(format!(
+                "plan '{confirmed_plan_id}' needs an unexpired interactive CLI approval"
+            ))
+        })?;
 
         let deleted_events = tx.execute(
             "DELETE FROM events
@@ -2217,6 +2418,7 @@ impl Bus {
             "retention_plan",
             &plan.plan_id,
             json!({
+                "operatorApprovalId": &approval_id,
                 "policy": &plan.policy,
                 "deleted": &deleted,
                 "eventsPrunedThroughSequence": plan.protection.event_prune_through_sequence
@@ -2224,19 +2426,33 @@ impl Bus {
         )?;
         let report = RetentionReport {
             plan_id: plan.plan_id.clone(),
+            operator_approval_id: Some(approval_id.clone()),
             applied_at: now,
             deleted,
             events_pruned_through_sequence: plan.protection.event_prune_through_sequence,
             replayed: false,
         };
+        let consumed = tx.execute(
+            "UPDATE retention_approvals
+             SET consumed_at = ?1, consumed_by_agent_id = ?2
+             WHERE id = ?3 AND project_id = ?4 AND consumed_at IS NULL",
+            params![now, actor.id, approval_id, self.project.project_id],
+        )?;
+        if consumed != 1 {
+            return Err(BusError::Conflict(
+                "operator approval changed concurrently".into(),
+            ));
+        }
         tx.execute(
             "INSERT INTO retention_runs
-             (project_id, plan_id, actor_agent_id, policy_json, report_json, applied_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (project_id, plan_id, actor_agent_id, operator_approval_id,
+              policy_json, report_json, applied_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 self.project.project_id,
                 plan.plan_id,
                 actor.id,
+                approval_id,
                 serde_json::to_string(&plan.policy)?,
                 serde_json::to_string(&report)?,
                 now
@@ -2627,12 +2843,34 @@ impl Bus {
                 project_id TEXT NOT NULL,
                 plan_id TEXT NOT NULL,
                 actor_agent_id TEXT NOT NULL,
+                operator_approval_id TEXT,
                 policy_json TEXT NOT NULL,
                 report_json TEXT NOT NULL,
                 applied_at INTEGER NOT NULL,
                 PRIMARY KEY(project_id, plan_id),
                 FOREIGN KEY(project_id) REFERENCES projects(id),
                 FOREIGN KEY(actor_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS operator_credentials (
+                project_id TEXT PRIMARY KEY,
+                secret_hash TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation >= 1),
+                configured_at INTEGER NOT NULL,
+                rotated_at INTEGER,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+             );
+             CREATE TABLE IF NOT EXISTS retention_approvals (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                operator_generation INTEGER NOT NULL CHECK(operator_generation >= 1),
+                policy_json TEXT NOT NULL,
+                approved_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL CHECK(expires_at > approved_at),
+                consumed_at INTEGER,
+                consumed_by_agent_id TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(consumed_by_agent_id) REFERENCES agents(id)
              );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency
                 ON events(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -2653,7 +2891,9 @@ impl Bus {
              CREATE INDEX IF NOT EXISTS idx_subscriptions_agent
                 ON subscriptions(project_id, agent_id, name);
              CREATE INDEX IF NOT EXISTS idx_retention_runs_applied
-                ON retention_runs(project_id, applied_at);",
+                ON retention_runs(project_id, applied_at);
+             CREATE INDEX IF NOT EXISTS idx_retention_approvals_active
+                ON retention_approvals(project_id, plan_id, consumed_at, expires_at);",
         )?;
         ensure_column(&self.conn, "agents", "recovery_hash", "TEXT")?;
         ensure_column(
@@ -2690,6 +2930,7 @@ impl Bus {
             "INTEGER",
         )?;
         ensure_column(&self.conn, "subscriptions", "last_acked_at", "INTEGER")?;
+        ensure_column(&self.conn, "retention_runs", "operator_approval_id", "TEXT")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![SCHEMA_VERSION, now_ms()],
@@ -2863,6 +3104,50 @@ fn validate_retention_policy(policy: &RetentionPolicy) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_retention_plan_id(plan_id: &str) -> Result<()> {
+    let valid = plan_id.starts_with("rtp_")
+        && plan_id.len() == 68
+        && plan_id[4..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "retention confirmation must be a plan ID returned by retention plan".into(),
+        ))
+    }
+}
+
+fn validate_operator_approval_ttl(ttl_seconds: i64) -> Result<()> {
+    if (MIN_OPERATOR_APPROVAL_TTL_SECONDS..=MAX_OPERATOR_APPROVAL_TTL_SECONDS)
+        .contains(&ttl_seconds)
+    {
+        Ok(())
+    } else {
+        Err(BusError::Validation(format!(
+            "operator approval TTL must be between {MIN_OPERATOR_APPROVAL_TTL_SECONDS} and {MAX_OPERATOR_APPROVAL_TTL_SECONDS} seconds"
+        )))
+    }
+}
+
+fn authenticate_operator(connection: &Connection, project_id: &str, secret: &str) -> Result<i64> {
+    let row: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT secret_hash, generation FROM operator_credentials WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (secret_hash, generation) = row.ok_or_else(|| {
+        BusError::OperatorApprovalRequired("operator credential is not configured".into())
+    })?;
+    if secret.is_empty() || !secret_matches(secret, &secret_hash) {
+        return Err(BusError::OperatorUnauthorized);
+    }
+    Ok(generation)
 }
 
 fn retention_cutoff(now: i64, days: i64) -> Result<i64> {

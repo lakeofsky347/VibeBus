@@ -45,6 +45,14 @@ Bearer and recovery secrets remain outside this database. When storage is explic
 VibeBus:<project-id>:<agent-name>
 ```
 
+Destructive maintenance uses a distinct project operator target:
+
+```text
+VibeBusOperator:<project-id>
+```
+
+The operator is intentionally not an Agent role. Its CLI-only interactive capability approves a single exact retention plan for a short window; MCP can plan and apply but cannot initialize, rotate, restore, delete, or approve the operator credential.
+
 The serialized secret pair includes a format version and token generation and stays below the Windows 2,560-byte Generic Credential BLOB limit. `CRED_PERSIST_LOCAL_MACHINE` makes it available to later local logon sessions of the same Windows user, not to other users or machines.
 
 ## Data model
@@ -65,6 +73,8 @@ The serialized secret pair includes a format version and token generation and st
 | `events` | Append-only audit facts |
 | `retention_state` | Retained event-history floor and latest applied plan |
 | `retention_runs` | Retry-safe immutable cleanup reports keyed by confirmation plan |
+| `operator_credentials` | Project operator secret digest, generation, and rotation timestamps |
+| `retention_approvals` | Short-lived plan approvals, generation binding, and atomic consumption audit |
 | `schema_migrations` | Applied database schema versions |
 
 ## Invariants
@@ -94,6 +104,9 @@ The serialized secret pair includes a format version and token generation and st
 23. A credential target is scoped by both project ID and validated Agent name, so identities with the same name in different projects do not collide.
 24. A successful stored-secret delivery omits bearer and recovery values; a failed post-rotation write returns the only usable pair with an explicit storage error instead of stranding the identity.
 25. Explicit token input wins over environment input, which wins over current-user vault fallback; recovery-key fallback comes only from the matching vault entry.
+26. Operator mutation is CLI-only, requires a real terminal plus exact typed confirmation, and has no MCP tool.
+27. A new retention run requires one unexpired, unconsumed approval for the exact plan and current operator generation.
+28. Approval consumption, retention deletion, audit append, and immutable report storage commit atomically; a completed retry needs no second approval.
 
 ## Recovery and retry boundaries
 
@@ -102,6 +115,8 @@ Bearer tokens and recovery keys are generated from independent random UUID mater
 The credential-vault layer is outside the domain transaction. Register, recover, and provision first commit the authoritative digest state, then write the returned pair to the OS vault. On success, the response is redacted. If that second write fails, suppressing the secrets would make the newly committed identity unrecoverable, so the response deliberately falls back to the plaintext pair plus `credentialStorageError` and `secretsRedacted=false`. When recovery or provisioning itself used a vault secret, the rotated pair is automatically written back so the single-use recovery key cannot become stale.
 
 The Windows backend calls `CredWriteW`, `CredReadW`, `CredDeleteW`, and `CredFree` directly. Tests inject an in-memory implementation and never touch a developer's real credentials. The vault is an at-rest and accidental-disclosure boundary, not a sandbox between processes already running as the same Windows user.
+
+Operator initialization and rotation use the same digest-first/vault-second recovery rule as Agent credentials. Successful storage redacts the operator secret. If the vault write fails after the authoritative generation changes, the interactive response exposes the only usable secret once with an explicit error. `operator restore-credential` accepts that secret through a no-echo TTY prompt, verifies it against the database digest, and repairs the separate vault entry. An operator rotation invalidates every outstanding approval from the previous generation without deleting its audit record. Explicit `operator delete-credential` removes only the current-user vault entry after a real-terminal `delete:<project-id>` confirmation. It deliberately preserves the database digest and generation, causing `ready=false`; this supports verifiable disposable-project cleanup without adding a remote or MCP deletion capability.
 
 Externally retried writes record a canonical JSON request hash and serialized response in the same `BEGIN IMMEDIATE` transaction as the domain mutation. This prevents the common ambiguous-result retry from creating duplicate messages, leases, renewals, or artifacts. Records are deliberately scoped by operation so unrelated APIs may reuse a caller's key. After an explicitly configured idempotency retention window expires, that historical retry guarantee also expires; the cleanup plan reports how many records are affected.
 
@@ -121,7 +136,9 @@ A task owner may bind a non-terminal task to one caller-supplied Codex task/thre
 
 ## Bounded retention
 
-Retention is an explicit authenticated two-phase operation. Preview calculates cutoffs and exact candidate counts, then hashes the policy, current event tail, subscription protection boundary, retained-history floor, and candidates into a `planId`. Apply opens `BEGIN IMMEDIATE`, recomputes that plan, and refuses a stale ID before deleting anything. A completed run is stored separately so an ambiguous external retry returns the original report with `replayed=true`.
+Retention is an explicit three-gate operation. An authenticated Agent preview calculates cutoffs and exact candidate counts, then hashes the policy, current event tail, subscription protection boundary, retained-history floor, and candidates into a `planId`. A local operator reviews and interactively authorizes that exact ID for 60–3,600 seconds. Apply opens `BEGIN IMMEDIATE`, recomputes the plan, requires an active approval at the current operator generation, and refuses stale or unapproved work before deletion. Approval bookkeeping deliberately does not append a domain event because that would invalidate its own plan.
+
+The accepted approval is consumed in the same transaction as deletion, the `retention_applied` event, and the immutable run report. Concurrent attempts serialize; after one commits, another sees and replays the stored report. This ambiguous-result recovery path does not require a second approval and cannot execute the deletion twice.
 
 Events are pruned only as a contiguous prefix. The planned boundary is the minimum of the age boundary, the slowest committed subscription cursor, and the sequence immediately before the configured recent-event tail. A subscription with cursor `0` therefore blocks event deletion; an unacknowledged pending delivery keeps the same protection until ACK. Each successful cleanup appends a new `retention_applied` audit event after deletion and advances a persistent history floor. Event queries or deliberate subscription replays older than that floor conflict instead of silently returning incomplete history; compact handoff snapshots clamp to the available floor.
 
@@ -145,7 +162,7 @@ Pull-request CI has read-only repository permission and produces explicitly unsi
 
 Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z` tag must match Cargo and plugin versions. SignTool signs and verifies the binary before staging and the MSI after construction using SHA-256 and an RFC 3161 timestamp. Checksums are calculated only after signing. A job-scoped `GITHUB_TOKEN` with `contents: write` publishes assets; signing material remains only in repository or protected-environment Secrets.
 
-## Deliberate non-goals for 0.7
+## Deliberate non-goals for 0.8
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;
@@ -156,6 +173,7 @@ Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z`
 - exactly-once consumer side effects; replay-safe delivery is at-least-once until ACK;
 - non-Windows secure-vault backends or cross-device credential recovery;
 - protection against a malicious process already running as the same Windows user;
+- hardware-backed or remote multi-party operator approval; the current gate is a local human-presence and accidental-automation boundary;
 - automatic creation of release tags or unsigned production releases;
 - installer custom actions that silently mutate Codex plugin configuration;
 - bit-for-bit reproducible MSI/ZIP output or private-repository attestations on an ineligible GitHub plan.

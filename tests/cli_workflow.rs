@@ -3,7 +3,7 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use vibebus::initialize_project;
+use vibebus::{Bus, RetentionPolicy, initialize_project};
 
 #[test]
 fn cli_accepts_metadata_file_on_windows_safe_path() {
@@ -416,6 +416,18 @@ fn cli_requires_a_confirmed_retention_plan_and_replays_apply() {
     );
     let plan_id = plan["result"]["planId"].as_str().unwrap();
     assert!(plan_id.starts_with("rtp_"));
+    let policy = RetentionPolicy {
+        event_max_age_days: 1,
+        keep_recent_events: 1,
+        idempotency_max_age_days: 1,
+        closed_message_max_age_days: 1,
+        terminal_binding_max_age_days: 1,
+    };
+    let mut bus = Bus::open(project.path(), Some(data.path())).unwrap();
+    let operator = bus.initialize_operator().unwrap();
+    bus.approve_retention(&operator.operator_secret, &policy, plan_id, 600)
+        .unwrap();
+    drop(bus);
     let applied = run_cli(
         project.path(),
         data.path(),
@@ -472,6 +484,34 @@ fn cli_requires_a_confirmed_retention_plan_and_replays_apply() {
     );
     let status = run_cli(project.path(), data.path(), &["retention", "status"]);
     assert_eq!(status["result"]["lastPlanId"], plan_id);
+}
+
+#[test]
+fn operator_mutations_reject_redirected_noninteractive_cli_calls() {
+    let project = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    initialize_project(project.path(), "CLI operator", Some(data.path())).unwrap();
+    for command in ["init", "delete-credential"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_vibebus"))
+            .arg("--root")
+            .arg(project.path())
+            .arg("--data-home")
+            .arg(data.path())
+            .args(["operator", command])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["kind"], "validation");
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("interactive terminal")
+        );
+    }
+    let bus = Bus::open(project.path(), Some(data.path())).unwrap();
+    assert!(!bus.operator_status().unwrap().configured);
 }
 
 fn run_cli(project: &std::path::Path, data: &std::path::Path, args: &[&str]) -> Value {

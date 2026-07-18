@@ -412,6 +412,8 @@ fn retention_is_previewed_subscription_safe_stale_checked_and_replayable() {
     let harness = Harness::new();
     let mut bus = harness.bus();
     let owner = bus.register_agent("retention-owner", "operations").unwrap();
+    let operator = bus.initialize_operator().unwrap();
+    assert!(bus.operator_status().unwrap().configured);
     bus.create_subscription(
         "retention-owner",
         &owner.token,
@@ -553,6 +555,24 @@ fn retention_is_previewed_subscription_safe_stale_checked_and_replayable() {
         applicable.protection.event_prune_through_sequence
             <= applicable.protection.safe_event_sequence
     );
+    assert!(matches!(
+        bus.apply_retention(
+            "retention-owner",
+            &owner.token,
+            &policy,
+            &applicable.plan_id,
+        ),
+        Err(BusError::OperatorApprovalRequired(_))
+    ));
+    assert!(matches!(
+        bus.approve_retention("wrong-operator-secret", &policy, &applicable.plan_id, 600),
+        Err(BusError::OperatorUnauthorized)
+    ));
+    let approval = bus
+        .approve_retention(&operator.operator_secret, &policy, &applicable.plan_id, 600)
+        .unwrap();
+    assert_eq!(approval.plan.candidates, applicable.candidates);
+    assert_eq!(approval.operator_generation, 1);
 
     let barrier = Arc::new(Barrier::new(3));
     let handles = (0..2)
@@ -580,6 +600,10 @@ fn retention_is_previewed_subscription_safe_stale_checked_and_replayable() {
     assert_eq!(reports.iter().filter(|report| !report.replayed).count(), 1);
     let applied = reports.iter().find(|report| !report.replayed).unwrap();
     assert_eq!(applied.deleted, applicable.candidates);
+    assert_eq!(
+        applied.operator_approval_id.as_deref(),
+        Some(approval.approval_id.as_str())
+    );
     let changed_retry_policy = RetentionPolicy {
         event_max_age_days: 2,
         ..policy.clone()
@@ -634,6 +658,116 @@ fn retention_is_previewed_subscription_safe_stale_checked_and_replayable() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn operator_approval_is_generation_bound_expiring_and_replay_safe() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let agent = bus.register_agent("operator-agent", "operations").unwrap();
+    let first_operator = bus.initialize_operator().unwrap();
+    assert!(matches!(
+        bus.initialize_operator(),
+        Err(BusError::Conflict(_))
+    ));
+    let policy = RetentionPolicy::default();
+    let plan = bus
+        .plan_retention("operator-agent", &agent.token, &policy)
+        .unwrap();
+    assert!(matches!(
+        bus.approve_retention(&first_operator.operator_secret, &policy, &plan.plan_id, 59,),
+        Err(BusError::Validation(_))
+    ));
+    assert!(matches!(
+        bus.approve_retention(
+            &first_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            3_601,
+        ),
+        Err(BusError::Validation(_))
+    ));
+    let stale_generation_approval = bus
+        .approve_retention(&first_operator.operator_secret, &policy, &plan.plan_id, 600)
+        .unwrap();
+    let second_operator = bus
+        .rotate_operator(&first_operator.operator_secret)
+        .unwrap();
+    assert_eq!(second_operator.generation, 2);
+    assert!(matches!(
+        bus.rotate_operator(&first_operator.operator_secret),
+        Err(BusError::OperatorUnauthorized)
+    ));
+    assert!(matches!(
+        bus.apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id),
+        Err(BusError::OperatorApprovalRequired(_))
+    ));
+
+    let expired_approval = bus
+        .approve_retention(
+            &second_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            600,
+        )
+        .unwrap();
+    let database = Connection::open(bus.database_path()).unwrap();
+    database
+        .execute(
+            "UPDATE retention_approvals SET approved_at = 0, expires_at = 1 WHERE id = ?1",
+            [expired_approval.approval_id.as_str()],
+        )
+        .unwrap();
+    drop(database);
+    assert!(matches!(
+        bus.apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id),
+        Err(BusError::OperatorApprovalRequired(_))
+    ));
+
+    let active_approval = bus
+        .approve_retention(
+            &second_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            600,
+        )
+        .unwrap();
+    let applied = bus
+        .apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id)
+        .unwrap();
+    assert_eq!(
+        applied.operator_approval_id.as_deref(),
+        Some(active_approval.approval_id.as_str())
+    );
+    assert_ne!(
+        applied.operator_approval_id.as_deref(),
+        Some(stale_generation_approval.approval_id.as_str())
+    );
+    let replayed = bus
+        .apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id)
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.operator_approval_id, applied.operator_approval_id);
+    assert!(matches!(
+        bus.approve_retention(
+            &second_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            600,
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let database = Connection::open(bus.database_path()).unwrap();
+    let consumed: (Option<i64>, Option<String>) = database
+        .query_row(
+            "SELECT consumed_at, consumed_by_agent_id FROM retention_approvals WHERE id = ?1",
+            [active_approval.approval_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(consumed.0.is_some());
+    assert!(consumed.1.is_some());
 }
 
 #[test]
@@ -860,7 +994,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 8);
+    assert_eq!(doctor.schema_version, 9);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -1030,6 +1164,26 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
     assert!(retention_run_columns.contains(&"report_json".to_owned()));
+    assert!(retention_run_columns.contains(&"operator_approval_id".to_owned()));
+    let operator_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(operator_credentials)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(operator_columns.contains(&"secret_hash".to_owned()));
+    assert!(operator_columns.contains(&"generation".to_owned()));
+    let approval_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(retention_approvals)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(approval_columns.contains(&"operator_generation".to_owned()));
+    assert!(approval_columns.contains(&"consumed_at".to_owned()));
+    assert_eq!(bus.doctor().unwrap().schema_version, 9);
 }
 
 #[test]

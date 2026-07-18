@@ -1,6 +1,6 @@
 # Release engineering
 
-VibeBus 0.7 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
+VibeBus 0.8 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
 
 ## Outputs
 
@@ -94,4 +94,4 @@ Creating and pushing a release tag is an explicit maintainer action. The workflo
 - The current pipeline accepts PFX-based SignTool signing because it works with GitHub-hosted Windows runners and any compatible certificate authority. Azure Trusted Signing or hardware-backed signing can replace only the signing step later.
 - Packages are repeatably produced from the same scripts and locked dependencies, but are not claimed to be bit-for-bit reproducible because MSI product codes, archive metadata, and signing timestamps can differ.
 - GitHub artifact attestations are not enabled. The repository is private, and private-repository attestations require an eligible GitHub Enterprise Cloud plan. Add them when the repository plan and verification policy support them.
-- No real production certificate, tag, or GitHub Release was used during the 0.7 implementation acceptance. The unsigned local package path and fail-closed missing-secret boundary are the currently verified states.
+- No real production certificate, tag, or GitHub Release was used during the 0.8 implementation acceptance. The unsigned local package path and fail-closed missing-secret boundary are the currently verified states.

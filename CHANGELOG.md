@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0 - 2026-07-17
+
+- Added a project-scoped operator credential whose secret digest is isolated from Agent bearer credentials and whose secret is stored under a distinct Windows Credential Manager target.
+- Added CLI-only interactive operator initialization, rotation, vault restoration, explicit vault deletion, status, and retention-plan approval; redirected input, MCP, and normal automation cannot perform operator mutations.
+- Required every new retention apply to consume one unexpired approval bound to the exact plan ID and current operator generation.
+- Preserved ambiguous-result retry recovery: a completed retention run replays its stored report without requiring or consuming a second approval.
+- Added schema-v9 operator credential and retention approval audit tables plus approval linkage in retention reports and runs.
+- Added migration, expiration, rotation invalidation, concurrent single-consumption, vault redaction/restoration/deletion, noninteractive rejection, CLI, and MCP boundary coverage.
+
 ## 0.7.0 - 2026-07-17
 
 - Added Windows GitHub Actions CI for formatting, locked tests, Clippy-as-error, plugin packaging, MSI validation, administrative extraction, and short-lived workflow artifacts.
