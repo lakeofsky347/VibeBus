@@ -6,7 +6,7 @@ VibeBus online backups are consistent SQLite recovery points. A usable export co
 2. the database produced by `vibebus backup`;
 3. the returned SHA-256 digest and byte count in an external recovery inventory.
 
-The database contains Agent and Operator credential digests, not the secrets stored in Windows Credential Manager. A move to another Windows user or host therefore also requires a separately retained Agent recovery key or another explicit identity-recovery decision. Never add bearer tokens, recovery keys, Operator secrets, vault exports, signing credentials, or cloud credentials to the recovery bundle.
+The database contains Agent and Operator credential digests, not the secrets stored in Windows Credential Manager or macOS Keychain. A move to another user or host therefore also requires a separately retained Agent recovery key or another explicit identity-recovery decision. Never add bearer tokens, recovery keys, Operator secrets, vault exports, signing credentials, or cloud credentials to the recovery bundle.
 
 ## Automated disposable drill
 

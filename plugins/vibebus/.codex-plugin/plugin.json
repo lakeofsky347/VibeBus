@@ -14,7 +14,7 @@
   "interface": {
     "displayName": "VibeBus",
     "shortDescription": "Coordinate independent Codex tasks",
-    "longDescription": "Use a local SQLite fact bus and Windows current-user credential vault for recoverable agents, responsibility-domain policy, bounded Git/test lifecycle facts, directed message lifecycles, atomically claimed tasks, Codex thread bindings, renewable file reservations, replay-safe event subscriptions, operator-approved bounded retention, and structured handoffs across independent Codex tasks.",
+    "longDescription": "Use a local SQLite fact bus with Windows Credential Manager or macOS Keychain for recoverable agents, responsibility-domain policy, bounded Git/test lifecycle facts, directed message lifecycles, atomically claimed tasks, Codex thread bindings, renewable file reservations, replay-safe event subscriptions, operator-approved bounded retention, and structured handoffs across independent Codex tasks.",
     "developerName": "VibeBus Contributors",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],

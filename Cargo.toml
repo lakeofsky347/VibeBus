@@ -23,6 +23,11 @@ uuid = { version = "1.24.0", features = ["v4", "serde"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = "3.7.0"
+security-framework-sys = "2.17.0"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 

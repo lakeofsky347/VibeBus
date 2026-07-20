@@ -8,11 +8,11 @@ VibeBus coordinates independent Codex top-level tasks without collapsing their c
 
 ```mermaid
 flowchart LR
-    A["Codex task A"] -->|MCP or CLI| X["vibebus.exe"]
+    A["Codex task A"] -->|MCP or CLI| X["vibebus"]
     B["Codex task B"] -->|MCP or CLI| X
     C["Codex task C"] -->|MCP or CLI| X
     X --> D["Project SQLite database in WAL mode"]
-    X --> V["Windows Credential Manager<br/>current-user Generic Credentials"]
+    X --> V["Windows Credential Manager<br/>or macOS Keychain"]
     R["Repository .vibebus/project.json"] --> X
 ```
 
@@ -35,11 +35,12 @@ The database is outside the repository by default:
 
 ```text
 %LOCALAPPDATA%\VibeBus\projects\<project-id>\vibebus.db
+~/Library/Application Support/dev.VibeBus.VibeBus/projects/<project-id>/vibebus.db
 ```
 
 `VIBEBUS_DATA_HOME` or `--data-home` can override the base directory for testing and controlled deployments.
 
-Bearer and recovery secrets remain outside this database. When storage is explicitly requested, Windows Credential Manager receives one current-user Generic Credential per project/Agent target:
+Bearer and recovery secrets remain outside this database. When storage is explicitly requested, Windows Credential Manager or macOS Keychain receives one current-user entry per project/Agent target:
 
 ```text
 VibeBus:<project-id>:<agent-name>
@@ -53,7 +54,7 @@ VibeBusOperator:<project-id>
 
 The operator is intentionally not an Agent role. Its CLI-only interactive capability approves a single exact retention plan for a short window and directly authorizes an explicitly confirmed offline compaction. MCP can plan and apply logical retention but cannot initialize, rotate, restore, delete, approve, or compact.
 
-The serialized secret pair includes a format version and token generation and stays below the Windows 2,560-byte Generic Credential BLOB limit. `CRED_PERSIST_LOCAL_MACHINE` makes it available to later local logon sessions of the same Windows user, not to other users or machines.
+The serialized secret pair includes a format version and token generation. On Windows it stays below the 2,560-byte Generic Credential BLOB limit, and `CRED_PERSIST_LOCAL_MACHINE` makes it available to later local logon sessions of the same Windows user. On macOS it is a generic-password value stored by Security.framework under account `VibeBus`. Neither backend makes credentials available to other users or machines.
 
 ## Data model
 
@@ -130,7 +131,7 @@ Bearer tokens and recovery keys are generated from independent random UUID mater
 
 The credential-vault layer is outside the domain transaction. Register, recover, and provision first commit the authoritative digest state, then write the returned pair to the OS vault. On success, the response is redacted. If that second write fails, suppressing the secrets would make the newly committed identity unrecoverable, so the response deliberately falls back to the plaintext pair plus `credentialStorageError` and `secretsRedacted=false`. When recovery or provisioning itself used a vault secret, the rotated pair is automatically written back so the single-use recovery key cannot become stale.
 
-The Windows backend calls `CredWriteW`, `CredReadW`, `CredDeleteW`, and `CredFree` directly. Tests inject an in-memory implementation and never touch a developer's real credentials. The vault is an at-rest and accidental-disclosure boundary, not a sandbox between processes already running as the same Windows user.
+The Windows backend calls `CredWriteW`, `CredReadW`, `CredDeleteW`, and `CredFree` directly. The macOS backend uses Security.framework generic-password set/get/delete operations, maps missing items to normal absent status, and suppresses interactive authentication UI so a CLI, MCP server, or Hook fails closed instead of hanging when its code signature is not authorized for an older item. Unit tests inject an in-memory implementation; the repository macOS acceptance fixture separately creates and removes a disposable real Keychain entry. The vault is an at-rest and accidental-disclosure boundary, not a sandbox between processes already running as the same OS user.
 
 Operator initialization and rotation use the same digest-first/vault-second recovery rule as Agent credentials. Successful storage redacts the operator secret. If the vault write fails after the authoritative generation changes, the interactive response exposes the only usable secret once with an explicit error. `operator restore-credential` accepts that secret through a no-echo TTY prompt, verifies it against the database digest, and repairs the separate vault entry. An operator rotation invalidates every outstanding approval from the previous generation without deleting its audit record. Explicit `operator delete-credential` removes only the current-user vault entry after a real-terminal `delete:<project-id>` confirmation. It deliberately preserves the database digest and generation, causing `ready=false`; this supports verifiable disposable-project cleanup without adding a remote or MCP deletion capability.
 
@@ -170,7 +171,7 @@ Other cleanup domains are independent and age-bounded: idempotency records, clos
 
 ## Offline compaction
 
-`maintenance compact --backup <new-path>` is intentionally absent from MCP and handled before the normal connection/migration path. The maintainer must stop every CLI, MCP, Hook, and Codex task for the project, use a real terminal to type `compact:<project-id>`, and have the current Operator credential in the Windows vault. The core then opens the existing database read/write without creating or migrating it, sets zero busy timeout, checkpoints WAL, retains an exclusive lock, switches to DELETE journaling, verifies current schema/project/Operator identity, and refuses any non-terminal task, active task binding, or unexpired reservation.
+`maintenance compact --backup <new-path>` is intentionally absent from MCP and handled before the normal connection/migration path. The maintainer must stop every CLI, MCP, Hook, and Codex task for the project, use a real terminal to type `compact:<project-id>`, and have the current Operator credential in the platform vault. The core then opens the existing database read/write without creating or migrating it, sets zero busy timeout, checkpoints WAL, retains an exclusive lock, switches to DELETE journaling, verifies current schema/project/Operator identity, and refuses any non-terminal task, active task binding, or unexpired reservation.
 
 Before `VACUUM`, VibeBus creates a new non-overwriting SQLite backup, verifies its integrity, foreign keys, schema, and project identity, and requires at least twice the current database size free beside the live database. It records a bounded start event, runs `VACUUM` under the exclusive boundary, restores WAL, records completion, checkpoints, and returns before/after file hashes, sizes, page/freelist counts, reclaimed bytes, backup identity, Operator generation, and final verification. On failure after the journal switch it best-effort restores WAL; the verified backup remains the recovery boundary. Repository acceptance invokes the core only against disposable project/data directories, never the live coordination database.
 
@@ -180,13 +181,13 @@ The plugin contains:
 
 - `.mcp.json`, which launches the packaged native executable with `mcp`;
 - `skills/vibebus-coordination/SKILL.md`, which defines the coordination discipline;
-- `hooks/hooks.json`, which runs Windows SessionStart discovery, Bash PostToolUse fact capture, and Stop proposal generation.
+- `hooks/hooks.json`, which runs PowerShell implementations on Windows and native-binary SessionStart/PostToolUse/Stop implementations on macOS/Unix.
 
 The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call. Hook commands receive `PLUGIN_ROOT` and writable `PLUGIN_DATA`, require Codex trust review, and run at the session working directory. PostToolUse resolves only an active task/thread binding, reliable exit metadata, commit identity/subject/path names, and a hashed working state; Stop calls the bounded proposal read model and writes it under plugin data. Neither Hook reads the unstable transcript format, and Stop emits no continuation or automatic message mutation.
 
 ## Release supply chain
 
-Rust 1.97.1 and Cargo.lock define the native build inputs. A repository-owned PowerShell path packages the release binary into the plugin, validates its manifest/MCP/Hook/Skill contract, stages one marketplace-shaped payload, and uses pinned WiX 4.0.6 to produce a per-user x64 MSI. The same staged payload feeds the portable and plugin archives, so the three distribution formats share one binary and plugin tree.
+Rust 1.97.1 and Cargo.lock define the native build inputs. A repository-owned PowerShell path packages Windows, validates the manifest/MCP/Hook/Skill contract, and uses pinned WiX 4.0.6 to produce a per-user x64 MSI. The macOS path builds a native host-architecture Mach-O, applies an ad-hoc local signature, stages a macOS MCP payload, validates it, and emits portable/plugin archives plus checksums and a manifest. Developer ID signing, hardened runtime, notarization, and downloaded-artifact Gatekeeper acceptance remain explicit production gates.
 
 Pull-request CI has read-only repository permission and produces explicitly unsigned, short-lived acceptance artifacts. It runs stock MSI validation except the irrelevant per-machine-only ICE91 rule, creates an administrative image, verifies the expected payload and binary version, and cleans the image.
 
@@ -201,8 +202,8 @@ Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z`
 - automatic Git merging or conflict resolution;
 - holding secrets in repository files;
 - exactly-once consumer side effects; replay-safe delivery is at-least-once until ACK;
-- non-Windows secure-vault backends or cross-device credential recovery;
-- protection against a malicious process already running as the same Windows user;
+- Linux secure-vault backends or cross-device credential recovery;
+- protection against a malicious process already running as the same OS user;
 - hardware-backed or remote multi-party operator approval; the current gate is a local human-presence and accidental-automation boundary;
 - automatic creation of release tags or unsigned production releases;
 - installer custom actions that silently mutate Codex plugin configuration;

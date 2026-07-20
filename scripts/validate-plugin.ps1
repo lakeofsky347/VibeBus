@@ -72,6 +72,9 @@ $windowsCommand = [string]$sessionStart[0].hooks[0].commandWindows
 if ($windowsCommand -notmatch 'session-start\.ps1') {
     throw "SessionStart hook must invoke session-start.ps1 on Windows."
 }
+if ([string]$sessionStart[0].hooks[0].command -notmatch 'vibebus.*hook session-start') {
+    throw "SessionStart hook must invoke the native VibeBus hook on Unix."
+}
 Require-Path (Join-Path $PluginRoot "scripts\session-start.ps1") "SessionStart script"
 $postToolUse = @($hooks.hooks.PostToolUse)
 if ($postToolUse.Count -ne 1 -or $postToolUse[0].matcher -ne "^Bash$") {
@@ -80,9 +83,15 @@ if ($postToolUse.Count -ne 1 -or $postToolUse[0].matcher -ne "^Bash$") {
 if ([string]$postToolUse[0].hooks[0].commandWindows -notmatch 'post-tool-facts\.ps1') {
     throw "PostToolUse hook must invoke post-tool-facts.ps1 on Windows."
 }
+if ([string]$postToolUse[0].hooks[0].command -notmatch 'vibebus.*hook post-tool-use') {
+    throw "PostToolUse hook must invoke the native VibeBus hook on Unix."
+}
 $stop = @($hooks.hooks.Stop)
 if ($stop.Count -ne 1 -or [string]$stop[0].hooks[0].commandWindows -notmatch 'stop-handoff\.ps1') {
     throw "Stop hook must invoke stop-handoff.ps1 on Windows."
+}
+if ([string]$stop[0].hooks[0].command -notmatch 'vibebus.*hook stop') {
+    throw "Stop hook must invoke the native VibeBus hook on Unix."
 }
 Require-Path (Join-Path $PluginRoot "scripts\hook-common.ps1") "Hook helper script"
 Require-Path (Join-Path $PluginRoot "scripts\post-tool-facts.ps1") "PostToolUse script"

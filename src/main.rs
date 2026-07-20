@@ -6,10 +6,10 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use vibebus::{
-    Bus, BusError, CredentialVault, Result, RetentionPolicy, SecretSource,
+    Bus, BusError, CodexHook, CredentialVault, Result, RetentionPolicy, SecretSource,
     StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
     operator_credential_delivery, recovery_delivery, recovery_key_delivery, registration_delivery,
-    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret,
+    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret, run_codex_hook,
     system_credential_vault,
 };
 
@@ -120,7 +120,19 @@ enum Command {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
     Mcp,
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    SessionStart,
+    PostToolUse,
+    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -646,6 +658,24 @@ enum MaintenanceCommand {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Hook { command } = &cli.command {
+        let hook = match command {
+            HookCommand::SessionStart => CodexHook::SessionStart,
+            HookCommand::PostToolUse => CodexHook::PostToolUse,
+            HookCommand::Stop => CodexHook::Stop,
+        };
+        return match run_codex_hook(hook) {
+            Ok(Some(value)) => {
+                print_json(&value);
+                ExitCode::SUCCESS
+            }
+            Ok(None) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("VibeBus hook failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if matches!(&cli.command, Command::Mcp) {
         return match run_mcp(cli.root, cli.data_home).await {
             Ok(()) => ExitCode::SUCCESS,
@@ -1300,6 +1330,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Command::Doctor => json!(bus.doctor()?),
         Command::Backup { output } => json!(bus.backup_to(&output)?),
         Command::Maintenance { .. } => unreachable!(),
+        Command::Hook { .. } => unreachable!(),
         Command::Mcp => unreachable!(),
     };
     Ok(json!({"ok": true, "result": result}))

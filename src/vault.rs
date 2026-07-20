@@ -13,6 +13,14 @@ const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 #[cfg(windows)]
 const MAX_CREDENTIAL_BLOB_BYTES: usize =
     windows_sys::Win32::Security::Credentials::CRED_MAX_CREDENTIAL_BLOB_SIZE as usize;
+#[cfg(target_os = "macos")]
+const MACOS_KEYCHAIN_ACCOUNT: &str = "VibeBus";
+#[cfg(target_os = "macos")]
+const ERR_SEC_AUTH_FAILED: i32 = -25293;
+#[cfg(target_os = "macos")]
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+#[cfg(target_os = "macos")]
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -840,7 +848,159 @@ fn win32_error(operation: &str, code: u32) -> BusError {
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+impl CredentialVault for PlatformCredentialVault {
+    fn backend(&self) -> &'static str {
+        "macos-keychain"
+    }
+
+    fn supported(&self) -> bool {
+        true
+    }
+
+    fn store(
+        &self,
+        project_id: &str,
+        agent: &str,
+        credentials: &StoredAgentCredentials,
+    ) -> Result<()> {
+        credentials.validate()?;
+        macos_store(credential_target(project_id, agent)?, credentials)
+    }
+
+    fn load(&self, project_id: &str, agent: &str) -> Result<Option<StoredAgentCredentials>> {
+        let credentials: Option<StoredAgentCredentials> =
+            macos_load(&credential_target(project_id, agent)?)?;
+        if let Some(credentials) = &credentials {
+            credentials.validate()?;
+        }
+        Ok(credentials)
+    }
+
+    fn delete(&self, project_id: &str, agent: &str) -> Result<bool> {
+        macos_delete(&credential_target(project_id, agent)?)
+    }
+
+    fn store_operator(
+        &self,
+        project_id: &str,
+        credential: &StoredOperatorCredential,
+    ) -> Result<()> {
+        credential.validate()?;
+        macos_store(operator_credential_target(project_id)?, credential)
+    }
+
+    fn load_operator(&self, project_id: &str) -> Result<Option<StoredOperatorCredential>> {
+        let credential: Option<StoredOperatorCredential> =
+            macos_load(&operator_credential_target(project_id)?)?;
+        if let Some(credential) = &credential {
+            credential.validate()?;
+        }
+        Ok(credential)
+    }
+
+    fn delete_operator(&self, project_id: &str) -> Result<bool> {
+        macos_delete(&operator_credential_target(project_id)?)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_store<T: Serialize>(target: String, value: &T) -> Result<()> {
+    use security_framework::passwords::set_generic_password_options;
+
+    macos_disable_keychain_ui()?;
+    let mut blob = serde_json::to_vec(value)?;
+    let result = set_generic_password_options(&blob, macos_password_options(&target))
+        .map_err(|error| macos_keychain_error("SecItemAdd/SecItemUpdate", error.code()));
+    blob.fill(0);
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn macos_load<T: for<'de> Deserialize<'de>>(target: &str) -> Result<Option<T>> {
+    use security_framework::passwords::generic_password;
+
+    macos_disable_keychain_ui()?;
+    let mut blob = match generic_password(macos_password_options(target)) {
+        Ok(blob) => blob,
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => return Ok(None),
+        Err(error) => {
+            return Err(macos_keychain_error("SecItemCopyMatching", error.code()));
+        }
+    };
+    let parsed = serde_json::from_slice(&blob).map_err(|error| {
+        BusError::CredentialVault(format!("stored credential is not valid JSON: {error}"))
+    });
+    blob.fill(0);
+    parsed.map(Some)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_delete(target: &str) -> Result<bool> {
+    use security_framework::passwords::delete_generic_password_options;
+
+    macos_disable_keychain_ui()?;
+    match delete_generic_password_options(macos_password_options(target)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(false),
+        Err(error) => Err(macos_keychain_error("SecItemDelete", error.code())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_disable_keychain_ui() -> Result<()> {
+    use security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed;
+
+    let status = unsafe { SecKeychainSetUserInteractionAllowed(0) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(macos_keychain_error(
+            "SecKeychainSetUserInteractionAllowed",
+            status,
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_password_options(target: &str) -> security_framework::passwords::PasswordOptions {
+    use core_foundation::{
+        base::TCFType,
+        string::{CFString, CFStringRef},
+    };
+    use security_framework::passwords::PasswordOptions;
+    use security_framework_sys::item::kSecUseAuthenticationUI;
+
+    // Security.framework defaults to allowing authentication UI. A CLI or Hook must instead
+    // fail closed so an inaccessible item cannot suspend a headless Codex process indefinitely.
+    unsafe extern "C" {
+        static kSecUseAuthenticationUIFail: CFStringRef;
+    }
+
+    let mut options = PasswordOptions::new_generic_password(target, MACOS_KEYCHAIN_ACCOUNT);
+    #[allow(deprecated)]
+    unsafe {
+        options.query.push((
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
+        ));
+    }
+    options
+}
+
+#[cfg(target_os = "macos")]
+fn macos_keychain_error(operation: &str, code: i32) -> BusError {
+    if matches!(code, ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED) {
+        return BusError::CredentialVault(format!(
+            "{operation} failed with macOS Security status {code}: Keychain authorization is unavailable without interactive UI; use the same stable signed VibeBus build that created the item, or explicitly repair/re-register the credential"
+        ));
+    }
+    BusError::CredentialVault(format!(
+        "{operation} failed with macOS Security status {code}"
+    ))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 impl CredentialVault for PlatformCredentialVault {
     fn backend(&self) -> &'static str {
         "unsupported-platform"
@@ -857,7 +1017,7 @@ impl CredentialVault for PlatformCredentialVault {
         _credentials: &StoredAgentCredentials,
     ) -> Result<()> {
         Err(BusError::CredentialVault(
-            "the system credential vault is currently supported only on Windows".into(),
+            "the system credential vault is currently supported only on Windows and macOS".into(),
         ))
     }
 

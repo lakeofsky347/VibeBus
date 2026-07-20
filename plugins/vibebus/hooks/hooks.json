@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "true",
+            "command": "\"$PLUGIN_ROOT/bin/vibebus\" hook session-start",
             "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:PLUGIN_ROOT\\scripts\\session-start.ps1\"",
             "timeout": 10,
             "statusMessage": "Detecting VibeBus project"
@@ -21,7 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "true",
+            "command": "\"$PLUGIN_ROOT/bin/vibebus\" hook post-tool-use",
             "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:PLUGIN_ROOT\\scripts\\post-tool-facts.ps1\"",
             "timeout": 30,
             "statusMessage": "Recording bounded VibeBus lifecycle facts"
@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "true",
+            "command": "\"$PLUGIN_ROOT/bin/vibebus\" hook stop",
             "commandWindows": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:PLUGIN_ROOT\\scripts\\stop-handoff.ps1\"",
             "timeout": 30,
             "statusMessage": "Preparing a VibeBus handoff proposal"

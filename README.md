@@ -4,7 +4,7 @@
 
 VibeBus 是面向独立 Codex 顶层任务的本地结构化事实总线。它保留每个任务的聊天上下文与 worktree 隔离，只共享明确登记的消息、ACK、任务状态、依赖、已确认决策、路径租约和产物引用。
 
-VibeBus 0.10 是可运行的 Windows MVP：Rust 单文件程序同时提供 CLI 和 stdio MCP，状态写入项目级 SQLite WAL；Agent 与 operator 秘密位于 Windows 当前用户凭据库；Codex 插件、Hook、marketplace、本地 MSI、便携 ZIP 和独立插件包均有仓库内交付路径。
+VibeBus 0.10 可在 Windows 与 macOS 原生运行，并提供 Linux `amd64` 容器路径。Rust 单文件程序同时提供 CLI、stdio MCP 和 macOS 原生 Hook 入口，状态写入项目级 SQLite WAL；Agent 与 operator 秘密分别位于 Windows Credential Manager 或 macOS Keychain。Codex 插件、Hook、marketplace、Windows MSI、macOS ARM64 本地包和独立插件包均有仓库内交付路径。
 
 ## 5 分钟上手
 
@@ -29,6 +29,23 @@ vibebus.exe inbox --root D:\path\to\repo --agent api
 
 领取任务前检查责任策略，为真正要编辑的精确项目相对路径建立 reservation；需要跨域时由任务所有者签发限时 override。完成后用结构化 handoff 交接，并对需要确认的消息执行 read → ACK → close。
 
+### macOS 插件安装
+
+Apple Silicon 本地开发与验收入口：
+
+```sh
+./scripts/package-plugin-macos.sh
+codex plugin marketplace add \
+  "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+codex plugin add vibebus@vibebus-local
+./plugins/vibebus/bin/vibebus --root "$PWD" \
+  register --name mac-worker --role implementation --store-credentials
+./plugins/vibebus/bin/vibebus --root "$PWD" \
+  credential status --agent mac-worker
+```
+
+安装或 Hook 变更后启动新的 Codex 任务并审查/信任 Hooks。macOS 使用 Keychain，成功存储后同样返回 `secretsRedacted=true`。完整环境、验收、运行目录和生产签名边界见 [macOS 开发与本地交付](docs/macos.md)。
+
 ### Linux 容器
 
 容器是无 HTTP 端口的命令式 CLI/std io MCP 服务，多阶段构建、非 root 运行，项目挂载到 `/workspace`，SQLite 数据放在独立 `/data` volume：
@@ -45,11 +62,11 @@ docker run --rm `
 
 ## 已实现与边界
 
-- Agent 注册、单次 recovery key、bearer token 轮换、Windows 当前用户凭据库和成功写入后的秘密脱敏。
+- Agent 注册、单次 recovery key、bearer token 轮换、Windows Credential Manager/macOS Keychain 和成功写入后的秘密脱敏。
 - 定向消息、未读 Inbox、read/ACK/close、带依赖任务、原子领取、乐观版本冲突和 Codex task/thread 绑定。
 - 项目相对路径 reservation、严格责任域、任务作用域限时 override、产物登记和 SHA-256 校验。
 - 不可变 Git commit/test 事实、确认决策、任务作用域 context sync、幂等键和 replay-safe subscription peek/ACK。
-- 高优先级结构化 handoff、review-only proposal、SQLite health/backup、CLI-only 离线压缩、Windows CI、MSI、便携包和独立插件包。
+- 高优先级结构化 handoff、review-only proposal、SQLite health/backup、CLI-only 离线压缩、Windows/macOS/Linux CI、MSI、macOS 本地包、便携包和独立插件包。
 
 VibeBus 共享结构化事实，不共享整段聊天或隐藏推理；不承诺远程多主机同步、强制中断/唤醒正在生成的模型、自动 Git 合并/冲突解决、自动生产签名或已完成的远程发布。PostToolUse 只记录有界事实，Stop 只保存待审阅提案。
 
@@ -57,14 +74,14 @@ VibeBus 共享结构化事实，不共享整段聊天或隐藏推理；不承诺
 
 ```mermaid
 flowchart LR
-    A[独立 Codex 任务 A] -->|CLI / stdio MCP| X[vibebus.exe]
+    A[独立 Codex 任务 A] -->|CLI / stdio MCP| X[vibebus]
     B[独立 Codex 任务 B] -->|CLI / stdio MCP| X
     X --> D[项目 SQLite WAL]
-    X --> V[Windows 当前用户凭据库]
+    X --> V[Windows Credential Manager / macOS Keychain]
     R[项目 .vibebus/project.json] --> X
 ```
 
-没有常驻 HTTP daemon。每次 CLI/MCP 调用都打开同一个项目数据库；事务、唯一约束、乐观版本、busy timeout 和 TTL reservation 构成协调边界。默认数据库在 `%LOCALAPPDATA%\VibeBus\projects\<project-id>\vibebus.db`，不进入仓库。
+没有常驻 HTTP daemon。每次 CLI/MCP 调用都打开同一个项目数据库；事务、唯一约束、乐观版本、busy timeout 和 TTL reservation 构成协调边界。默认数据库在 Windows `%LOCALAPPDATA%\VibeBus\projects\<project-id>\vibebus.db` 或 macOS `~/Library/Application Support/dev.VibeBus.VibeBus/projects/<project-id>/vibebus.db`，不进入仓库。
 
 ## 安全模型
 
@@ -77,7 +94,7 @@ flowchart LR
 
 ## 构建、开发和验收
 
-需要 Rust 2024 edition 兼容工具链；Windows 本地入口：
+仓库锁定 Rust 1.97.1。Windows 本地入口：
 
 ```powershell
 cargo fmt --all -- --check
@@ -92,6 +109,18 @@ $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
 git diff --check
 ```
 
+macOS 本地入口：
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+./scripts/test-lifecycle-hooks.sh
+./scripts/test-macos-keychain.sh
+./scripts/package-plugin-macos.sh
+git diff --check
+```
+
 普通 PR 的本地 release 包明确是未签名验收包；生产 tag 路径在缺少 PFX Base64 与密码时失败关闭，不会伪造已签名生产发布。MSI 不通过自定义操作修改 Codex 配置，安装后仍需显式注册 marketplace。
 
 ## 文档入口
@@ -102,6 +131,7 @@ git diff --check
 - [企划差距分析](docs/plan-gap-analysis.md)
 - [发布工程](docs/release.md)
 - [容器交付](docs/container.md)
+- [macOS 开发与本地交付](docs/macos.md)
 - [备份、导出与恢复演练](docs/backup-restore.md)
 - [双顶层任务桌面验收](docs/desktop-acceptance.md)
 - [安全策略与漏洞报告](SECURITY.md)

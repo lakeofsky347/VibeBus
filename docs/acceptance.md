@@ -1,6 +1,6 @@
 # Acceptance record
 
-Acceptance date: 2026-07-19.
+Acceptance date: 2026-07-19. macOS adaptation acceptance: 2026-07-20.
 
 ## Automated checks
 
@@ -14,6 +14,20 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 ./scripts/build-release.ps1
 ./scripts/test-installer.ps1 -MsiPath ./dist/VibeBus-0.10.0-windows-x64.msi -ExpectedVersion 0.10.0
 ./scripts/validate-plugin.ps1
+```
+
+The macOS ARM64 path is accepted with:
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+./scripts/test-lifecycle-hooks.sh
+./scripts/test-macos-keychain.sh
+./scripts/package-plugin-macos.sh
+./scripts/validate-plugin-macos.sh \
+  ./dist/staging/VibeBus-0.10.0-macos-arm64/plugins/vibebus
+(cd dist && shasum -a 256 -c SHA256SUMS-macos-arm64.txt)
 ```
 
 Covered behaviors:
@@ -48,9 +62,10 @@ Covered behaviors:
 - retry-safe structured handoff, ACK lifecycle, and authenticated resume snapshot;
 - CLI end-to-end responsibility/fact/proposal, subscription/handoff, message/thread lifecycle, and retention plan/apply flows;
 - MCP initialize negotiation, responsibility/fact/proposal tools, explicit absence of operator mutation tools, stored registration, no-token inbox access, vault-backed recovery, unapproved retention rejection, credential deletion, and rejection after deletion;
-- seven deterministic PowerShell lifecycle-Hook checks covering path-only Git facts, no-log test facts, unknown exit refusal, review-only Stop proposals, and plugin configuration.
+- seven deterministic PowerShell and seven native macOS lifecycle-Hook checks covering path-only Git facts, no-log test facts, unknown exit refusal, review-only Stop proposals, and plugin configuration;
+- disposable macOS Keychain storage, redaction, vault-backed inbox access, recovery rotation, deletion, rejection after deletion, and cleanup.
 
-The suite contains 38 tests: 1 policy unit test, 7 CLI workflows, 25 core workflows, 4 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted checkout together with formatting, clippy-as-error, and 7/7 lifecycle-Hook checks.
+The suite contains 39 tests: 1 policy unit test, 1 native-Hook unit test, 7 CLI workflows, 25 core workflows, 4 credential-vault workflows, and 1 MCP protocol workflow. All pass on the accepted checkout together with formatting, clippy-as-error, Windows 7/7 lifecycle-Hook checks, and macOS 7/7 native-Hook checks.
 
 The 0.10 release layer additionally covers Cargo/plugin version agreement, repository-owned Codex plugin validation, pinned release tools, per-user MSI ICE validation, administrative extraction, all three Hooks and four Hook scripts, extracted binary execution/version, portable/plugin archives, post-build SHA-256 checksums, and a machine-readable signed-state manifest. Production publishing remains configured to fail before packaging when either signing Secret is absent.
 
@@ -60,6 +75,7 @@ The accepted local 0.10 package is intentionally unsigned because no production 
 
 - Manifest and component paths pass the plugin validator.
 - `.mcp.json` launches `./bin/vibebus.exe mcp` from the plugin root.
+- The staged macOS `.mcp.json` launches `./bin/vibebus mcp`; the three Unix Hook commands launch the same binary's hidden native Hook entrypoints.
 - SessionStart is read-only; PostToolUse stores only bounded Git/test facts; Stop writes a review-only proposal and never sends. All require normal Codex Hook trust review after definition changes.
 - The Skill states responsibility inspection/override, task-scoped reservations, Git/test no-diff/no-log facts, proposal-versus-send, root/vault, retention, delivery, conflict, and non-interruption boundaries.
 - The repository plugin manifest is version 0.10.0 and passes the repository validator.
@@ -77,6 +93,27 @@ The accepted unsigned local artifacts are:
 | `VibeBus-Codex-plugin-0.10.0.zip` | 3,469,334 | `638680d50829a1ab2d4fa69cff663d5d70179a4a064292d4652f782dc106b3be` |
 
 The release manifest records `signed=false`. The MSI passes all applicable stock ICEs, administrative extraction returns Windows Installer exit code 0, ten critical payload paths are present, and the extracted binary reports 0.10.0. The missing-signing-secret test rejects signing before any temporary PFX is created. YAML, JSON, and PowerShell AST parsing all pass.
+
+## macOS adaptation acceptance
+
+The accepted environment is macOS 26.5.2 on Apple Silicon `arm64` with Xcode Command Line Tools and Rust 1.97.1. The unchanged pre-adaptation core first passed all 38 existing tests. After adding the native Hook unit coverage, all 39 tests pass with formatting and Clippy-as-error.
+
+The Security.framework backend reports `macos-keychain`. A disposable real-Keychain run passed 11/11 checks: stored Agent registration returned redacted metadata, status reported generation 1, inbox access succeeded without an explicit token, recovery rotated and stored generation 2 without exposing either secret, deletion reported absent state, and a later no-token inbox call failed. A real pseudo-terminal then initialized a redacted generation-1 Operator, proved database/Keychain readiness, rotated it through the vault to generation 2, and explicitly deleted the Operator entry with `ready=false`. The fixture deleted both Keychain entries and its temporary project/data directories.
+
+The repository's tracked project marker was retained while Windows runtime state and credentials were not copied. Fresh Mac-local state was created under `~/Library/Application Support/dev.VibeBus.VibeBus`; `doctor` reports schema 11, WAL, foreign keys, integrity `ok`, and overall `ok=true`. Final-build Agent `macos-adaptation-final` is stored in Keychain at target `VibeBus:prj_51ac137e4aa342a7a80bda77d94cfbc5:macos-adaptation-final`, generation 1, with no secret exposed. The installed-cache binary reads that entry and its inbox successfully. An earlier `macos-adaptation` entry remains bound to a superseded ad-hoc binary; the final CLI rejects it in 0.01 seconds with an actionable authorization error instead of opening UI or hanging. The live project Operator remains unconfigured.
+
+The fresh Mac runtime completed a self-directed required-ACK lifecycle. Message `msg_38a636d8c0ea47ba878241fd607e63f5` was created at `1784516524422`, read at `1784516531123`, ACKed at `1784516536871`, and closed at `1784516541824`. It is absent from the normal inbox, present in explicit closed history with all timestamps stable, and `doctor.ok=true` remains intact.
+
+Native SessionStart output was accepted against the real project. The deterministic PostToolUse/Stop fixture passed 7/7 and proves the same bounded no-diff/no-log/review-only properties as the Windows scripts. The installed `vibebus@vibebus-local` cache is enabled at 0.10.0; source, staged, and installed Mach-O hashes match, the installed binary passes `codesign --verify`, and the installed binary returns a healthy `doctor` result.
+
+The accepted local macOS artifacts are ad-hoc signed, not production-notarized:
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `VibeBus-0.10.0-macos-arm64.tar.gz` | 3,341,874 | `f99a94473d975c131bc3a1120c95a1ace2a741a37dd3f2b7dd4a63650f61e2b6` |
+| `VibeBus-Codex-plugin-0.10.0-macos-arm64.zip` | 3,336,833 | `a76f1d2dd4e9c6114ac87ff41d8b1988c859588e65fc3a4ada3fc78bb2084c61` |
+
+Both checksum entries verify. The packaged Mach-O is a thin `arm64` executable, 6,603,024 bytes, with SHA-256 `2446edc1f2f39819e344b41c76fe2d4e61d8411e6d443e7d1d13dd02ffe9babb`; `codesign` reports a valid ad-hoc signature with identifier `dev.vibebus.cli`. Developer ID signing, notarization, stapling, and downloaded-quarantine Gatekeeper acceptance remain external production gates.
 
 ## Live project migration
 

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added native macOS Security.framework Keychain storage for Agent and Operator credentials, including redacted registration/rotation, vault fallback, status, explicit deletion, and an isolated real-Keychain acceptance fixture.
+- Added native-binary macOS SessionStart/PostToolUse/Stop Hooks with the existing path-only Git, no-log test, reliable-exit, and review-only handoff boundaries.
+- Added Apple Silicon local plugin packaging, ad-hoc signing, manifest/archive/checksum validation, installed-cache acceptance, and a macOS CI job. Developer ID signing and notarization remain production gates.
 - Added a CLI-only `maintenance compact --backup <new-path>` operation with exact real-terminal confirmation, vault-backed Operator authentication, fail-fast exclusive SQLite locking, and zero-active-state enforcement.
 - Required a new verified backup plus conservative free-space validation before `VACUUM`, restored and checkpointed WAL afterward, and returned bounded before/after hashes, page counts, reclaimed bytes, and integrity evidence.
 - Added `compaction_started` and `compaction_completed` audit events plus disposable-project coverage for success, active-state refusal, busy-database refusal, and redirected-input no-mutation behavior. No compaction tool was added to MCP.

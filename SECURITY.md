@@ -8,7 +8,7 @@ Security fixes are developed against the latest `0.10.x` source and its current 
 
 Do not open a public issue, discussion, or pull request for a suspected vulnerability. Use the repository's [private vulnerability reporting form](https://github.com/lakeofsky347/VibeBus/security/advisories/new) so maintainers can review the report before disclosure.
 
-Include the affected version or commit, platform, impact, minimal reproduction steps, and suggested mitigation when available. Do not include live Agent tokens, recovery keys, Operator secrets, Windows Credential Manager exports, signing certificates, cloud credentials, database copies, or unrelated personal data. Use placeholders in reproductions.
+Include the affected version or commit, platform, impact, minimal reproduction steps, and suggested mitigation when available. Do not include live Agent tokens, recovery keys, Operator secrets, Windows Credential Manager or macOS Keychain exports, signing/notarization credentials, cloud credentials, database copies, or unrelated personal data. Use placeholders in reproductions.
 
 VibeBus is a local coordination boundary, not an operating-system sandbox. Reports should distinguish application authorization bypasses from raw filesystem access already available to another process running as the same operating-system user.
 

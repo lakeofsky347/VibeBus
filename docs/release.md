@@ -1,6 +1,6 @@
 # Release engineering
 
-VibeBus 0.10 has one repeatable Windows release path shared by local validation and GitHub Actions. Pull requests build unsigned acceptance packages. Production tag releases are fail-closed: they must sign both the executable and MSI before GitHub Release publication.
+VibeBus 0.10 has repeatable Windows and macOS local/CI packaging paths. Windows production tag releases remain fail-closed: they must sign both the executable and MSI before publication. macOS currently produces an ad-hoc-signed local acceptance package; Developer ID signing and notarization are explicit production gates and are not claimed by that artifact.
 
 The plugin manifest uses the officially supported `interface.composerIcon` and `interface.logo` fields. Those paths remain relative to the plugin root and point to the transparent PNGs under `plugins/vibebus/assets/`. The release staging step copies the complete plugin tree, while the WiX payload lists all four light/dark icon and logo files explicitly so MSI and ZIP delivery stay aligned.
 
@@ -15,6 +15,15 @@ The plugin manifest uses the officially supported `interface.composerIcon` and `
 | `VibeBus-Codex-plugin-X.Y.Z.zip` | Standalone `vibebus` plugin directory |
 | `SHA256SUMS.txt` | SHA-256 checksums generated after all signing |
 | `release-manifest.json` | Version, platform, signed state, sizes, and hashes |
+
+`scripts/package-plugin-macos.sh` additionally produces host-architecture macOS artifacts:
+
+| File | Purpose |
+| --- | --- |
+| `VibeBus-X.Y.Z-macos-arm64.tar.gz` | Portable marketplace root for Apple Silicon |
+| `VibeBus-Codex-plugin-X.Y.Z-macos-arm64.zip` | Standalone macOS plugin directory |
+| `SHA256SUMS-macos-arm64.txt` | SHA-256 checksums for both archives |
+| `release-manifest-macos-arm64.json` | Version, platform, ad-hoc signature state, sizes, and hashes |
 
 The MSI installs to `%LOCALAPPDATA%\Programs\VibeBus`, adds the bundled plugin binary directory to the current user's `PATH`, and includes the repository-shaped local marketplace at the install root. It does not run Codex or mutate Codex configuration through a custom action. Register the installed marketplace explicitly:
 
@@ -43,6 +52,38 @@ The plugin validator also checks that the manifest icon and logo references reso
 
 Local builds are unsigned unless `-Sign` is supplied with both signing environment variables. This permits PR validation without sharing a private key. A local unsigned package is not a production release.
 
+## macOS local build and acceptance
+
+The macOS path requires the Xcode Command Line Tools, Python 3 for repository-only JSON validation, and Rust 1.97.1. The packaged plugin runtime itself is a single native binary and does not require Python, PowerShell, Node, or jq.
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+./scripts/test-lifecycle-hooks.sh
+./scripts/test-macos-keychain.sh
+./scripts/package-plugin-macos.sh
+./scripts/validate-plugin-macos.sh \
+  ./dist/staging/VibeBus-0.10.0-macos-arm64/plugins/vibebus
+(cd dist && shasum -a 256 -c SHA256SUMS-macos-arm64.txt)
+```
+
+The build copies the optimized Mach-O to `bin/vibebus`, applies an ad-hoc signature by default, substitutes the macOS MCP configuration only inside the staged marketplace, removes the Windows executable from the macOS payload, and validates the binary/version/manifest/Hook/Skill contract before archiving. It supports native `arm64` and `x86_64` hosts, naming the latter `x64`; only `arm64` has current live acceptance. Supplying `VIBEBUS_CODESIGN_IDENTITY` signs with that identity, hardened runtime, and a secure timestamp and records `signature: "identity"`; this does not by itself claim Developer ID provenance or notarization.
+
+The CI workflow runs the Rust gates, seven native Hook fixtures, disposable Keychain lifecycle, package validation, and checksum verification on `macos-latest`, then uploads the local acceptance artifacts for 14 days.
+
+## macOS production signing boundary
+
+Ad-hoc signing proves that the local Mach-O is internally consistent after packaging, but it does not establish publisher identity or satisfy downloaded-artifact Gatekeeper policy. A public macOS release must add all of these maintainer-owned gates before publication:
+
+1. sign the final binary with a Developer ID Application identity and hardened runtime;
+2. submit the final archive or containing app/package to Apple notarization and wait for acceptance;
+3. staple the notarization ticket where the distribution shape supports stapling;
+4. verify `codesign`, `spctl`, checksums, architecture, and execution from a freshly downloaded quarantined artifact on a disposable user profile;
+5. keep the certificate/private key and App Store Connect/notary credentials outside the repository and logs.
+
+The repository does not store or simulate these credentials. `release-manifest-macos-*.json` reports `signature: "adhoc"` by default and `signature: "identity"` only when the caller explicitly supplies `VIBEBUS_CODESIGN_IDENTITY`; notarization remains a separate fail-closed gate.
+
 ## Authenticode signing
 
 `scripts/sign-windows.ps1` locates the newest x64 SignTool from the installed Windows SDK, decodes a temporary PFX, signs with SHA-256, requests an RFC 3161 SHA-256 timestamp, verifies with the default Authenticode policy, and deletes the temporary PFX in `finally`.
@@ -67,7 +108,7 @@ Do not commit a PFX, Base64 certificate, password, or decoded temporary file. Gi
 
 ## GitHub Actions behavior
 
-`.github/workflows/ci.yml` runs on pull requests, `main` pushes, and manual dispatch. It has read-only `contents` permission and performs formatting, tests, Clippy-as-error, lifecycle-Hook fixtures, release packaging, MSI validation, administrative extraction, and 14-day workflow artifact upload.
+`.github/workflows/ci.yml` runs on pull requests, `main` pushes, and manual dispatch. It has read-only `contents` permission. Windows performs formatting, tests, Clippy-as-error, PowerShell Hook fixtures, release packaging, MSI validation, administrative extraction, and artifact upload. macOS independently performs Rust gates, native Hook fixtures, disposable Keychain acceptance, native packaging, checksum validation, and artifact upload. Linux retains the non-root container path.
 
 `.github/workflows/release.yml` runs for `v*.*.*` tag pushes or manual dispatch against an existing tag. It:
 

@@ -1,12 +1,12 @@
 # VibeBus plan gap analysis
 
-Assessment date: 2026-07-19.
+Assessment date: 2026-07-20.
 
 This document compares the implemented VibeBus 0.10 baseline with the goals and phased roadmap in the 2026-07-17 project startup plan. The comparison uses repository code, tests, release automation, VibeBus durable state, and the completed two-real-task desktop acceptance as evidence.
 
 ## Executive assessment
 
-The core product definition is achieved: independent Codex top-level tasks can exchange authenticated, structured, durable facts through a local SQLite-backed CLI/MCP plugin without sharing complete conversations. The real desktop run used two user-owned top-level tasks and passed the repository auditor with 178 of 178 checks, zero failures, and zero skips.
+The core product definition is achieved: independent Codex top-level tasks can exchange authenticated, structured, durable facts through a local SQLite-backed CLI/MCP plugin without sharing complete conversations. The real Windows desktop run used two user-owned top-level tasks and passed the repository auditor with 178 of 178 checks, zero failures, and zero skips. The macOS ARM64 adaptation now adds a Security.framework Keychain backend, native-binary lifecycle Hooks, native packaging, CI gates, a fresh local runtime, and an installed 0.10.0 plugin cache.
 
 All 12 original MVP acceptance criteria are fully covered. VibeBus 0.10 adds strict responsibility domains, authenticated expiring task-scoped overrides, immutable Git/test facts, and deterministic lifecycle Hooks to the 0.9 context projection. Item/byte budgets, bounded previews, semantic deduplication, and continuation cursors keep the shared surface explicit and bounded.
 
@@ -16,15 +16,15 @@ Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. The br
 
 | Planning goal | Status | Current evidence | Remaining gap |
 | --- | --- | --- | --- |
-| Local structured fact bus with isolated top-level-task contexts | Complete | SQLite WAL, authenticated Agents, tasks, messages, events, artifacts, subscriptions, CLI, and MCP | None for the single-host Windows scope |
+| Local structured fact bus with isolated top-level-task contexts | Complete | SQLite WAL, authenticated Agents, tasks, messages, events, artifacts, subscriptions, CLI, and MCP on Windows and macOS | None for the supported single-host scope |
 | Two independent top-level tasks sharing one service | Complete | Task B `019f73ad-0618-76a1-9c42-e17a8fda1486` and Task A `019f73af-839c-7b03-a62b-09fd7eb07ec0` completed B1/A1/B2/A2 | Do not generalize this into forced model interruption |
 | Directed Inbox, read/ACK/close, and replay-safe delivery | Complete | Three structured handoffs, closed recipient receipts, same-delivery double peek, ACK replay `false` then `true` | Exactly-once consumer side effects remain out of scope |
 | Tasks, dependencies, atomic claim, versions, and terminal bindings | Complete | Dependency unlock, live competing-claim conflict, optimistic-version tests, and four closed desktop bindings | Task reassignment and richer scheduling remain Phase 4 concerns |
 | Artifacts, audit history, backup, and recovery | Complete | Hashed artifacts, ordered events, migrations, online backups, retained-history floor, CI-backed isolated restore/import, and backup-first CLI-only offline compaction | Live compaction remains a maintainer-controlled maintenance-window decision, not a release requirement |
 | Agent-specific context synchronization | Complete | `context sync` has CLI/MCP parity, authenticated scope isolation, direct-dependency expansion, confirmed decisions, item/byte budgets, bounded previews, and stable continuation | Cursor pagination is deliberately not an atomic database snapshot; restart for fresh concurrent state |
 | File conflict control | Complete for declared operations | Strict role `allowedPaths`, task-scoped expiring overrides, reservation/artifact/Git-path enforcement, plus existing overlap/TTL control | This is application policy, not an OS filesystem sandbox; raw external writes remain outside the bus |
-| Deterministic lifecycle automation | Complete for bounded local facts | PostToolUse records commit identity/path lists and test outcomes; Stop writes a review-only proposal; Hook fixtures run in CI | Specialized host tools may opt out of Hooks; automatic handoff sending is deliberately excluded |
-| Codex plugin packaging and Windows delivery | Complete for unsigned acceptance | Public repository, branded plugin manifest/assets, marketplace metadata, Skill, stdio MCP, Hook, portable ZIP, per-user MSI, validation, and green cumulative PR #12 CI | Production certificate, protected release environment, signed tag, and disposable-profile acceptance remain external gates |
+| Deterministic lifecycle automation | Complete for bounded local facts | PowerShell Hooks on Windows and native-binary Hooks on macOS record the same bounded facts; both 7/7 fixtures run in CI | Specialized host tools may opt out of Hooks; automatic handoff sending is deliberately excluded |
+| Codex plugin packaging and native desktop delivery | Complete for local acceptance | Windows MSI/ZIP/plugin packages plus macOS ARM64 portable/plugin packages, manifests, checksums, validators, installed cache, and OS-vault acceptance | Windows production certificate and macOS Developer ID/notarization remain external gates |
 | Notifications, Supervisor, and visualization | Deferred | Codex task tools can create, read, wait, and continue user-authorized tasks; SQLite remained authoritative during acceptance | No plugin-owned best-effort notification bridge, status UI, dependency graph, or Worker supervisor |
 | Remote/multi-host operation | Deferred by design | Project state is local and project-ID scoped | No remote synchronization, cross-device vault recovery, or distributed consistency model |
 
@@ -50,10 +50,20 @@ Phase 0, the usable Phase 1 core, and Phase 3 pluginization are complete. The br
 ### P0: production release acceptance
 
 - Configure a protected GitHub `release` environment and real Windows code-signing certificate.
-- Create a matching signed tag only after all gates pass.
+- Configure maintainer-owned Apple Developer ID/notarization credentials and add a fail-closed macOS production path.
+- Create a matching signed tag only after all platform-specific gates pass.
 - Verify downloaded checksums, Authenticode timestamps, and install/uninstall from a disposable Windows user profile.
+- Verify Developer ID signature, hardened runtime, notarization, stapling where applicable, and Gatekeeper execution from a quarantined download on a disposable macOS profile.
 
-This is the only remaining release blocker, but it requires maintainer-owned external credentials and policy.
+These are the remaining production-distribution blockers, and both require maintainer-owned external credentials and policy. Local development and CI acceptance do not simulate them.
+
+### Completed on macOS: native development and plugin path
+
+- Rust 1.97.1 builds all CLI/MCP/database behavior natively on Apple Silicon and all 39 tests pass.
+- Security.framework stores Agent and Operator values as Keychain generic passwords with project-scoped service names; a disposable 11/11 real-vault fixture proves Agent redaction/lookup/recovery/deletion/rejection and Operator initialization/readiness/rotation/deletion with cleanup.
+- SessionStart, PostToolUse, and Stop are implemented inside the native binary, retaining the no-transcript/no-diff/no-log/review-only boundaries without PowerShell, Node, or jq.
+- The repository builds an ad-hoc-signed `arm64` Mach-O, stages the macOS MCP configuration, validates the plugin, checks both archives, installs `vibebus@vibebus-local`, and proves installed-cache health.
+- Fresh runtime state and Agent credentials were created locally; Windows runtime databases and vault entries were not copied.
 
 ### Completed in 0.9: context sync and confirmed decisions
 
