@@ -24,8 +24,9 @@ case "$output_root" in
     *) echo "Output directory must be inside the repository: $output_root" >&2; exit 1 ;;
 esac
 
-cargo build --release --locked
+cargo build --release --locked --bin vibebus
 plugin_binary="$repo_root/plugins/vibebus/bin/vibebus"
+mkdir -p "$(dirname "$plugin_binary")"
 cp "$repo_root/target/release/vibebus" "$plugin_binary"
 chmod 755 "$plugin_binary"
 if [ "$signing_identity" = "-" ]; then

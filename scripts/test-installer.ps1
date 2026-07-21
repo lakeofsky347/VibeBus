@@ -188,7 +188,7 @@ try {
 
             Invoke-MsiOperation -Operation uninstall -PackagePath $installedPackage -LogPath (Join-Path $lifecycleRoot "uninstall.log")
             $installedPackage = ""
-            if (Test-Path -LiteralPath $lifecycleInstallRoot -or Test-Path -LiteralPath $lifecycleMarketplace) {
+            if ((Test-Path -LiteralPath $lifecycleInstallRoot) -or (Test-Path -LiteralPath $lifecycleMarketplace)) {
                 throw "Uninstall left VibeBus marketplace files behind."
             }
             if (Test-UserPathEntry -PathEntry $lifecyclePluginBin) {
