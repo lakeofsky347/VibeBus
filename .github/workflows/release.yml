@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
@@ -45,7 +45,7 @@ jobs:
           rustup show active-toolchain
 
       - name: Install .NET SDK
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: 6.0.x
 
@@ -62,6 +62,13 @@ jobs:
           if ($version -ne $cargoVersion -or $version -ne $pluginVersion) {
             throw "Tag, Cargo, and plugin versions must match (tag=$version cargo=$cargoVersion plugin=$pluginVersion)."
           }
+          if ((git status --porcelain).Length -ne 0) {
+            throw "Release source checkout must be clean."
+          }
+          $trackedPluginBinary = & git ls-files --error-unmatch -- plugins/vibebus/bin/vibebus.exe 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release source must not track plugins/vibebus/bin/vibebus.exe; build it from the tagged source."
+          }
           "VIBEBUS_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Run release gates
@@ -70,6 +77,35 @@ jobs:
           cargo fmt --all -- --check
           cargo test --all-targets --locked
           cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Install pinned supply-chain tools
+        shell: pwsh
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Gate Rust advisories, licenses, bans, and sources
+        shell: pwsh
+        run: cargo deny check advisories bans licenses sources
+
+      - name: Generate normalized release SBOM and supply-chain evidence
+        shell: pwsh
+        run: |
+          cargo cyclonedx --format json
+          python scripts/normalize-cyclonedx.py --self-test
+          $sboms = @(Get-ChildItem -LiteralPath . -Filter "*.cdx.json")
+          if ($sboms.Count -ne 1) {
+            throw "Expected exactly one CycloneDX SBOM, found $($sboms.Count)."
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $sbomPath = Join-Path dist "VibeBus-$env:VIBEBUS_VERSION-windows-x64.cdx.json"
+          python scripts/normalize-cyclonedx.py --input $sboms[0].FullName --output $sbomPath
+          [ordered]@{
+            version = $env:VIBEBUS_VERSION
+            sourceRevision = (git rev-parse HEAD).Trim()
+            sbom = [System.IO.Path]::GetFileName($sbomPath)
+            gates = @("cargo-deny advisories", "cargo-deny licenses", "cargo-deny bans", "cargo-deny sources")
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path dist "supply-chain-evidence.json") -Encoding utf8
 
       - name: Build release assets
         shell: pwsh
@@ -80,6 +116,23 @@ jobs:
           }
           ./scripts/build-release.ps1 -Version $env:VIBEBUS_VERSION -Sign
 
+      - name: Add supply-chain evidence to release checksums
+        shell: pwsh
+        run: |
+          $checksumPath = Join-Path dist "SHA256SUMS.txt"
+          $evidenceFiles = @(
+            Get-ChildItem -LiteralPath dist -File | Where-Object {
+              $_.Name -like '*.cdx.json' -or $_.Name -eq 'supply-chain-evidence.json'
+            }
+          )
+          if ($evidenceFiles.Count -ne 2) {
+            throw "Expected CycloneDX SBOM and supply-chain evidence, found $($evidenceFiles.Count) files."
+          }
+          $lines = @($evidenceFiles | ForEach-Object {
+            "$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())  $($_.Name)"
+          })
+          [System.IO.File]::AppendAllLines($checksumPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+
       - name: Validate MSI and extracted payload
         shell: pwsh
         run: |
@@ -88,10 +141,10 @@ jobs:
             throw "Expected exactly one MSI, found $($msiFiles.Count)."
           }
           $msi = $msiFiles[0]
-          ./scripts/test-installer.ps1 -MsiPath $msi.FullName -ExpectedVersion $env:VIBEBUS_VERSION
+          ./scripts/test-installer.ps1 -MsiPath $msi.FullName -ExpectedVersion $env:VIBEBUS_VERSION -ExerciseLifecycle
 
       - name: Upload workflow assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: vibebus-${{ env.VIBEBUS_VERSION }}-windows
           path: |
@@ -99,6 +152,8 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS.txt
             dist/release-manifest.json
+            dist/*.cdx.json
+            dist/supply-chain-evidence.json
           if-no-files-found: error
           retention-days: 30
 
@@ -108,10 +163,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $assets = Get-ChildItem -LiteralPath dist -File | Where-Object {
-            $_.Extension -in @('.msi', '.zip') -or $_.Name -in @('SHA256SUMS.txt', 'release-manifest.json')
+            $_.Extension -in @('.msi', '.zip', '.json') -or $_.Name -eq 'SHA256SUMS.txt'
           }
-          if ($assets.Count -lt 5) {
-            throw "Expected five release assets, found $($assets.Count)."
+          if ($assets.Count -lt 7) {
+            throw "Expected at least seven release assets, found $($assets.Count)."
           }
           $releaseArguments = @("release", "create", $env:RELEASE_TAG)
           $releaseArguments += $assets.FullName

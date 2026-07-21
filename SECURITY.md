@@ -2,7 +2,9 @@
 
 ## Supported versions
 
-Security fixes are developed against the latest `0.10.x` source and its current stacked pull-request baseline. Older snapshots and local backup artifacts are retained only as recovery evidence and are not separately supported release lines.
+Security fixes are developed against the latest `0.10.x` source and its current stacked pull-request baseline. The only G1 production candidate is the Windows x64 signed GitHub Release `v0.10.0`; macOS local packages and Linux containers are not production-release claims. Older snapshots and local backup artifacts are retained only as recovery evidence and are not separately supported release lines.
+
+Release candidates are gated with pinned GitHub Actions, `cargo-deny` advisory/license/source checks, and a CycloneDX SBOM. Report a suspected supply-chain issue privately with the affected source revision, SBOM component, and minimal reproduction, but never attach secrets or local databases.
 
 ## Report a vulnerability privately
 

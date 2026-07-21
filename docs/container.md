@@ -2,6 +2,8 @@
 
 VibeBus 0.10 includes a Linux `amd64` container path for CLI and stdio MCP use. The image is a command-style local service, not an HTTP daemon, so it exposes no network port.
 
+The G1 production candidate excludes Linux distribution. Container acceptance and registry delivery remain useful evidence for the controlled Linux path, but must not be presented as a Windows `v0.10.0` GitHub Release asset.
+
 ## Security and platform boundary
 
 - The container runs as the non-root user `10001:10001`.
@@ -9,6 +11,7 @@ VibeBus 0.10 includes a Linux `amd64` container path for CLI and stdio MCP use. 
 - Windows Credential Manager is unavailable in Linux. Do not pass `--store-credentials` in the container. Supply short-lived Agent credentials explicitly or through `VIBEBUS_AGENT_TOKEN`, preferably from the host's secret facility.
 - Never bake Agent, recovery, operator, ACR, certificate, or cloud credentials into the image, Dockerfile, build arguments, labels, repository, or report.
 - Operator mutations require a real interactive terminal and remain intentionally unavailable through redirected automation or MCP.
+- The Dockerfile pins its Rust builder and Debian runtime bases to linux/amd64 manifest digests and labels each image with the Git source revision. The acceptance and ACR helper verify the resulting platform and revision.
 
 ## Build and acceptance
 
@@ -80,9 +83,9 @@ Then run the repository-owned push helper with the complete repository path, exc
   -Tag 0.10.0
 ```
 
-The helper refuses non-ACR targets, requires an existing Docker login, tags the accepted local image, pushes it, and prints only the public image reference, manifest digest, and timestamp. It never accepts or prints a password.
+The helper refuses non-ACR targets, requires an existing Docker login, tags the accepted local image, pushes it, then verifies that the remote index digest matches the push result, exactly one runnable `linux/amd64` manifest is present when the remote is an index, and the pulled remote runtime label matches the checked-out Git revision. It never accepts or prints a password.
 
-Record the returned `image` and `digest` in acceptance evidence and in the course report. The image reference alone is not proof of a push; the manifest digest is required.
+Record the returned `image`, index `digest`, `runnableManifestDigest`, `platform`, and `sourceRevision` in acceptance evidence. The image reference alone is not proof of a push; the remote digest and platform/revision verification are required.
 
 ## Accepted ACR result
 

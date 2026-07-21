@@ -1,5 +1,9 @@
 # Release engineering
 
+## G1 production boundary
+
+The frozen `v0.10.0` candidate is a **Windows x64 signed GitHub Release only**. macOS packages remain local-development acceptance artifacts and the Linux image remains a separately controlled container delivery path; neither is authorized for this production release. The release workflow refuses to publish from a dirty checkout, a missing tag, or a source tree that tracks `plugins/vibebus/bin/vibebus.exe`.
+
 VibeBus 0.10 has repeatable Windows and macOS local/CI packaging paths. Windows production tag releases remain fail-closed: they must sign both the executable and MSI before publication. macOS currently produces an ad-hoc-signed local acceptance package; Developer ID signing and notarization are explicit production gates and are not claimed by that artifact.
 
 The plugin manifest uses the officially supported `interface.composerIcon` and `interface.logo` fields. Those paths remain relative to the plugin root and point to the transparent PNGs under `plugins/vibebus/assets/`. The release staging step copies the complete plugin tree, while the WiX payload lists all four light/dark icon and logo files explicitly so MSI and ZIP delivery stay aligned.
@@ -40,6 +44,10 @@ The repository pins Rust 1.97.1 in `rust-toolchain.toml` and WiX 4.0.6 in `.conf
 cargo fmt --all -- --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo install cargo-deny --version 0.20.2 --locked
+cargo install cargo-cyclonedx --version 0.5.9 --locked
+cargo deny check advisories bans licenses sources
+cargo cyclonedx --format json
 ./scripts/test-lifecycle-hooks.ps1
 ./scripts/build-release.ps1
 $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
@@ -93,7 +101,13 @@ The production workflow requires two repository or `release` environment secrets
 - `WINDOWS_SIGNING_CERTIFICATE_BASE64`: Base64 form of a code-signing PFX;
 - `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: its password.
 
-The optional repository variable `WINDOWS_TIMESTAMP_URL` overrides the default `http://timestamp.digicert.com`. Use the timestamp service supplied by the certificate authority when it differs.
+The optional repository variable `WINDOWS_TIMESTAMP_URL` overrides the default `https://timestamp.digicert.com`. Only HTTPS RFC 3161 timestamp endpoints are accepted; use the certificate authority's HTTPS endpoint when it differs.
+
+## Supply-chain gates and candidate evidence
+
+Both CI and the tag workflow install pinned `cargo-deny 0.20.2` and `cargo-cyclonedx 0.5.9`. `deny.toml` fails the build on RustSec advisories, yanked crates, unapproved licenses, unknown registries, and unknown Git dependencies. The exception lists are empty for this candidate. Before an SBOM is uploaded or released, `scripts/normalize-cyclonedx.py` replaces cargo's local `path+file` references with stable package URLs, removes volatile serial/timestamp metadata, and recursively rejects the GitHub workspace, runner temp directory, current user home, or any absolute file path. It uses only the Python standard library; run `python3 scripts/normalize-cyclonedx.py --self-test` locally before generating a sanitized candidate.
+
+The tag workflow publishes a CycloneDX `*.cdx.json` SBOM plus `supply-chain-evidence.json` with the source revision and the four completed `cargo-deny` gates. Their SHA-256 entries are appended to `SHA256SUMS.txt`; treat these files, the signed MSI/portable/plugin archives, checksums, and `release-manifest.json` as one candidate evidence set. Artifact upload does not substitute for the later downloaded-artifact verification.
 
 To set the PFX without printing its Base64 value:
 
@@ -108,7 +122,7 @@ Do not commit a PFX, Base64 certificate, password, or decoded temporary file. Gi
 
 ## GitHub Actions behavior
 
-`.github/workflows/ci.yml` runs on pull requests, `main` pushes, and manual dispatch. It has read-only `contents` permission. Windows performs formatting, tests, Clippy-as-error, PowerShell Hook fixtures, release packaging, MSI validation, administrative extraction, and artifact upload. macOS independently performs Rust gates, native Hook fixtures, disposable Keychain acceptance, native packaging, checksum validation, and artifact upload. Linux retains the non-root container path.
+`.github/workflows/ci.yml` runs on pull requests, `main` pushes, and manual dispatch. It has read-only `contents` permission and pins every third-party Action to an immutable SHA. A Linux supply-chain job produces the CycloneDX candidate evidence and runs the `cargo-deny` gates. Windows performs formatting, tests, Clippy-as-error, PowerShell Hook fixtures, release packaging, MSI validation, administrative extraction, disposable install/uninstall/PATH/marketplace cleanup, and artifact upload. macOS independently performs local-development Rust/package acceptance; it is not a G1 production target. Linux retains the non-root container path.
 
 `.github/workflows/release.yml` runs for `v*.*.*` tag pushes or manual dispatch against an existing tag. It:
 
@@ -117,9 +131,9 @@ Do not commit a PFX, Base64 certificate, password, or decoded temporary file. Gi
 3. refuses to continue unless both signing secrets exist;
 4. signs and verifies `vibebus.exe` before staging;
 5. builds the MSI from the signed payload, then signs and verifies the MSI;
-6. creates the archives, checksums, and signed release manifest;
-7. validates the MSI and uploads workflow artifacts;
-8. publishes the five assets with `gh release create --verify-tag --generate-notes` using only `contents: write` on the job-scoped `GITHUB_TOKEN`.
+6. creates the archives, checksums, signed release manifest, CycloneDX SBOM, and supply-chain evidence;
+7. validates the MSI, including a disposable install/uninstall/PATH/marketplace-cleanup exercise, and uploads workflow artifacts;
+8. publishes the candidate assets with `gh release create --verify-tag --generate-notes` using only `contents: write` on the job-scoped `GITHUB_TOKEN`.
 
 Creating and pushing a release tag is an explicit maintainer action. The workflow never creates a missing tag, and no release is published from an ordinary branch or pull request.
 
@@ -132,7 +146,7 @@ Creating and pushing a release tag is an explicit maintainer action. The workflo
 5. Create and push an annotated `vX.Y.Z` tag.
 6. Wait for the Release workflow, then download the assets and verify `SHA256SUMS.txt`.
 7. Verify Authenticode on both executable and MSI with `signtool verify /pa /tw /v` or `Get-AuthenticodeSignature`.
-8. Install on a disposable Windows user profile, register the installed marketplace, start a new Codex task, then uninstall and verify PATH/configuration cleanup.
+8. Install on a disposable Windows user profile, register the installed marketplace, start a new Codex task, then uninstall and verify user `PATH` and marketplace cleanup. If a prior MSI is available, run `test-installer.ps1 -PreviousMsiPath <prior.msi> -ExerciseLifecycle` to exercise the major upgrade before the final uninstall.
 
 ## Deliberate boundaries
 

@@ -15,6 +15,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  supply-chain:
+    name: Rust CVE, license, source, and SBOM gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup show active-toolchain
+
+      - name: Install pinned supply-chain tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Gate Rust advisories, licenses, bans, and sources
+        run: cargo deny check advisories bans licenses sources
+
+      - name: Generate and normalize CycloneDX SBOM
+        run: |
+          cargo cyclonedx --format json
+          python3 scripts/normalize-cyclonedx.py --self-test
+          python3 scripts/normalize-cyclonedx.py --input vibebus.cdx.json --output dist/vibebus.cdx.json
+
+      - name: Upload supply-chain evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vibebus-supply-chain-${{ github.sha }}
+          path: 'dist/*.cdx.json'
+          if-no-files-found: error
+          retention-days: 14
+
   container:
     name: Linux container acceptance
     runs-on: ubuntu-latest
@@ -22,7 +59,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Build and test Linux container
         shell: pwsh
@@ -35,7 +72,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install pinned Rust toolchain
         run: |
@@ -66,7 +103,7 @@ jobs:
           shasum -a 256 -c SHA256SUMS-macos-*.txt
 
       - name: Upload macOS acceptance assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: vibebus-macos-${{ github.sha }}
           path: |
@@ -84,7 +121,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -94,7 +131,7 @@ jobs:
           rustup show active-toolchain
 
       - name: Install .NET SDK
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: 6.0.x
 
@@ -127,10 +164,10 @@ jobs:
             throw "Expected exactly one MSI, found $($msiFiles.Count)."
           }
           $msi = $msiFiles[0]
-          ./scripts/test-installer.ps1 -MsiPath $msi.FullName
+          ./scripts/test-installer.ps1 -MsiPath $msi.FullName -ExerciseLifecycle
 
       - name: Upload CI release assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: vibebus-windows-${{ github.sha }}
           path: |

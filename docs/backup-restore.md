@@ -8,6 +8,8 @@ VibeBus online backups are consistent SQLite recovery points. A usable export co
 
 The database contains Agent and Operator credential digests, not the secrets stored in Windows Credential Manager or macOS Keychain. A move to another user or host therefore also requires a separately retained Agent recovery key or another explicit identity-recovery decision. Never add bearer tokens, recovery keys, Operator secrets, vault exports, signing credentials, or cloud credentials to the recovery bundle.
 
+For the G1 Windows release candidate, keep recovery evidence separate from release evidence: retain the project marker/database inventory under the recovery procedure, and retain the signed Windows assets, `SHA256SUMS.txt`, `release-manifest.json`, CycloneDX SBOM, and `supply-chain-evidence.json` with the release record. Neither set replaces the other.
+
 ## Automated disposable drill
 
 Run the repository-owned drill after building the release binary:

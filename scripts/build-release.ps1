@@ -10,6 +10,10 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $cargoManifestPath = Join-Path $repoRoot "Cargo.toml"
 $pluginManifestPath = Join-Path $repoRoot "plugins\vibebus\.codex-plugin\plugin.json"
+$sourceRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceRevision -notmatch '^[0-9a-f]{40}$') {
+    throw "Git source revision could not be resolved."
+}
 
 $cargoText = Get-Content -Raw -LiteralPath $cargoManifestPath
 $cargoVersionMatch = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"')
@@ -119,6 +123,7 @@ $manifest = [ordered]@{
     version = $Version
     platform = "windows-x64"
     signed = [bool]$Sign
+    sourceRevision = $sourceRevision
     generatedAt = [DateTimeOffset]::UtcNow.ToString("O")
     artifacts = foreach ($file in $releaseFiles) {
         $item = Get-Item -LiteralPath $file

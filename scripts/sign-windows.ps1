@@ -19,7 +19,10 @@ if ([string]::IsNullOrWhiteSpace($TimestampUrl)) {
     $TimestampUrl = $env:VIBEBUS_TIMESTAMP_URL
 }
 if ([string]::IsNullOrWhiteSpace($TimestampUrl)) {
-    $TimestampUrl = "http://timestamp.digicert.com"
+    $TimestampUrl = "https://timestamp.digicert.com"
+}
+if ($TimestampUrl -notmatch '^https://') {
+    throw "TimestampUrl must use HTTPS."
 }
 
 $signTool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |

@@ -78,6 +78,10 @@ if ($serverOs -ne "linux") {
 }
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$sourceRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceRevision -notmatch '^[0-9a-f]{40}$') {
+    throw "Git source revision could not be resolved"
+}
 $cargoText = Get-Content -Raw -LiteralPath (Join-Path $repoRoot "Cargo.toml")
 $expectedVersion = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"').Groups["version"].Value
 if ([string]::IsNullOrWhiteSpace($expectedVersion)) {
@@ -91,7 +95,9 @@ if (-not $SkipBuild) {
     Invoke-DockerChecked -Arguments @(
         "build",
         "--pull",
+        "--platform", "linux/amd64",
         "--build-arg", "VIBEBUS_VERSION=$expectedVersion",
+        "--build-arg", "VIBEBUS_SOURCE_REVISION=$sourceRevision",
         "--tag", $ImageTag,
         $repoRoot
     ) | Out-Null
@@ -215,6 +221,9 @@ try {
     if ($imageInspect.Config.User -ne "10001:10001") {
         throw "accepted image must run as non-root user 10001:10001"
     }
+    if ($imageInspect.Config.Labels."org.opencontainers.image.revision" -ne $sourceRevision) {
+        throw "accepted image source revision does not match the checked-out source"
+    }
 
     [pscustomobject]@{
         ok = $true
@@ -223,6 +232,7 @@ try {
         platform = "linux/amd64"
         imageSizeBytes = [long]$imageInspect.Size
         runtimeUser = [string]$imageInspect.Config.User
+        sourceRevision = $sourceRevision
         version = $version.Trim()
         journalMode = $doctor.result.journalMode
         foreignKeysEnabled = [bool]$doctor.result.foreignKeysEnabled

@@ -9,6 +9,10 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$sourceRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceRevision -notmatch '^[0-9a-f]{40}$') {
+    throw "Git source revision could not be resolved"
+}
 $cargoText = Get-Content -Raw -LiteralPath (Join-Path $repoRoot "Cargo.toml")
 $version = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"').Groups["version"].Value
 if ([string]::IsNullOrWhiteSpace($version)) {
@@ -66,10 +70,56 @@ $digestMatch = [regex]::Match(($pushOutput -join "`n"), 'digest:\s*(sha256:[0-9a
 if (-not $digestMatch.Success) {
     throw "push completed but no manifest digest was found in Docker output"
 }
+$indexDigest = $digestMatch.Groups[1].Value
+
+$remoteInspectOutput = & docker buildx imagetools inspect $remoteImage 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "remote manifest inspection failed: $($remoteInspectOutput -join [Environment]::NewLine)"
+}
+$remoteDigestMatch = [regex]::Match(($remoteInspectOutput -join "`n"), '(?m)^Digest:\s*(sha256:[0-9a-f]{64})')
+if (-not $remoteDigestMatch.Success -or $remoteDigestMatch.Groups[1].Value -ne $indexDigest) {
+    throw "remote index digest does not match the digest returned by docker push"
+}
+
+$remoteManifestRaw = & docker buildx imagetools inspect $remoteImage --raw 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "remote manifest JSON inspection failed: $($remoteManifestRaw -join [Environment]::NewLine)"
+}
+$remoteManifest = ($remoteManifestRaw -join "`n") | ConvertFrom-Json
+$runnableManifestDigest = $indexDigest
+if ($null -ne $remoteManifest.manifests) {
+    $linuxAmd64 = @($remoteManifest.manifests | Where-Object {
+        $_.platform.os -eq "linux" -and $_.platform.architecture -eq "amd64"
+    })
+    if ($linuxAmd64.Count -ne 1 -or $linuxAmd64[0].digest -notmatch '^sha256:[0-9a-f]{64}$') {
+        throw "remote image must contain exactly one linux/amd64 runnable manifest"
+    }
+    $runnableManifestDigest = [string]$linuxAmd64[0].digest
+}
+$remoteRuntime = "$remoteImage@$runnableManifestDigest"
+& docker pull --platform linux/amd64 $remoteRuntime *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "failed to pull the remote linux/amd64 manifest for verification"
+}
+$remoteRuntimeInspectRaw = & docker image inspect $remoteRuntime --format '{{json .}}'
+if ($LASTEXITCODE -ne 0) {
+    throw "failed to inspect remote runtime"
+}
+$remoteRuntimeInspect = ($remoteRuntimeInspectRaw -join "`n") | ConvertFrom-Json
+if ($remoteRuntimeInspect.Os -ne "linux" -or $remoteRuntimeInspect.Architecture -ne "amd64") {
+    throw "remote runtime is not linux/amd64"
+}
+$labels = $remoteRuntimeInspect.Config.Labels
+if ($labels."org.opencontainers.image.revision" -ne $sourceRevision) {
+    throw "remote image source revision does not match the checked-out source"
+}
 
 [pscustomobject]@{
     ok = $true
     image = $remoteImage
-    digest = $digestMatch.Groups[1].Value
+    digest = $indexDigest
+    runnableManifestDigest = $runnableManifestDigest
+    platform = "linux/amd64"
+    sourceRevision = $sourceRevision
     pushedAt = [DateTimeOffset]::UtcNow.ToString("o")
 } | ConvertTo-Json

@@ -11,6 +11,11 @@ $releaseBinary = Join-Path $repoRoot "target\release\vibebus.exe"
 $pluginBin = Join-Path $pluginRoot "bin"
 $packagedBinary = Join-Path $pluginBin "vibebus.exe"
 
+$trackedBinary = & git -C $repoRoot ls-files --error-unmatch -- "plugins/vibebus/bin/vibebus.exe" 2>$null
+if ($LASTEXITCODE -eq 0) {
+    throw "plugins/vibebus/bin/vibebus.exe must be generated from source and must not be tracked."
+}
+
 if ($CargoPath -eq "cargo" -and $null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
     $localCargo = Join-Path $repoRoot ".tools\cargo\bin\cargo.exe"
     $localCargoHome = Join-Path $repoRoot ".tools\cargo"
