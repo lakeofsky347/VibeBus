@@ -15,6 +15,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-contract:
+    name: OSS release contract metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Verify public-governance files and stable-release controls
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          required = [
+              ".github/ISSUE_TEMPLATE/bug_report.yml",
+              ".github/ISSUE_TEMPLATE/feature_request.yml",
+              ".github/PULL_REQUEST_TEMPLATE.md",
+              ".github/dependabot.yml",
+              "CODE_OF_CONDUCT.md",
+              "CONTRIBUTING.md",
+              "SECURITY.md",
+              "docs/release.md",
+          ]
+          missing = [path for path in required if not Path(path).is_file()]
+          assert not missing, f"Missing OSS governance files: {missing}"
+
+          release = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+          for marker in (
+              "origin/main",
+              "Release tag must point to a commit reachable from main.",
+              "--verify-tag",
+              "VibeBus-$env:VIBEBUS_VERSION-source.zip",
+              "supply-chain-evidence.json",
+          ):
+              assert marker in release, f"Release workflow is missing: {marker}"
+          PY
+
   supply-chain:
     name: Rust CVE, license, source, and SBOM gates
     runs-on: ubuntu-latest
@@ -148,7 +186,7 @@ jobs:
         shell: pwsh
         run: ./scripts/test-lifecycle-hooks.ps1
 
-      - name: Build unsigned release assets
+      - name: Build unsigned CI acceptance assets
         shell: pwsh
         run: ./scripts/build-release.ps1
 

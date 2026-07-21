@@ -1,43 +1,34 @@
-# VibeBus contribution guide
+# Contributing to VibeBus
 
-## 提交记录要求
+Thanks for contributing. By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-每次修改必须形成可追踪的 Git 提交，并在提交正文中注明：
+## Start with an issue or discussion
 
-1. 修改项：本次实际改变的代码、协议、文档或交付物。
-2. 验证：执行过的测试、静态检查或人工验证；未执行时必须说明原因。
-3. 后续跟进方向：仍需完成的工作、已知边界或下一阶段建议。确实没有时写明“无”并说明理由。
+Use the issue templates for reproducible bugs and feature proposals. Do not open a public issue for a security vulnerability; follow [SECURITY.md](SECURITY.md) instead. Small documentation fixes can be proposed directly, but please describe the problem they solve.
 
-推荐格式：
+## Development expectations
 
-~~~text
-<type>: <简短摘要>
+1. Work from a focused branch and keep each pull request to one reviewable concern.
+2. Preserve the project's security boundaries: do not add credentials, recovery material, local databases, backups, generated binaries, or release archives.
+3. Update tests and documentation when behavior, compatibility, installation, or release policy changes.
+4. Use the project language and style already established in the surrounding files.
 
-修改项:
-- ...
+For Rust, protocol, or plugin changes, run:
 
-验证:
-- ...
-
-后续跟进方向:
-- ...
-~~~
-
-一个提交应只覆盖一个清晰的逻辑变化。不得提交 bearer token、recovery key、数据库、备份、构建缓存或其他本地秘密。
-
-## Pull Request 要求
-
-Pull Request 同样必须包含“修改项、验证、后续跟进方向”，并说明对用户、CLI、MCP、数据库迁移或插件兼容性的影响。仓库提供的 PR 模板应保持启用。
-
-## 基础验证
-
-Rust、协议或插件实现发生变化时，至少运行：
-
-~~~powershell
+```sh
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
-python C:\Users\17430\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py D:\MyProjects\CoWork\plugins\vibebus
-~~~
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+```
 
-纯文档变更可按影响缩减验证范围，但必须在提交正文中明确记录。
+Run platform packaging or installer checks when your change affects them. Pure documentation changes may use narrower validation, but the pull request must state what was checked and what was not run.
+
+## Pull requests
+
+Use the pull-request template. Explain the user-visible purpose, validation, compatibility impact, and SemVer impact. Keep generated artifacts out of the pull request; GitHub Releases are created only from an accepted stable tag on `main`.
+
+Maintainers review changes for correctness, tests, documentation, security, compatibility, and release readiness. A pull request is not a release and does not authorize a tag, a GitHub Release, or external publishing.
+
+## Versioning and changelog
+
+VibeBus uses SemVer. Add an entry under `Unreleased` in [CHANGELOG.md](CHANGELOG.md) for user-visible fixes, features, breaking changes, security changes, and changes to distribution behavior. Keep historic entries immutable; describe the current behavior rather than rewriting release history.

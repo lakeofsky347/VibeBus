@@ -1,4 +1,4 @@
-name: Release
+name: Publish GitHub Release
 
 on:
   push:
@@ -49,13 +49,25 @@ jobs:
         with:
           dotnet-version: 6.0.x
 
-      - name: Verify tag and source versions
+      - name: Verify stable main tag and source versions
         shell: pwsh
         run: |
           if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
-            throw "Release tag must match vX.Y.Z."
+            throw "Stable release tag must match vX.Y.Z; prerelease tags are not enabled."
           }
           $version = $Matches.version
+          $tagCommit = (git rev-parse "$env:RELEASE_TAG^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -notmatch '^[0-9a-f]{40}$') {
+            throw "Release tag must resolve to a commit."
+          }
+          & git merge-base --is-ancestor $tagCommit origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag must point to a commit reachable from main."
+          }
+          $checkoutCommit = (git rev-parse HEAD).Trim()
+          if ($checkoutCommit -ne $tagCommit) {
+            throw "Release checkout does not match the requested tag commit."
+          }
           $cargoText = Get-Content -Raw -LiteralPath Cargo.toml
           $cargoVersion = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"').Groups['version'].Value
           $pluginVersion = (Get-Content -Raw -LiteralPath plugins/vibebus/.codex-plugin/plugin.json | ConvertFrom-Json).version
@@ -114,7 +126,7 @@ jobs:
               [string]::IsNullOrWhiteSpace($env:VIBEBUS_SIGNING_CERTIFICATE_PASSWORD)) {
             throw "Production releases require both Windows signing secrets. CI remains available for unsigned package validation."
           }
-          ./scripts/build-release.ps1 -Version $env:VIBEBUS_VERSION -Sign
+          ./scripts/build-release.ps1 -Version $env:VIBEBUS_VERSION -SourceRef $env:RELEASE_TAG -Sign
 
       - name: Add supply-chain evidence to release checksums
         shell: pwsh
@@ -132,6 +144,14 @@ jobs:
             "$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())  $($_.Name)"
           })
           [System.IO.File]::AppendAllLines($checksumPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+          $manifestPath = Join-Path dist "release-manifest.json"
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $manifest | Add-Member -NotePropertyName evidence -NotePropertyValue ([ordered]@{
+            checksums = "SHA256SUMS.txt"
+            sbom = [System.IO.Path]::GetFileName($sbomPath)
+            supplyChain = "supply-chain-evidence.json"
+          })
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 
       - name: Validate MSI and extracted payload
         shell: pwsh
@@ -162,12 +182,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $assets = Get-ChildItem -LiteralPath dist -File | Where-Object {
-            $_.Extension -in @('.msi', '.zip', '.json') -or $_.Name -eq 'SHA256SUMS.txt'
+          $requiredNames = @(
+            "VibeBus-$env:VIBEBUS_VERSION-windows-x64.msi",
+            "VibeBus-$env:VIBEBUS_VERSION-windows-x64.zip",
+            "VibeBus-Codex-plugin-$env:VIBEBUS_VERSION.zip",
+            "VibeBus-$env:VIBEBUS_VERSION-source.zip",
+            "SHA256SUMS.txt",
+            "release-manifest.json",
+            "VibeBus-$env:VIBEBUS_VERSION-windows-x64.cdx.json",
+            "supply-chain-evidence.json"
+          )
+          $available = @(Get-ChildItem -LiteralPath dist -File)
+          $missing = @($requiredNames | Where-Object { $_ -notin $available.Name })
+          if ($missing.Count -ne 0) {
+            throw "Release evidence set is incomplete: $($missing -join ', ')."
           }
-          if ($assets.Count -lt 7) {
-            throw "Expected at least seven release assets, found $($assets.Count)."
-          }
+          $assets = @($available | Where-Object { $_.Name -in $requiredNames })
           $releaseArguments = @("release", "create", $env:RELEASE_TAG)
           $releaseArguments += $assets.FullName
           $releaseArguments += @("--verify-tag", "--generate-notes", "--title", "VibeBus $env:VIBEBUS_VERSION")

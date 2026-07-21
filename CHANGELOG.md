@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Established the public open-source release contract: GitHub Releases are the official distribution channel, stable SemVer tags must resolve to commits reachable from `main`, and prerelease publishing remains disabled until it has its own verified workflow.
+- Added source archives, release-evidence manifest fields, public contribution and conduct guidance, Issue/PR templates, Dependabot updates, download verification instructions, and explicit first-install, upgrade, and rollback rules.
 - Added native macOS Security.framework Keychain storage for Agent and Operator credentials, including redacted registration/rotation, vault fallback, status, explicit deletion, and an isolated real-Keychain acceptance fixture.
 - Added native-binary macOS SessionStart/PostToolUse/Stop Hooks with the existing path-only Git, no-log test, reliable-exit, and review-only handoff boundaries.
 - Added Apple Silicon local plugin packaging, ad-hoc signing, manifest/archive/checksum validation, installed-cache acceptance, and a macOS CI job. Developer ID signing and notarization remain production gates.

@@ -48,7 +48,7 @@ VIBEBUS_CODESIGN_IDENTITY='Developer ID Application: Example Corp (TEAMID)' \
   ./scripts/package-plugin-macos.sh
 ```
 
-Public distribution still requires verification that the selected identity is the intended Developer ID, notarization, stapling where applicable, and clean downloaded-artifact Gatekeeper acceptance. The repository never stores the identity's private key or notary credentials.
+macOS packages are source and CI acceptance outputs, not current GitHub Release assets. A future public macOS distribution contract must verify the selected Developer ID identity, notarization, stapling where applicable, checksums, and clean downloaded-artifact Gatekeeper acceptance. The repository never stores the identity's private key or notary credentials.
 
 ## Install the local plugin
 

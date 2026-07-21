@@ -1,18 +1,23 @@
-## 修改项
+## Summary
 
-- <!-- 说明本次实际修改 -->
+- <!-- Explain the user-visible change and why it belongs in this PR. -->
 
-## 验证
+## Validation
 
-- <!-- 列出测试、静态检查或人工验证 -->
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo test --all-targets --locked`
+- [ ] `cargo clippy --all-targets --all-features --locked -- -D warnings`
+- [ ] <!-- Add packaging, installer, documentation, or manual checks that apply. -->
 
-## 后续跟进方向
+## Compatibility and release notes
 
-- <!-- 列出下一步、已知边界，或写明无 -->
+- CLI / MCP / database / plugin impact:
+- Upgrade or rollback impact:
+- SemVer impact: <!-- patch / minor / major / none -->
+- Changelog entry: <!-- link, text, or why none is needed -->
 
-## 影响与兼容性
+## Contributor checklist
 
-- 用户影响：
-- CLI / MCP：
-- 数据库迁移：
-- 插件兼容性：
+- [ ] I have read `CONTRIBUTING.md` and `CODE_OF_CONDUCT.md`.
+- [ ] I did not add credentials, generated release assets, databases, or local build output.
+- [ ] I have described follow-up work or stated that none is needed.

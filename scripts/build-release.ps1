@@ -2,6 +2,7 @@ param(
     [string]$Version = "",
     [string]$CargoPath = "cargo",
     [string]$OutputDirectory = "dist",
+    [string]$SourceRef = "HEAD",
     [switch]$SkipCargoBuild,
     [switch]$Sign
 )
@@ -13,6 +14,13 @@ $pluginManifestPath = Join-Path $repoRoot "plugins\vibebus\.codex-plugin\plugin.
 $sourceRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceRevision -notmatch '^[0-9a-f]{40}$') {
     throw "Git source revision could not be resolved."
+}
+$sourceRefRevision = (& git -C $repoRoot rev-parse "$SourceRef^{commit}").Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceRefRevision -notmatch '^[0-9a-f]{40}$') {
+    throw "SourceRef must resolve to a Git commit."
+}
+if ($sourceRefRevision -ne $sourceRevision) {
+    throw "SourceRef must resolve to the checked-out source revision."
 }
 
 $cargoText = Get-Content -Raw -LiteralPath $cargoManifestPath
@@ -96,7 +104,8 @@ if ($Sign) {
 
 $portableZip = Join-Path $outputRoot "VibeBus-$Version-windows-x64.zip"
 $pluginZip = Join-Path $outputRoot "VibeBus-Codex-plugin-$Version.zip"
-foreach ($archive in @($portableZip, $pluginZip)) {
+$sourceZip = Join-Path $outputRoot "VibeBus-$Version-source.zip"
+foreach ($archive in @($portableZip, $pluginZip, $sourceZip)) {
     if (Test-Path -LiteralPath $archive) {
         Remove-Item -Force -LiteralPath $archive
     }
@@ -108,8 +117,12 @@ Compress-Archive -CompressionLevel Optimal -LiteralPath @(
     (Join-Path $stagingRoot "README.md")
 ) -DestinationPath $portableZip
 Compress-Archive -CompressionLevel Optimal -LiteralPath (Join-Path $stagingRoot "plugins\vibebus") -DestinationPath $pluginZip
+& git -C $repoRoot archive --format=zip "--prefix=VibeBus-$Version/" "--output=$sourceZip" $SourceRef
+if ($LASTEXITCODE -ne 0) {
+    throw "git archive failed for source ref '$SourceRef' with exit code $LASTEXITCODE."
+}
 
-$releaseFiles = @($msiPath, $portableZip, $pluginZip)
+$releaseFiles = @($msiPath, $portableZip, $pluginZip, $sourceZip)
 $hashLines = foreach ($file in $releaseFiles) {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
     "$hash  $([System.IO.Path]::GetFileName($file))"
@@ -124,6 +137,7 @@ $manifest = [ordered]@{
     platform = "windows-x64"
     signed = [bool]$Sign
     sourceRevision = $sourceRevision
+    sourceRef = $SourceRef
     generatedAt = [DateTimeOffset]::UtcNow.ToString("O")
     artifacts = foreach ($file in $releaseFiles) {
         $item = Get-Item -LiteralPath $file

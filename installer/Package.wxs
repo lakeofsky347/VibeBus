@@ -10,7 +10,7 @@
     UpgradeCode="{08BC19E4-1338-4A55-B3D5-F4D9D8B5968C}">
 
     <SummaryInformation Description="VibeBus local coordination bus and Codex plugin" />
-    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of VibeBus is already installed." />
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of VibeBus is already installed. To return to an earlier version, uninstall the newer version first, then install the earlier MSI." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <Property Id="ARPHELPLINK" Value="https://github.com/lakeofsky347/VibeBus" />

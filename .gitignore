@@ -10,3 +10,9 @@
 *.db-shm
 *.db-wal
 .DS_Store
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key

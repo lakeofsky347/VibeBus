@@ -2,18 +2,18 @@
 
 ## Supported versions
 
-Security fixes are developed against the latest `0.10.x` source and its current stacked pull-request baseline. The only G1 production candidate is the Windows x64 signed GitHub Release `v0.10.0`; macOS local packages and Linux containers are not production-release claims. Older snapshots and local backup artifacts are retained only as recovery evidence and are not separately supported release lines.
+Security fixes are developed for the latest stable GitHub Release and the `main` branch. Older releases may receive guidance, but are not guaranteed to receive backports. Check [GitHub Releases](https://github.com/lakeofsky347/VibeBus/releases) for the current stable version and its signed Windows evidence set.
 
-Release candidates are gated with pinned GitHub Actions, `cargo-deny` advisory/license/source checks, and a CycloneDX SBOM. Report a suspected supply-chain issue privately with the affected source revision, SBOM component, and minimal reproduction, but never attach secrets or local databases.
+Stable releases are protected by pinned GitHub Actions, `cargo deny` advisory/license/source gates, CycloneDX SBOM generation, SHA-256 checksums, and Windows Authenticode verification. These controls reduce risk; they do not replace independent review before deployment.
 
-## Report a vulnerability privately
+## Reporting a vulnerability
 
-Do not open a public issue, discussion, or pull request for a suspected vulnerability. Use the repository's [private vulnerability reporting form](https://github.com/lakeofsky347/VibeBus/security/advisories/new) so maintainers can review the report before disclosure.
+Do not open a public issue, discussion, or pull request for a suspected vulnerability. Use the repository's [private vulnerability reporting form](https://github.com/lakeofsky347/VibeBus/security/advisories/new).
 
-Include the affected version or commit, platform, impact, minimal reproduction steps, and suggested mitigation when available. Do not include live Agent tokens, recovery keys, Operator secrets, Windows Credential Manager or macOS Keychain exports, signing/notarization credentials, cloud credentials, database copies, or unrelated personal data. Use placeholders in reproductions.
+Include the affected version or commit, supported platform, impact, minimal safe reproduction, and suggested mitigation where possible. Do not attach Agent tokens, recovery keys, Operator secrets, Keychain or Credential Manager exports, signing material, cloud credentials, local databases, or unrelated personal data.
 
-VibeBus is a local coordination boundary, not an operating-system sandbox. Reports should distinguish application authorization bypasses from raw filesystem access already available to another process running as the same operating-system user.
+Maintainers will acknowledge and triage reports privately. Coordinated disclosure timing depends on severity, reproduction, affected users, and availability of a safe fix. Do not assume an issue is fixed until a maintainer identifies a released version or published advisory.
 
-## Disclosure
+## Security-sensitive contributions
 
-Please allow maintainers time to reproduce and remediate the issue before public disclosure. No fixed response or remediation SLA is promised. Accepted fixes must preserve credential redaction, project scoping, explicit Operator approval for destructive maintenance, and the no-transcript/no-raw-log lifecycle-fact boundary.
+Security changes must preserve project scoping, credential redaction, explicit Operator approval for destructive maintenance, and the bounded no-transcript/no-raw-log lifecycle-fact boundary. If a proposed change weakens one of these controls, explain the threat model, alternatives, migration, tests, and rollback plan in the private report or pull request as appropriate.
