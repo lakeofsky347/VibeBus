@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-contract:
+    name: OSS release contract metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Verify public-governance files and stable-release controls
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          required = [
+              ".github/ISSUE_TEMPLATE/bug_report.yml",
+              ".github/ISSUE_TEMPLATE/feature_request.yml",
+              ".github/PULL_REQUEST_TEMPLATE.md",
+              ".github/dependabot.yml",
+              "CODE_OF_CONDUCT.md",
+              "CONTRIBUTING.md",
+              "SECURITY.md",
+              "docs/release.md",
+          ]
+          missing = [path for path in required if not Path(path).is_file()]
+          assert not missing, f"Missing OSS governance files: {missing}"
+
+          release = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+          for marker in (
+              "origin/main",
+              "Release tag must point to a commit reachable from main.",
+              "--verify-tag",
+              "GitHub automatic source archives",
+              "source-release-manifest.json",
+              "SHA256SUMS.txt",
+              "supply-chain-evidence.json",
+          ):
+              assert marker in release, f"Release workflow is missing: {marker}"
+          for prohibited in (
+              "windows-latest",
+              "environment: release",
+              "WINDOWS_SIGNING_CERTIFICATE",
+              "build-release.ps1",
+              "test-installer.ps1",
+              "VibeBus-$env:VIBEBUS_VERSION-source.zip",
+          ):
+              assert prohibited not in release, f"Source-only release workflow still requires: {prohibited}"
+          PY
+
+  supply-chain:
+    name: Rust CVE, license, source, and SBOM gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup show active-toolchain
+
+      - name: Install pinned supply-chain tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Gate Rust advisories, licenses, bans, and sources
+        run: cargo deny check advisories bans licenses sources
+
+      - name: Generate and normalize CycloneDX SBOM
+        run: |
+          cargo cyclonedx --format json
+          python3 scripts/normalize-cyclonedx.py --self-test
+          python3 scripts/normalize-cyclonedx.py --input vibebus.cdx.json --output dist/vibebus.cdx.json
+
+      - name: Upload supply-chain evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vibebus-supply-chain-${{ github.sha }}
+          path: 'dist/*.cdx.json'
+          if-no-files-found: error
+          retention-days: 14
+
+  container:
+    name: Linux container acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Build and test Linux container
+        shell: pwsh
+        run: ./scripts/test-container.ps1
+
+  macos:
+    name: macOS build, Keychain, Hooks, and package
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test native lifecycle Hooks
+        run: ./scripts/test-lifecycle-hooks.sh
+
+      - name: Test macOS Keychain lifecycle
+        run: ./scripts/test-macos-keychain.sh
+
+      - name: Build and validate macOS package
+        run: |
+          ./scripts/package-plugin-macos.sh
+          ./scripts/validate-plugin-macos.sh dist/staging/VibeBus-0.10.0-macos-$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)/plugins/vibebus
+          cd dist
+          shasum -a 256 -c SHA256SUMS-macos-*.txt
+
+      - name: Upload macOS acceptance assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vibebus-macos-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/*macos-*.zip
+            dist/SHA256SUMS-macos-*.txt
+            dist/release-manifest-macos-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows build, test, and package
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup show active-toolchain
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 6.0.x
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test lifecycle hooks
+        shell: pwsh
+        run: ./scripts/test-lifecycle-hooks.ps1
+
+      - name: Build unsigned CI acceptance assets
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+
+      - name: Test backup restore drill
+        shell: pwsh
+        run: ./scripts/test-backup-restore.ps1 -BinaryPath ./target/release/vibebus.exe
+
+      - name: Validate MSI and extracted payload
+        shell: pwsh
+        run: |
+          $msiFiles = @(Get-ChildItem -LiteralPath dist -Filter "VibeBus-*-windows-x64.msi")
+          if ($msiFiles.Count -ne 1) {
+            throw "Expected exactly one MSI, found $($msiFiles.Count)."
+          }
+          $msi = $msiFiles[0]
+          ./scripts/test-installer.ps1 -MsiPath $msi.FullName -ExerciseLifecycle
+
+      - name: Upload CI release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vibebus-windows-${{ github.sha }}
+          path: |
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
+            dist/release-manifest.json
+          if-no-files-found: error
+          retention-days: 14

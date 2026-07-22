@@ -1,6 +1,7 @@
 param(
     [string]$CargoPath = "cargo",
-    [string]$PluginValidator = ""
+    [string]$PluginValidator = "",
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,11 +11,30 @@ $releaseBinary = Join-Path $repoRoot "target\release\vibebus.exe"
 $pluginBin = Join-Path $pluginRoot "bin"
 $packagedBinary = Join-Path $pluginBin "vibebus.exe"
 
+$trackedBinary = & git -C $repoRoot ls-files --error-unmatch -- "plugins/vibebus/bin/vibebus.exe" 2>$null
+if ($LASTEXITCODE -eq 0) {
+    throw "plugins/vibebus/bin/vibebus.exe must be generated from source and must not be tracked."
+}
+
+if ($CargoPath -eq "cargo" -and $null -eq (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $localCargo = Join-Path $repoRoot ".tools\cargo\bin\cargo.exe"
+    $localCargoHome = Join-Path $repoRoot ".tools\cargo"
+    $localRustupHome = Join-Path $repoRoot ".tools\rustup"
+    if (-not (Test-Path -LiteralPath $localCargo)) {
+        throw "Cargo was not found on PATH or at '$localCargo'."
+    }
+    $env:CARGO_HOME = $localCargoHome
+    $env:RUSTUP_HOME = $localRustupHome
+    $CargoPath = $localCargo
+}
+
 Push-Location $repoRoot
 try {
-    & $CargoPath build --release
-    if ($LASTEXITCODE -ne 0) {
-        throw "cargo build --release failed with exit code $LASTEXITCODE"
+    if (-not $SkipBuild) {
+        & $CargoPath build --release --locked
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build --release --locked failed with exit code $LASTEXITCODE"
+        }
     }
 
     New-Item -ItemType Directory -Force -Path $pluginBin | Out-Null
@@ -25,6 +45,8 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "plugin validation failed with exit code $LASTEXITCODE"
         }
+    } else {
+        & (Join-Path $PSScriptRoot "validate-plugin.ps1") -PluginRoot $pluginRoot | Out-Null
     }
 
     $file = Get-Item -LiteralPath $packagedBinary

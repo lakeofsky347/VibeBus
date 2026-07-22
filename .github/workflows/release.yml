@@ -1,0 +1,211 @@
+name: Publish source-only GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  source-release:
+    name: Verify and publish source-only release evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup show active-toolchain
+
+      - name: Verify stable main tag and source versions
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Stable release tag must match vX.Y.Z; prerelease tags are not enabled." >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ ! "$tag_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release tag must resolve to a commit." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Release tag must point to a commit reachable from main." >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$tag_commit" ]]; then
+            echo "Release checkout does not match the requested tag commit." >&2
+            exit 1
+          fi
+          cargo_version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' Cargo.toml | head -n 1)"
+          plugin_version="$(python3 -c 'import json; print(json.load(open("plugins/vibebus/.codex-plugin/plugin.json", encoding="utf-8"))["version"])')"
+          if [[ "$version" != "$cargo_version" || "$version" != "$plugin_version" ]]; then
+            echo "Tag, Cargo, and plugin versions must match (tag=$version cargo=$cargo_version plugin=$plugin_version)." >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "Release source checkout must be clean." >&2
+            exit 1
+          fi
+          {
+            echo "VIBEBUS_VERSION=$version"
+            echo "SOURCE_REVISION=$tag_commit"
+          } >> "$GITHUB_ENV"
+
+      - name: Run source release gates
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Install pinned supply-chain tools
+        shell: bash
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Gate Rust advisories, licenses, bans, and sources
+        shell: bash
+        run: cargo deny check advisories bans licenses sources
+
+      - name: Generate normalized source SBOM and supply-chain evidence
+        shell: bash
+        run: |
+          cargo cyclonedx --format json
+          python3 scripts/normalize-cyclonedx.py --self-test
+          mapfile -t sboms < <(find . -maxdepth 1 -type f -name '*.cdx.json' -print)
+          if [[ "${#sboms[@]}" -ne 1 ]]; then
+            echo "Expected exactly one CycloneDX SBOM, found ${#sboms[@]}." >&2
+            exit 1
+          fi
+          mkdir -p dist
+          sbom_path="dist/VibeBus-${VIBEBUS_VERSION}.cdx.json"
+          python3 scripts/normalize-cyclonedx.py --input "${sboms[0]}" --output "$sbom_path"
+          python3 - "$SOURCE_REVISION" "$(basename "$sbom_path")" > dist/supply-chain-evidence.json <<'PY'
+          import json
+          import os
+          import sys
+
+          print(json.dumps({
+              "version": os.environ["VIBEBUS_VERSION"],
+              "tag": os.environ["RELEASE_TAG"],
+              "sourceRevision": sys.argv[1],
+              "sbom": sys.argv[2],
+              "gates": [
+                  "cargo-deny advisories",
+                  "cargo-deny licenses",
+                  "cargo-deny bans",
+                  "cargo-deny sources",
+              ],
+          }, indent=2))
+          PY
+
+      - name: Generate source-release manifest and checksums
+        shell: bash
+        run: |
+          sbom_name="VibeBus-${VIBEBUS_VERSION}.cdx.json"
+          python3 - "$SOURCE_REVISION" "$sbom_name" > dist/source-release-manifest.json <<'PY'
+          import json
+          import os
+          import sys
+
+          print(json.dumps({
+              "version": os.environ["VIBEBUS_VERSION"],
+              "tag": os.environ["RELEASE_TAG"],
+              "sourceRevision": sys.argv[1],
+              "sourceArchives": {
+                  "providedBy": "GitHub automatic source archives",
+                  "zip": "Source code (zip)",
+                  "tarball": "Source code (tar.gz)",
+              },
+              "evidence": {
+                  "checksums": "SHA256SUMS.txt",
+                  "sbom": sys.argv[2],
+                  "supplyChain": "supply-chain-evidence.json",
+              },
+          }, indent=2))
+          PY
+          (
+            cd dist
+            sha256sum "$sbom_name" supply-chain-evidence.json source-release-manifest.json > SHA256SUMS.txt
+          )
+
+      - name: Validate source-only evidence set
+        shell: bash
+        run: |
+          sbom_name="VibeBus-${VIBEBUS_VERSION}.cdx.json"
+          sha256sum --check dist/SHA256SUMS.txt
+          python3 - "$sbom_name" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          sbom_name = sys.argv[1]
+          expected = {sbom_name, "supply-chain-evidence.json", "source-release-manifest.json"}
+          rows = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
+          covered = {row.split(maxsplit=1)[1].lstrip("*") for row in rows if row.split(maxsplit=1)}
+          assert covered == expected, f"Checksums must cover only source evidence: {covered}"
+          manifest = json.loads(Path("dist/source-release-manifest.json").read_text(encoding="utf-8"))
+          assert manifest["sourceArchives"]["providedBy"] == "GitHub automatic source archives"
+          assert set(manifest["evidence"].values()) == {"SHA256SUMS.txt", *expected - {"source-release-manifest.json"}}
+          assert str(Path.cwd()) not in Path("dist/source-release-manifest.json").read_text(encoding="utf-8")
+          assert str(Path.cwd()) not in Path("dist/" + sbom_name).read_text(encoding="utf-8")
+          PY
+
+      - name: Upload source-only release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vibebus-${{ env.VIBEBUS_VERSION }}-source-evidence
+          path: |
+            dist/SHA256SUMS.txt
+            dist/VibeBus-${{ env.VIBEBUS_VERSION }}.cdx.json
+            dist/supply-chain-evidence.json
+            dist/source-release-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          required_names=(
+            "SHA256SUMS.txt"
+            "VibeBus-${VIBEBUS_VERSION}.cdx.json"
+            "supply-chain-evidence.json"
+            "source-release-manifest.json"
+          )
+          assets=()
+          for name in "${required_names[@]}"; do
+            if [[ ! -f "dist/$name" ]]; then
+              echo "Release evidence set is incomplete: $name" >&2
+              exit 1
+            fi
+            assets+=("dist/$name")
+          done
+          gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --generate-notes --title "VibeBus $VIBEBUS_VERSION"

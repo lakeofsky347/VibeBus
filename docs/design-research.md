@@ -35,3 +35,32 @@ This combination keeps the strongest properties from the references:
 ## Compatibility direction
 
 Future network or A2A bridges should translate from the event and artifact model. They must remain adapters; the local SQLite facts stay authoritative for a VibeBus project.
+
+## Release engineering decision
+
+The 0.7 release slice compared four Windows distribution shapes:
+
+| Approach | Strength | Decision |
+| --- | --- | --- |
+| Portable ZIP only | No installer dependency and easy inspection | Kept as a fallback, but insufficient for PATH and uninstall lifecycle |
+| MSIX | Strong platform identity and signing model | Deferred because local/private distribution requires certificate identity and deployment policy that would complicate the MVP |
+| Inno Setup or NSIS EXE | Flexible UI and scripting | Rejected for now because custom scripting increases the installer attack and maintenance surface |
+| WiX MSI | Native Windows Installer upgrade/uninstall semantics and stock ICE validation | Selected, with an explicitly per-user, no-custom-action package |
+
+WiX 7.0.0 was tested first because it is current, but its command-line tool requires explicit OSMF EULA acceptance. VibeBus does not automate legal acceptance on behalf of a maintainer, so the repository pins WiX 4.0.6 under its published MS-RL license. The v4 schema and command-line flow cover the required MSI without extensions.
+
+For signing, the chosen baseline is SignTool with a CA-issued PFX stored only as GitHub Secrets. It is provider-neutral and available on GitHub-hosted Windows runners. The production workflow signs the executable before MSI construction, signs the MSI afterward, and verifies both. Cloud or hardware-backed signing remains a replaceable adapter when certificate operations justify it.
+
+## Destructive-maintenance authorization decision
+
+Version 0.8 compared three retention authorization shapes:
+
+| Approach | Strength | Decision |
+| --- | --- | --- |
+| Agent token plus typed plan ID | Simple and already implemented | Rejected as the only gate because the same autonomous caller can both plan and delete |
+| Pass a long-lived operator secret through MCP or command arguments | Easy to automate | Rejected because it puts the stronger capability in model-visible inputs and removes meaningful separation |
+| Interactive CLI approval stored as a short-lived database capability | Separates planning from local operator consent without exposing the secret to MCP | Selected |
+
+The selected flow keeps SQLite authoritative while adding a procedural human-presence boundary. Operator initialization, rotation, vault restoration, and approval require a real terminal and exact typed confirmation. The secret is stored in a distinct Windows Credential Manager target; the database stores only its digest and generation. An approval binds the exact plan ID, policy, expiry, and operator generation. Apply consumes it atomically with cleanup and report storage.
+
+This is deliberately not claimed as protection from a malicious process already executing as the same Windows user. Such a process sits inside the current local trust boundary. The capability prevents routine MCP/Agent workflows and redirected automation from accidentally authorizing destructive maintenance, while retaining a clear future adapter point for hardware-backed or multi-party approval.

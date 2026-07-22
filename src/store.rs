@@ -6,21 +6,39 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params_from_iter,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+type ReservationRenewRow = (Option<String>, String, bool, Option<String>, i64);
+
 use crate::error::{BusError, Result};
 use crate::models::{
-    AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, DoctorReport, EventView,
-    HandoffSnapshot, MessageReceipt, MessageView, ProjectMetadata, RecoveryKeyView, ReleaseResult,
-    ReservationView, SubscriptionPoll, SubscriptionView, TaskView,
+    AgentRecovery, AgentRegistration, AgentView, ArtifactView, BackupView, CompactionMetricsView,
+    CompactionView, ContextItemView, ContextScopeView, ContextSyncView, DecisionView, DoctorReport,
+    EventView, GitCommitFactView, HandoffProposalView, HandoffSnapshot, MessageReceipt,
+    MessageView, OperatorCredentialView, OperatorStatusView, ProjectMetadata, RecoveryKeyView,
+    ReleaseResult, ReservationView, ResponsibilityOverrideView, ResponsibilityPolicyView,
+    RetentionApprovalView, RetentionCounts, RetentionPlan, RetentionPolicy,
+    RetentionProtectionView, RetentionReport, RetentionStateView, SubscriptionAck,
+    SubscriptionDeliveryView, SubscriptionPeek, SubscriptionPoll, SubscriptionView,
+    TaskThreadBindingView, TaskView, TestResultFactView,
+};
+use crate::policy::{
+    ResponsibilityPolicy, normalize_policy_pattern, normalize_project_path, policy_pattern_matches,
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 11;
+const DAY_MS: i64 = 86_400_000;
+const MIN_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 60;
+const MAX_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 3_600;
+const MIN_CONTEXT_BYTE_BUDGET: usize = 4_096;
+const MAX_CONTEXT_BYTE_BUDGET: usize = 1_048_576;
+const MAX_CONTEXT_ITEM_LIMIT: usize = 500;
 const TASK_STATUSES: &[&str] = &[
     "pending",
     "ready",
@@ -36,6 +54,14 @@ const TASK_STATUSES: &[&str] = &[
 struct AuthenticatedAgent {
     id: String,
     name: String,
+    role: String,
+}
+
+struct ReceiptLifecycle {
+    requires_ack: bool,
+    read_at: Option<i64>,
+    ack_at: Option<i64>,
+    closed_at: Option<i64>,
 }
 
 struct TaskRecord {
@@ -48,6 +74,53 @@ struct TaskRecord {
     blocked_reason: Option<String>,
     created_at: i64,
     updated_at: i64,
+}
+
+struct ContextCandidate {
+    sort_key: String,
+    kind: &'static str,
+    value: serde_json::Value,
+}
+
+struct SubscriptionRecord {
+    subscription_id: String,
+    name: String,
+    event_types: Vec<String>,
+    cursor_sequence: i64,
+    pending_delivery: Option<SubscriptionDeliveryView>,
+    last_acked_delivery_id: Option<String>,
+    last_acked_through_sequence: Option<i64>,
+    last_acked_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl SubscriptionRecord {
+    fn view(&self, agent: &str) -> SubscriptionView {
+        SubscriptionView {
+            subscription_id: self.subscription_id.clone(),
+            agent: agent.to_owned(),
+            name: self.name.clone(),
+            event_types: self.event_types.clone(),
+            cursor_sequence: self.cursor_sequence,
+            pending_delivery: self.pending_delivery.clone(),
+            last_acked_delivery_id: self.last_acked_delivery_id.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            event_max_age_days: 90,
+            keep_recent_events: 1_000,
+            idempotency_max_age_days: 30,
+            closed_message_max_age_days: 30,
+            terminal_binding_max_age_days: 90,
+        }
+    }
 }
 
 pub struct Bus {
@@ -341,6 +414,9 @@ impl Bus {
                 "unsupported priority '{priority}'"
             )));
         }
+        if let Some(thread_id) = thread_id {
+            validate_thread_id(thread_id)?;
+        }
         let request_hash = idempotency_key
             .map(|key| {
                 validate_idempotency_key(key)?;
@@ -432,6 +508,7 @@ impl Bus {
             created_at: now,
             read_at: None,
             ack_at: None,
+            closed_at: None,
         };
         if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
             store_idempotent(
@@ -463,28 +540,34 @@ impl Bus {
     }
 
     pub fn inbox(&self, agent: &str, token: &str, unread_only: bool) -> Result<Vec<MessageView>> {
+        self.inbox_with_options(agent, token, unread_only, false)
+    }
+
+    pub fn inbox_with_options(
+        &self,
+        agent: &str,
+        token: &str,
+        unread_only: bool,
+        include_closed: bool,
+    ) -> Result<Vec<MessageView>> {
         let recipient = self.authenticate(agent, token)?;
-        let sql = if unread_only {
+        let mut statement = self.conn.prepare(
             "SELECT m.id, sender.name, recipient.name, m.thread_id, m.priority,
-                    m.subject, m.body, m.requires_ack, m.created_at, r.read_at, r.ack_at
-             FROM message_receipts r
-             JOIN messages m ON m.id = r.message_id
-             JOIN agents sender ON sender.id = m.sender_agent_id
-             JOIN agents recipient ON recipient.id = r.recipient_agent_id
-             WHERE r.recipient_agent_id = ?1 AND r.read_at IS NULL
-             ORDER BY m.created_at DESC"
-        } else {
-            "SELECT m.id, sender.name, recipient.name, m.thread_id, m.priority,
-                    m.subject, m.body, m.requires_ack, m.created_at, r.read_at, r.ack_at
+                    m.subject, m.body, m.requires_ack, m.created_at, r.read_at, r.ack_at,
+                    r.closed_at
              FROM message_receipts r
              JOIN messages m ON m.id = r.message_id
              JOIN agents sender ON sender.id = m.sender_agent_id
              JOIN agents recipient ON recipient.id = r.recipient_agent_id
              WHERE r.recipient_agent_id = ?1
-             ORDER BY m.created_at DESC"
-        };
-        let mut statement = self.conn.prepare(sql)?;
-        let rows = statement.query_map(params![recipient.id], map_message)?;
+               AND (?2 = 0 OR r.read_at IS NULL)
+               AND (?3 = 1 OR r.closed_at IS NULL)
+             ORDER BY m.created_at DESC",
+        )?;
+        let rows = statement.query_map(
+            params![recipient.id, unread_only as i64, include_closed as i64],
+            map_message,
+        )?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -504,6 +587,85 @@ impl Bus {
         message_id: &str,
     ) -> Result<MessageReceipt> {
         self.update_receipt(agent, token, message_id, true)
+    }
+
+    pub fn close_message(
+        &mut self,
+        agent: &str,
+        token: &str,
+        message_id: &str,
+    ) -> Result<MessageReceipt> {
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<ReceiptLifecycle> = tx
+            .query_row(
+                "SELECT m.requires_ack, r.read_at, r.ack_at, r.closed_at
+                 FROM message_receipts r
+                 JOIN messages m ON m.id = r.message_id
+                 WHERE r.message_id = ?1 AND r.recipient_agent_id = ?2",
+                params![message_id, actor.id],
+                |row| {
+                    Ok(ReceiptLifecycle {
+                        requires_ack: row.get(0)?,
+                        read_at: row.get(1)?,
+                        ack_at: row.get(2)?,
+                        closed_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        let current = current.ok_or_else(|| {
+            BusError::Unauthorized(format!(
+                "message '{message_id}' is not addressed to agent '{}'",
+                actor.name
+            ))
+        })?;
+        if let Some(closed_at) = current.closed_at {
+            tx.commit()?;
+            return Ok(MessageReceipt {
+                message_id: message_id.to_owned(),
+                recipient: actor.name,
+                read_at: current.read_at.unwrap_or(closed_at),
+                ack_at: current.ack_at,
+                closed_at: Some(closed_at),
+            });
+        }
+        if current.requires_ack && current.ack_at.is_none() {
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' requires ACK before it can be closed"
+            )));
+        }
+        let changed = tx.execute(
+            "UPDATE message_receipts
+             SET read_at = COALESCE(read_at, ?1), closed_at = ?1
+             WHERE message_id = ?2 AND recipient_agent_id = ?3 AND closed_at IS NULL",
+            params![now, message_id, actor.id],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' was closed concurrently"
+            )));
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "message_closed",
+            "message",
+            message_id,
+            json!({"agent": actor.name, "at": now}),
+        )?;
+        tx.commit()?;
+        Ok(MessageReceipt {
+            message_id: message_id.to_owned(),
+            recipient: actor.name,
+            read_at: current.read_at.unwrap_or(now),
+            ack_at: current.ack_at,
+            closed_at: Some(now),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -710,6 +872,15 @@ impl Bus {
         if status == "completed" {
             unlock_ready_tasks(&tx, &self.project.project_id, now)?;
         }
+        let thread_bindings_closed = if matches!(status, "completed" | "abandoned") {
+            tx.execute(
+                "UPDATE task_thread_bindings SET unbound_at = ?1
+                 WHERE project_id = ?2 AND task_id = ?3 AND unbound_at IS NULL",
+                params![now, self.project.project_id, task_id],
+            )?
+        } else {
+            0
+        };
         append_event(
             &tx,
             &self.project.project_id,
@@ -724,7 +895,8 @@ impl Bus {
             json!({
                 "status": status,
                 "blockedReason": blocked_reason,
-                "previousVersion": expected_version
+                "previousVersion": expected_version,
+                "threadBindingsClosed": thread_bindings_closed
             }),
         )?;
         tx.commit()?;
@@ -785,6 +957,169 @@ impl Bus {
             .collect()
     }
 
+    pub fn bind_task_thread(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        thread_id: &str,
+    ) -> Result<TaskThreadBindingView> {
+        validate_task_id(task_id)?;
+        validate_thread_id(thread_id)?;
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_task_owner(&tx, &self.project.project_id, task_id, &actor, false)?;
+        let existing: Option<TaskThreadBindingView> = tx
+            .query_row(
+                "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+                 FROM task_thread_bindings b
+                 JOIN agents owner ON owner.id = b.agent_id
+                 WHERE b.project_id = ?1 AND b.task_id = ?2 AND b.unbound_at IS NULL",
+                params![self.project.project_id, task_id],
+                map_task_thread_binding,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.thread_id == thread_id {
+                tx.commit()?;
+                return Ok(existing);
+            }
+            return Err(BusError::Conflict(format!(
+                "task '{task_id}' is already bound to thread '{}'",
+                existing.thread_id
+            )));
+        }
+        let binding = TaskThreadBindingView {
+            binding_id: format!("tbd_{}", Uuid::new_v4().simple()),
+            task_id: task_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            agent: actor.name.clone(),
+            bound_at: now,
+            unbound_at: None,
+        };
+        tx.execute(
+            "INSERT INTO task_thread_bindings
+             (id, project_id, task_id, thread_id, agent_id, bound_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                binding.binding_id,
+                self.project.project_id,
+                task_id,
+                thread_id,
+                actor.id,
+                now
+            ],
+        )?;
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "task_thread_bound",
+            "task_thread_binding",
+            &binding.binding_id,
+            json!({"taskId": task_id, "threadId": thread_id}),
+        )?;
+        tx.commit()?;
+        Ok(binding)
+    }
+
+    pub fn unbind_task_thread(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        thread_id: &str,
+    ) -> Result<TaskThreadBindingView> {
+        validate_task_id(task_id)?;
+        validate_thread_id(thread_id)?;
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_task_owner(&tx, &self.project.project_id, task_id, &actor, true)?;
+        let active: Option<TaskThreadBindingView> = tx
+            .query_row(
+                "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+                 FROM task_thread_bindings b
+                 JOIN agents owner ON owner.id = b.agent_id
+                 WHERE b.project_id = ?1 AND b.task_id = ?2 AND b.thread_id = ?3
+                   AND b.unbound_at IS NULL",
+                params![self.project.project_id, task_id, thread_id],
+                map_task_thread_binding,
+            )
+            .optional()?;
+        let Some(mut binding) = active else {
+            let previous = tx
+                .query_row(
+                    "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+                     FROM task_thread_bindings b
+                     JOIN agents owner ON owner.id = b.agent_id
+                     WHERE b.project_id = ?1 AND b.task_id = ?2 AND b.thread_id = ?3
+                       AND b.agent_id = ?4 AND b.unbound_at IS NOT NULL
+                     ORDER BY b.unbound_at DESC LIMIT 1",
+                    params![self.project.project_id, task_id, thread_id, actor.id],
+                    map_task_thread_binding,
+                )
+                .optional()?;
+            tx.commit()?;
+            return previous.ok_or_else(|| {
+                BusError::Conflict(format!(
+                    "task '{task_id}' has no active binding to thread '{thread_id}'"
+                ))
+            });
+        };
+        let changed = tx.execute(
+            "UPDATE task_thread_bindings SET unbound_at = ?1
+             WHERE project_id = ?2 AND id = ?3 AND unbound_at IS NULL",
+            params![now, self.project.project_id, binding.binding_id],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(format!(
+                "task '{task_id}' thread binding changed concurrently"
+            )));
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "task_thread_unbound",
+            "task_thread_binding",
+            &binding.binding_id,
+            json!({"taskId": task_id, "threadId": thread_id}),
+        )?;
+        tx.commit()?;
+        binding.unbound_at = Some(now);
+        Ok(binding)
+    }
+
+    pub fn list_task_thread_bindings(
+        &self,
+        task_id: Option<&str>,
+        active_only: bool,
+    ) -> Result<Vec<TaskThreadBindingView>> {
+        if let Some(task_id) = task_id {
+            validate_task_id(task_id)?;
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT b.id, b.task_id, b.thread_id, owner.name, b.bound_at, b.unbound_at
+             FROM task_thread_bindings b
+             JOIN agents owner ON owner.id = b.agent_id
+             WHERE b.project_id = ?1
+               AND (?2 IS NULL OR b.task_id = ?2)
+               AND (?3 = 0 OR b.unbound_at IS NULL)
+             ORDER BY b.bound_at DESC, b.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, task_id, active_only as i64],
+            map_task_thread_binding,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn reserve_path(
         &mut self,
         agent: &str,
@@ -816,8 +1151,35 @@ impl Bus {
         reason: Option<&str>,
         idempotency_key: Option<&str>,
     ) -> Result<ReservationView> {
+        self.reserve_path_for_task_idempotent(
+            agent,
+            token,
+            path_pattern,
+            ttl_seconds,
+            exclusive,
+            reason,
+            None,
+            idempotency_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_path_for_task_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        path_pattern: &str,
+        ttl_seconds: i64,
+        exclusive: bool,
+        reason: Option<&str>,
+        task_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<ReservationView> {
         validate_reservation_ttl(ttl_seconds)?;
-        let normalized = normalize_path_pattern(path_pattern)?;
+        if let Some(task_id) = task_id {
+            validate_task_id(task_id)?;
+        }
+        let normalized = normalize_project_path(path_pattern)?;
         let request_hash = idempotency_key
             .map(|key| {
                 validate_idempotency_key(key)?;
@@ -825,11 +1187,13 @@ impl Bus {
                     "pathPattern": normalized,
                     "ttlSeconds": ttl_seconds,
                     "exclusive": exclusive,
-                    "reason": reason
+                    "reason": reason,
+                    "taskId": task_id
                 }))
             })
             .transpose()?;
         let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
         let now = now_ms();
         let expires_at = now + ttl_seconds * 1_000;
         let reservation_id = format!("rsv_{}", Uuid::new_v4().simple());
@@ -849,6 +1213,18 @@ impl Bus {
             tx.commit()?;
             return Ok(cached);
         }
+        if let Some(task_id) = task_id {
+            ensure_nonterminal_task_exists(&tx, &self.project.project_id, task_id)?;
+        }
+        authorize_project_path(
+            &tx,
+            &self.project.project_id,
+            &policy,
+            &actor,
+            task_id,
+            &normalized,
+            now,
+        )?;
 
         let active = {
             let mut statement = tx.prepare(
@@ -879,12 +1255,13 @@ impl Bus {
 
         tx.execute(
             "INSERT INTO reservations
-             (id, project_id, owner_agent_id, path_pattern, exclusive, reason, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, project_id, owner_agent_id, task_id, path_pattern, exclusive, reason, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 reservation_id,
                 self.project.project_id,
                 actor.id,
+                task_id,
                 normalized,
                 exclusive as i64,
                 reason,
@@ -895,6 +1272,7 @@ impl Bus {
         let response = ReservationView {
             reservation_id: reservation_id.clone(),
             owner: actor.name.clone(),
+            task_id: task_id.map(ToOwned::to_owned),
             path_pattern: normalized.clone(),
             exclusive,
             reason: reason.map(ToOwned::to_owned),
@@ -924,6 +1302,7 @@ impl Bus {
                 "exclusive": exclusive,
                 "expiresAt": expires_at,
                 "reason": reason
+                ,"taskId": task_id
             }),
         )?;
         tx.commit()?;
@@ -1015,21 +1394,30 @@ impl Bus {
             tx.commit()?;
             return Ok(cached);
         }
-        let reservation: Option<(String, bool, Option<String>, i64)> = tx
+        let reservation: Option<ReservationRenewRow> = tx
             .query_row(
-                "SELECT path_pattern, exclusive, reason, created_at FROM reservations
+                "SELECT task_id, path_pattern, exclusive, reason, created_at FROM reservations
                  WHERE id = ?1 AND project_id = ?2 AND owner_agent_id = ?3
                    AND released_at IS NULL AND expires_at > ?4",
                 params![reservation_id, self.project.project_id, actor.id, now],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let (path_pattern, exclusive, reason, created_at) = reservation.ok_or_else(|| {
-            BusError::Conflict(format!(
-                "active reservation '{reservation_id}' is expired or not owned by agent '{}'",
-                actor.name
-            ))
-        })?;
+        let (task_id, path_pattern, exclusive, reason, created_at) =
+            reservation.ok_or_else(|| {
+                BusError::Conflict(format!(
+                    "active reservation '{reservation_id}' is expired or not owned by agent '{}'",
+                    actor.name
+                ))
+            })?;
         tx.execute(
             "UPDATE reservations SET expires_at = ?1 WHERE id = ?2 AND project_id = ?3",
             params![expires_at, reservation_id, self.project.project_id],
@@ -1037,6 +1425,7 @@ impl Bus {
         let response = ReservationView {
             reservation_id: reservation_id.to_owned(),
             owner: actor.name.clone(),
+            task_id,
             path_pattern,
             exclusive,
             reason,
@@ -1070,7 +1459,7 @@ impl Bus {
     pub fn list_active_reservations(&self) -> Result<Vec<ReservationView>> {
         let now = now_ms();
         let mut statement = self.conn.prepare(
-            "SELECT r.id, owner.name, r.path_pattern, r.exclusive, r.reason,
+            "SELECT r.id, owner.name, r.task_id, r.path_pattern, r.exclusive, r.reason,
                     r.created_at, r.expires_at
              FROM reservations r JOIN agents owner ON owner.id = r.owner_agent_id
              WHERE r.project_id = ?1 AND r.released_at IS NULL AND r.expires_at > ?2
@@ -1080,11 +1469,12 @@ impl Bus {
             Ok(ReservationView {
                 reservation_id: row.get(0)?,
                 owner: row.get(1)?,
-                path_pattern: row.get(2)?,
-                exclusive: row.get(3)?,
-                reason: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
+                task_id: row.get(2)?,
+                path_pattern: row.get(3)?,
+                exclusive: row.get(4)?,
+                reason: row.get(5)?,
+                created_at: row.get(6)?,
+                expires_at: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1122,7 +1512,7 @@ impl Bus {
             ));
         }
         let actor = self.authenticate(agent, token)?;
-        let normalized = normalize_path_pattern(path)?;
+        let normalized = normalize_project_path(path)?;
         let project_root = self.project_root.canonicalize()?;
         let artifact_path = self.project_root.join(&normalized).canonicalize()?;
         if !artifact_path.starts_with(&project_root) || !artifact_path.is_file() {
@@ -1163,6 +1553,16 @@ impl Bus {
             tx.commit()?;
             return Ok(cached);
         }
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        authorize_project_path(
+            &tx,
+            &self.project.project_id,
+            &policy,
+            &actor,
+            task_id,
+            &normalized,
+            now,
+        )?;
         if let Some(task_id) = task_id {
             let task_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM tasks WHERE project_id = ?1 AND id = ?2)",
@@ -1275,6 +1675,1018 @@ impl Bus {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn inspect_responsibility_policy(
+        &self,
+        agent: &str,
+        token: &str,
+    ) -> Result<ResponsibilityPolicyView> {
+        let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        let now = now_ms();
+        let mut statement = self.conn.prepare(
+            "SELECT o.id, o.task_id, grantee.name, grantor.name, o.path_pattern,
+                    o.reason, o.created_at, o.expires_at
+             FROM responsibility_overrides o
+             JOIN agents grantee ON grantee.id = o.grantee_agent_id
+             JOIN agents grantor ON grantor.id = o.granted_by_agent_id
+             WHERE o.project_id = ?1 AND o.grantee_agent_id = ?2 AND o.expires_at > ?3
+             ORDER BY o.task_id, o.path_pattern, o.created_at, o.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, actor.id, now],
+            map_responsibility_override,
+        )?;
+        Ok(ResponsibilityPolicyView {
+            agent: actor.name,
+            role: actor.role.clone(),
+            configured: policy.configured(),
+            source_path: policy.source_path().to_owned(),
+            policy_sha256: policy.sha256().map(ToOwned::to_owned),
+            allowed_paths: policy.allowed_paths(&actor.role),
+            active_overrides: rows.collect::<std::result::Result<Vec<_>, _>>()?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_responsibility_override_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        grantee: &str,
+        path_pattern: &str,
+        reason: &str,
+        ttl_seconds: i64,
+        idempotency_key: Option<&str>,
+    ) -> Result<ResponsibilityOverrideView> {
+        validate_task_id(task_id)?;
+        validate_identifier("override grantee", grantee)?;
+        validate_responsibility_ttl(ttl_seconds)?;
+        let path_pattern = normalize_policy_pattern(path_pattern)?;
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > 512 {
+            return Err(BusError::Validation(
+                "responsibility override reason must be 1-512 UTF-8 bytes".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        if !policy.configured() {
+            return Err(BusError::Conflict(
+                "responsibility overrides require a configured project policy".into(),
+            ));
+        }
+        let request_hash = idempotency_key
+            .map(|key| {
+                validate_idempotency_key(key)?;
+                hash_json(&json!({
+                    "taskId": task_id,
+                    "grantee": grantee,
+                    "pathPattern": path_pattern,
+                    "reason": reason,
+                    "ttlSeconds": ttl_seconds
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let expires_at = now + ttl_seconds * 1_000;
+        let override_id = format!("rov_{}", Uuid::new_v4().simple());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<ResponsibilityOverrideView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "responsibility.override",
+                key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+        ensure_owned_nonterminal_task(&tx, &self.project.project_id, &actor, task_id)?;
+        let grantee_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM agents WHERE project_id = ?1 AND name = ?2",
+                params![self.project.project_id, grantee],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let grantee_id = grantee_id.ok_or_else(|| BusError::AgentNotFound(grantee.to_owned()))?;
+        tx.execute(
+            "INSERT INTO responsibility_overrides
+             (id, project_id, task_id, grantee_agent_id, granted_by_agent_id,
+              path_pattern, reason, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                override_id,
+                self.project.project_id,
+                task_id,
+                grantee_id,
+                actor.id,
+                path_pattern,
+                reason,
+                now,
+                expires_at
+            ],
+        )?;
+        let response = ResponsibilityOverrideView {
+            override_id: override_id.clone(),
+            task_id: task_id.to_owned(),
+            grantee: grantee.to_owned(),
+            granted_by: actor.name.clone(),
+            path_pattern: path_pattern.clone(),
+            reason: reason.to_owned(),
+            created_at: now,
+            expires_at,
+        };
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "responsibility.override",
+                key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "responsibility_override_granted",
+            "responsibility_override",
+            &override_id,
+            json!({
+                "taskId": task_id,
+                "grantee": grantee,
+                "pathPattern": path_pattern,
+                "expiresAt": expires_at
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_git_commit_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        commit_sha: &str,
+        summary: &str,
+        changed_paths: &[String],
+        idempotency_key: Option<&str>,
+    ) -> Result<GitCommitFactView> {
+        validate_task_id(task_id)?;
+        let commit_sha = normalize_commit_sha(commit_sha)?;
+        let summary = summary.trim();
+        if summary.is_empty() || summary.len() > 512 {
+            return Err(BusError::Validation(
+                "Git commit summary must be 1-512 UTF-8 bytes".into(),
+            ));
+        }
+        if changed_paths.len() > 200 {
+            return Err(BusError::Validation(
+                "a Git commit fact can declare at most 200 changed paths".into(),
+            ));
+        }
+        let mut changed_paths = changed_paths
+            .iter()
+            .map(|path| normalize_project_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        changed_paths.sort();
+        changed_paths.dedup();
+        let actor = self.authenticate(agent, token)?;
+        let policy = ResponsibilityPolicy::load(&self.project_root)?;
+        let request_hash = idempotency_key
+            .map(|key| {
+                validate_idempotency_key(key)?;
+                hash_json(&json!({
+                    "taskId": task_id,
+                    "commitSha": commit_sha,
+                    "summary": summary,
+                    "changedPaths": changed_paths
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let fact_id = format!("gcf_{}", Uuid::new_v4().simple());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<GitCommitFactView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.git_commit",
+                key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+        ensure_owned_nonterminal_task(&tx, &self.project.project_id, &actor, task_id)?;
+        for path in &changed_paths {
+            authorize_project_path(
+                &tx,
+                &self.project.project_id,
+                &policy,
+                &actor,
+                Some(task_id),
+                path,
+                now,
+            )?;
+        }
+        let existing = tx
+            .query_row(
+                "SELECT f.id, f.task_id, author.name, f.commit_sha, f.summary,
+                        f.changed_paths_json, f.recorded_at
+                 FROM git_commit_facts f JOIN agents author ON author.id = f.author_agent_id
+                 WHERE f.project_id = ?1 AND f.task_id = ?2 AND f.commit_sha = ?3",
+                params![self.project.project_id, task_id, commit_sha],
+                map_git_commit_fact,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.author != actor.name
+                || existing.summary != summary
+                || existing.changed_paths != changed_paths
+            {
+                return Err(BusError::Conflict(format!(
+                    "Git commit fact '{task_id}/{commit_sha}' already exists with different semantics"
+                )));
+            }
+            if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+                store_idempotent(
+                    &tx,
+                    &self.project.project_id,
+                    &actor.id,
+                    "fact.git_commit",
+                    key,
+                    request_hash,
+                    &existing,
+                )?;
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        tx.execute(
+            "INSERT INTO git_commit_facts
+             (id, project_id, task_id, author_agent_id, commit_sha, summary,
+              changed_paths_json, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                fact_id,
+                self.project.project_id,
+                task_id,
+                actor.id,
+                commit_sha,
+                summary,
+                serde_json::to_string(&changed_paths)?,
+                now
+            ],
+        )?;
+        let response = GitCommitFactView {
+            fact_id: fact_id.clone(),
+            task_id: task_id.to_owned(),
+            author: actor.name.clone(),
+            commit_sha: commit_sha.clone(),
+            summary: summary.to_owned(),
+            changed_paths: changed_paths.clone(),
+            recorded_at: now,
+        };
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.git_commit",
+                key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "git_commit_recorded",
+            "git_commit_fact",
+            &fact_id,
+            json!({
+                "taskId": task_id,
+                "commitSha": commit_sha,
+                "changedPathCount": changed_paths.len()
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_test_result_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        result_key: &str,
+        suite: &str,
+        outcome: &str,
+        summary: &str,
+        command: Option<&str>,
+        report_artifact_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<TestResultFactView> {
+        validate_task_id(task_id)?;
+        validate_result_key(result_key)?;
+        let suite = suite.trim();
+        if suite.is_empty() || suite.len() > 128 {
+            return Err(BusError::Validation(
+                "test suite must be 1-128 UTF-8 bytes".into(),
+            ));
+        }
+        if !matches!(outcome, "passed" | "failed" | "skipped" | "error") {
+            return Err(BusError::Validation(
+                "test outcome must be passed, failed, skipped, or error".into(),
+            ));
+        }
+        let summary = summary.trim();
+        if summary.is_empty() || summary.len() > 1_024 {
+            return Err(BusError::Validation(
+                "test result summary must be 1-1024 UTF-8 bytes".into(),
+            ));
+        }
+        let command = command.map(str::trim);
+        if command.is_some_and(|value| value.is_empty() || value.len() > 512) {
+            return Err(BusError::Validation(
+                "test command must be 1-512 UTF-8 bytes when provided".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let request_hash = idempotency_key
+            .map(|key| {
+                validate_idempotency_key(key)?;
+                hash_json(&json!({
+                    "taskId": task_id,
+                    "resultKey": result_key,
+                    "suite": suite,
+                    "outcome": outcome,
+                    "summary": summary,
+                    "command": command,
+                    "reportArtifactId": report_artifact_id
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let fact_id = format!("trf_{}", Uuid::new_v4().simple());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<TestResultFactView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.test_result",
+                key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+        ensure_owned_nonterminal_task(&tx, &self.project.project_id, &actor, task_id)?;
+        if let Some(artifact_id) = report_artifact_id {
+            let artifact_task: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT task_id FROM artifacts WHERE project_id = ?1 AND id = ?2",
+                    params![self.project.project_id, artifact_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let artifact_task = artifact_task.ok_or_else(|| {
+                BusError::Validation(format!("report artifact '{artifact_id}' does not exist"))
+            })?;
+            if artifact_task
+                .as_deref()
+                .is_some_and(|value| value != task_id)
+            {
+                return Err(BusError::Conflict(format!(
+                    "report artifact '{artifact_id}' belongs to unrelated task '{}'",
+                    artifact_task.unwrap_or_default()
+                )));
+            }
+        }
+        let existing = tx
+            .query_row(
+                "SELECT f.id, f.task_id, author.name, f.result_key, f.suite, f.outcome,
+                        f.summary, f.command, f.report_artifact_id, f.recorded_at
+                 FROM test_result_facts f JOIN agents author ON author.id = f.author_agent_id
+                 WHERE f.project_id = ?1 AND f.task_id = ?2 AND f.result_key = ?3",
+                params![self.project.project_id, task_id, result_key],
+                map_test_result_fact,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.author != actor.name
+                || existing.suite != suite
+                || existing.outcome != outcome
+                || existing.summary != summary
+                || existing.command.as_deref() != command
+                || existing.report_artifact_id.as_deref() != report_artifact_id
+            {
+                return Err(BusError::Conflict(format!(
+                    "test result fact '{task_id}/{result_key}' already exists with different semantics"
+                )));
+            }
+            if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+                store_idempotent(
+                    &tx,
+                    &self.project.project_id,
+                    &actor.id,
+                    "fact.test_result",
+                    key,
+                    request_hash,
+                    &existing,
+                )?;
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        tx.execute(
+            "INSERT INTO test_result_facts
+             (id, project_id, task_id, author_agent_id, result_key, suite, outcome,
+              summary, command, report_artifact_id, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                fact_id,
+                self.project.project_id,
+                task_id,
+                actor.id,
+                result_key,
+                suite,
+                outcome,
+                summary,
+                command,
+                report_artifact_id,
+                now
+            ],
+        )?;
+        let response = TestResultFactView {
+            fact_id: fact_id.clone(),
+            task_id: task_id.to_owned(),
+            author: actor.name.clone(),
+            result_key: result_key.to_owned(),
+            suite: suite.to_owned(),
+            outcome: outcome.to_owned(),
+            summary: summary.to_owned(),
+            command: command.map(ToOwned::to_owned),
+            report_artifact_id: report_artifact_id.map(ToOwned::to_owned),
+            recorded_at: now,
+        };
+        if let (Some(key), Some(request_hash)) = (idempotency_key, request_hash.as_deref()) {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "fact.test_result",
+                key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "test_result_recorded",
+            "test_result_fact",
+            &fact_id,
+            json!({
+                "taskId": task_id,
+                "resultKey": result_key,
+                "suite": suite,
+                "outcome": outcome,
+                "reportArtifactId": report_artifact_id
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    pub fn list_git_commit_facts(&self, task_id: &str) -> Result<Vec<GitCommitFactView>> {
+        validate_task_id(task_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT f.id, f.task_id, author.name, f.commit_sha, f.summary,
+                    f.changed_paths_json, f.recorded_at
+             FROM git_commit_facts f JOIN agents author ON author.id = f.author_agent_id
+             WHERE f.project_id = ?1 AND f.task_id = ?2
+             ORDER BY f.recorded_at, f.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, task_id],
+            map_git_commit_fact,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_test_result_facts(&self, task_id: &str) -> Result<Vec<TestResultFactView>> {
+        validate_task_id(task_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT f.id, f.task_id, author.name, f.result_key, f.suite, f.outcome,
+                    f.summary, f.command, f.report_artifact_id, f.recorded_at
+             FROM test_result_facts f JOIN agents author ON author.id = f.author_agent_id
+             WHERE f.project_id = ?1 AND f.task_id = ?2
+             ORDER BY f.recorded_at, f.id",
+        )?;
+        let rows = statement.query_map(
+            params![self.project.project_id, task_id],
+            map_test_result_fact,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn handoff_proposal(
+        &self,
+        agent: &str,
+        token: &str,
+        task_id: &str,
+        item_limit: usize,
+    ) -> Result<HandoffProposalView> {
+        validate_task_id(task_id)?;
+        if !(1..=20).contains(&item_limit) {
+            return Err(BusError::Validation(
+                "handoff proposal item limit must be between 1 and 20".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let task = self.get_task(task_id)?;
+        if task.owner.as_deref() != Some(actor.name.as_str()) {
+            return Err(BusError::Unauthorized(format!(
+                "agent '{}' must own task '{task_id}' to build its handoff proposal",
+                actor.name
+            )));
+        }
+        let git_commits = bounded_tail(self.list_git_commit_facts(task_id)?, item_limit);
+        let test_results = bounded_tail(self.list_test_result_facts(task_id)?, item_limit);
+        let decisions = bounded_tail(
+            self.list_confirmed_decisions()?
+                .into_iter()
+                .filter(|decision| decision.task_id == task_id)
+                .collect(),
+            item_limit,
+        );
+        let artifacts = bounded_tail(self.list_artifacts(Some(task_id))?, item_limit);
+        let summary = format!(
+            "Task {task_id} is {} at version {}; proposal includes {} Git commit facts, {} test results, {} decisions, and {} artifacts.",
+            task.status,
+            task.version,
+            git_commits.len(),
+            test_results.len(),
+            decisions.len(),
+            artifacts.len()
+        );
+        Ok(HandoffProposalView {
+            task,
+            summary,
+            git_commits,
+            test_results,
+            decisions,
+            artifacts,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirm_decision_idempotent(
+        &mut self,
+        agent: &str,
+        token: &str,
+        key: &str,
+        task_id: &str,
+        summary: &str,
+        artifact_ids: &[String],
+        idempotency_key: Option<&str>,
+    ) -> Result<DecisionView> {
+        validate_decision_key(key)?;
+        validate_task_id(task_id)?;
+        let summary = summary.trim();
+        if summary.is_empty() || summary.len() > 1_024 {
+            return Err(BusError::Validation(
+                "decision summary must be 1-1024 UTF-8 bytes".into(),
+            ));
+        }
+        if artifact_ids.len() > 50 {
+            return Err(BusError::Validation(
+                "a decision can reference at most 50 artifacts".into(),
+            ));
+        }
+        let mut artifact_ids = artifact_ids.to_vec();
+        artifact_ids.sort();
+        artifact_ids.dedup();
+
+        let actor = self.authenticate(agent, token)?;
+        let request_hash = idempotency_key
+            .map(|idempotency_key| {
+                validate_idempotency_key(idempotency_key)?;
+                hash_json(&json!({
+                    "key": key,
+                    "taskId": task_id,
+                    "summary": summary,
+                    "artifactIds": artifact_ids
+                }))
+            })
+            .transpose()?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let (Some(idempotency_key), Some(request_hash)) =
+            (idempotency_key, request_hash.as_deref())
+            && let Some(cached) = load_idempotent::<DecisionView>(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "decision.confirm",
+                idempotency_key,
+                request_hash,
+            )?
+        {
+            tx.commit()?;
+            return Ok(cached);
+        }
+
+        let task: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT owner_agent_id, status FROM tasks WHERE project_id = ?1 AND id = ?2",
+                params![self.project.project_id, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (owner, status) =
+            task.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+        if owner.as_deref() != Some(actor.id.as_str()) {
+            return Err(BusError::Unauthorized(format!(
+                "agent '{}' must own task '{task_id}' to confirm its decisions",
+                actor.name
+            )));
+        }
+        if matches!(status.as_str(), "completed" | "abandoned") {
+            return Err(BusError::Conflict(format!(
+                "terminal task '{task_id}' cannot accept new confirmed decisions"
+            )));
+        }
+        for artifact_id in &artifact_ids {
+            let artifact_task: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT task_id FROM artifacts WHERE project_id = ?1 AND id = ?2",
+                    params![self.project.project_id, artifact_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let artifact_task = artifact_task.ok_or_else(|| {
+                BusError::Validation(format!("decision artifact '{artifact_id}' does not exist"))
+            })?;
+            if artifact_task
+                .as_deref()
+                .is_some_and(|value| value != task_id)
+            {
+                return Err(BusError::Validation(format!(
+                    "decision artifact '{artifact_id}' belongs to another task"
+                )));
+            }
+        }
+
+        let existing = tx
+            .query_row(
+                "SELECT d.id, d.decision_key, d.task_id, author.name, d.summary,
+                        d.artifact_ids_json, d.confirmed_at
+                 FROM decisions d JOIN agents author ON author.id = d.author_agent_id
+                 WHERE d.project_id = ?1 AND d.decision_key = ?2",
+                params![self.project.project_id, key],
+                map_decision,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.task_id != task_id
+                || existing.author != actor.name
+                || existing.summary != summary
+                || existing.artifact_ids != artifact_ids
+            {
+                return Err(BusError::Conflict(format!(
+                    "decision key '{key}' already identifies a different confirmed fact"
+                )));
+            }
+            if let (Some(idempotency_key), Some(request_hash)) =
+                (idempotency_key, request_hash.as_deref())
+            {
+                store_idempotent(
+                    &tx,
+                    &self.project.project_id,
+                    &actor.id,
+                    "decision.confirm",
+                    idempotency_key,
+                    request_hash,
+                    &existing,
+                )?;
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+
+        let decision_id = format!("dec_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO decisions
+             (id, project_id, decision_key, task_id, author_agent_id, summary,
+              artifact_ids_json, confirmed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                decision_id,
+                self.project.project_id,
+                key,
+                task_id,
+                actor.id,
+                summary,
+                serde_json::to_string(&artifact_ids)?,
+                now
+            ],
+        )?;
+        let response = DecisionView {
+            decision_id: decision_id.clone(),
+            key: key.to_owned(),
+            task_id: task_id.to_owned(),
+            author: actor.name.clone(),
+            summary: summary.to_owned(),
+            artifact_ids: artifact_ids.clone(),
+            confirmed_at: now,
+        };
+        if let (Some(idempotency_key), Some(request_hash)) =
+            (idempotency_key, request_hash.as_deref())
+        {
+            store_idempotent(
+                &tx,
+                &self.project.project_id,
+                &actor.id,
+                "decision.confirm",
+                idempotency_key,
+                request_hash,
+                &response,
+            )?;
+        }
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "decision_confirmed",
+            "decision",
+            &decision_id,
+            json!({
+                "key": key,
+                "taskId": task_id,
+                "artifactIds": artifact_ids
+            }),
+        )?;
+        tx.commit()?;
+        Ok(response)
+    }
+
+    pub fn context_sync(
+        &self,
+        agent: &str,
+        token: &str,
+        cursor: Option<&str>,
+        item_limit: usize,
+        byte_budget: usize,
+    ) -> Result<ContextSyncView> {
+        validate_context_budget(item_limit, byte_budget)?;
+        self.authenticate(agent, token)?;
+
+        let mut owned_tasks = self
+            .list_tasks()?
+            .into_iter()
+            .filter(|task| {
+                task.owner.as_deref() == Some(agent)
+                    && !matches!(task.status.as_str(), "completed" | "abandoned")
+            })
+            .collect::<Vec<_>>();
+        owned_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        let owned_task_ids = owned_tasks
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        let owned_task_set = owned_task_ids.iter().cloned().collect::<HashSet<_>>();
+
+        let mut dependency_ids = owned_tasks
+            .iter()
+            .flat_map(|task| task.depends_on.iter().cloned())
+            .filter(|task_id| !owned_task_set.contains(task_id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        dependency_ids.sort();
+        let direct_dependencies = dependency_ids
+            .iter()
+            .map(|task_id| self.get_task(task_id))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut relevant_task_ids = owned_task_set;
+        relevant_task_ids.extend(dependency_ids.iter().cloned());
+        let mut candidates = Vec::new();
+        for task in &owned_tasks {
+            candidates.push(context_task_candidate("1", "ownedTask", task));
+        }
+        for task in &direct_dependencies {
+            candidates.push(context_task_candidate("2", "directDependency", task));
+        }
+
+        for message in self.inbox(agent, token, true)? {
+            let (subject, subject_truncated) = text_preview(&message.subject, 128);
+            let (body_preview, body_truncated) = text_preview(&message.body, 256);
+            candidates.push(ContextCandidate {
+                sort_key: format!("3|{:020}|{}", message.created_at.max(0), message.message_id),
+                kind: "unreadMessage",
+                value: json!({
+                    "messageId": message.message_id,
+                    "sender": message.sender,
+                    "threadId": message.thread_id,
+                    "priority": message.priority,
+                    "subject": subject,
+                    "subjectTruncated": subject_truncated,
+                    "bodyPreview": body_preview,
+                    "bodyTruncated": body_truncated,
+                    "requiresAck": message.requires_ack,
+                    "createdAt": message.created_at
+                }),
+            });
+        }
+
+        for decision in self.list_confirmed_decisions()? {
+            if relevant_task_ids.contains(&decision.task_id) {
+                candidates.push(ContextCandidate {
+                    sort_key: format!(
+                        "4|{:020}|{}",
+                        decision.confirmed_at.max(0),
+                        decision.decision_id
+                    ),
+                    kind: "confirmedDecision",
+                    value: serde_json::to_value(decision)?,
+                });
+            }
+        }
+        for artifact in self.list_artifacts(None)? {
+            if artifact
+                .task_id
+                .as_ref()
+                .is_some_and(|task_id| relevant_task_ids.contains(task_id))
+            {
+                let (summary, summary_truncated) = text_preview(&artifact.summary, 256);
+                candidates.push(ContextCandidate {
+                    sort_key: format!(
+                        "5|{:020}|{}",
+                        artifact.created_at.max(0),
+                        artifact.artifact_id
+                    ),
+                    kind: "relevantArtifact",
+                    value: json!({
+                        "artifactId": artifact.artifact_id,
+                        "publisher": artifact.publisher,
+                        "taskId": artifact.task_id,
+                        "kind": artifact.kind,
+                        "path": artifact.path,
+                        "sha256": artifact.sha256,
+                        "summary": summary,
+                        "summaryTruncated": summary_truncated,
+                        "createdAt": artifact.created_at
+                    }),
+                });
+            }
+        }
+        let mut relevant_task_ids_sorted = relevant_task_ids.into_iter().collect::<Vec<_>>();
+        relevant_task_ids_sorted.sort();
+        for task_id in &relevant_task_ids_sorted {
+            for fact in self.list_git_commit_facts(task_id)? {
+                let (summary, summary_truncated) = text_preview(&fact.summary, 256);
+                let changed_paths = fact
+                    .changed_paths
+                    .iter()
+                    .take(20)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.push(ContextCandidate {
+                    sort_key: format!("6|{:020}|{}", fact.recorded_at.max(0), fact.fact_id),
+                    kind: "gitCommitFact",
+                    value: json!({
+                        "factId": fact.fact_id,
+                        "taskId": fact.task_id,
+                        "author": fact.author,
+                        "commitSha": fact.commit_sha,
+                        "summary": summary,
+                        "summaryTruncated": summary_truncated,
+                        "changedPaths": changed_paths,
+                        "changedPathsTruncated": fact.changed_paths.len() > 20,
+                        "recordedAt": fact.recorded_at
+                    }),
+                });
+            }
+            for fact in self.list_test_result_facts(task_id)? {
+                let (summary, summary_truncated) = text_preview(&fact.summary, 256);
+                let (command, command_truncated) = fact
+                    .command
+                    .as_deref()
+                    .map(|command| text_preview(command, 256))
+                    .unwrap_or_default();
+                candidates.push(ContextCandidate {
+                    sort_key: format!("7|{:020}|{}", fact.recorded_at.max(0), fact.fact_id),
+                    kind: "testResultFact",
+                    value: json!({
+                        "factId": fact.fact_id,
+                        "taskId": fact.task_id,
+                        "author": fact.author,
+                        "resultKey": fact.result_key,
+                        "suite": fact.suite,
+                        "outcome": fact.outcome,
+                        "summary": summary,
+                        "summaryTruncated": summary_truncated,
+                        "command": command,
+                        "commandTruncated": command_truncated,
+                        "reportArtifactId": fact.report_artifact_id,
+                        "recordedAt": fact.recorded_at
+                    }),
+                });
+            }
+        }
+        candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+
+        let after_key = cursor.map(decode_context_cursor).transpose()?;
+        let available = candidates
+            .into_iter()
+            .filter(|candidate| {
+                after_key
+                    .as_ref()
+                    .is_none_or(|after_key| candidate.sort_key.as_str() > after_key.as_str())
+            })
+            .collect::<Vec<_>>();
+        let mut items = Vec::new();
+        let mut bytes_used = 0usize;
+        for candidate in &available {
+            if items.len() == item_limit {
+                break;
+            }
+            let item = ContextItemView {
+                cursor: encode_context_cursor(&candidate.sort_key),
+                kind: candidate.kind.to_owned(),
+                value: candidate.value.clone(),
+            };
+            let item_bytes = serde_json::to_vec(&item)?.len();
+            if bytes_used + item_bytes > byte_budget {
+                if items.is_empty() {
+                    return Err(BusError::Validation(format!(
+                        "context byte budget {byte_budget} is too small for the next projected item ({item_bytes} bytes)"
+                    )));
+                }
+                break;
+            }
+            bytes_used += item_bytes;
+            items.push(item);
+        }
+        let has_more = items.len() < available.len();
+        let next_cursor = has_more
+            .then(|| items.last().map(|item| item.cursor.clone()))
+            .flatten();
+        Ok(ContextSyncView {
+            agent: agent.to_owned(),
+            scope: ContextScopeView {
+                owned_task_ids,
+                direct_dependency_task_ids: dependency_ids,
+            },
+            item_count: items.len(),
+            items,
+            item_limit,
+            byte_budget,
+            bytes_used,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    fn list_confirmed_decisions(&self) -> Result<Vec<DecisionView>> {
+        let mut statement = self.conn.prepare(
+            "SELECT d.id, d.decision_key, d.task_id, author.name, d.summary,
+                    d.artifact_ids_json, d.confirmed_at
+             FROM decisions d JOIN agents author ON author.id = d.author_agent_id
+             WHERE d.project_id = ?1 ORDER BY d.confirmed_at, d.id",
+        )?;
+        let rows = statement.query_map(params![self.project.project_id], map_decision)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_events(
         &self,
         after_sequence: i64,
@@ -1282,6 +2694,8 @@ impl Bus {
         event_types: &[String],
     ) -> Result<Vec<EventView>> {
         validate_event_query(after_sequence, limit, event_types)?;
+        let retention_state = load_retention_state(&self.conn, &self.project.project_id)?;
+        validate_retained_event_cursor(after_sequence, &retention_state)?;
         query_events(
             &self.conn,
             &self.project.project_id,
@@ -1308,11 +2722,15 @@ impl Bus {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let latest_sequence = latest_event_sequence(&tx, &self.project.project_id)?;
+        let retention_state = load_retention_state(&tx, &self.project.project_id)?;
         let cursor_sequence = from_sequence.unwrap_or(latest_sequence);
         if !(0..=latest_sequence).contains(&cursor_sequence) {
             return Err(BusError::Validation(format!(
                 "subscription cursor must be between 0 and current sequence {latest_sequence}"
             )));
+        }
+        if from_sequence.is_some() {
+            validate_retained_event_cursor(cursor_sequence, &retention_state)?;
         }
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM subscriptions
@@ -1361,6 +2779,8 @@ impl Bus {
             name: name.to_owned(),
             event_types: event_types.to_vec(),
             cursor_sequence,
+            pending_delivery: None,
+            last_acked_delivery_id: None,
             created_at: now,
             updated_at: now,
         })
@@ -1369,23 +2789,21 @@ impl Bus {
     pub fn list_subscriptions(&self, agent: &str, token: &str) -> Result<Vec<SubscriptionView>> {
         let actor = self.authenticate(agent, token)?;
         let mut statement = self.conn.prepare(
-            "SELECT id, name, event_types_json, cursor_sequence, created_at, updated_at
+            "SELECT id, name, event_types_json, cursor_sequence, created_at, updated_at,
+                    pending_delivery_id, pending_from_sequence, pending_through_sequence,
+                    pending_created_at, last_acked_delivery_id,
+                    last_acked_through_sequence, last_acked_at
              FROM subscriptions WHERE project_id = ?1 AND agent_id = ?2 ORDER BY name",
         )?;
-        let rows = statement.query_map(params![self.project.project_id, actor.id], |row| {
-            let event_types_json: String = row.get(2)?;
-            let event_types = parse_json_column(&event_types_json, 2)?;
-            Ok(SubscriptionView {
-                subscription_id: row.get(0)?,
-                agent: actor.name.clone(),
-                name: row.get(1)?,
-                event_types,
-                cursor_sequence: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let rows = statement.query_map(
+            params![self.project.project_id, actor.id],
+            map_subscription_record,
+        )?;
+        Ok(rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|record| record.view(&actor.name))
+            .collect())
     }
 
     pub fn poll_subscription(
@@ -1406,36 +2824,25 @@ impl Bus {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<(String, String, i64, i64, i64)> = tx
-            .query_row(
-                "SELECT id, event_types_json, cursor_sequence, created_at, updated_at
-                 FROM subscriptions WHERE project_id = ?1 AND agent_id = ?2 AND name = ?3",
-                params![self.project.project_id, actor.id, name],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let (subscription_id, event_types_json, cursor_sequence, created_at, _updated_at) = current
+        let mut record = load_subscription_record(&tx, &self.project.project_id, &actor.id, name)?
             .ok_or_else(|| {
                 BusError::Validation(format!(
                     "subscription '{name}' does not exist for agent '{}'",
                     actor.name
                 ))
             })?;
-        let event_types: Vec<String> = serde_json::from_str(&event_types_json)?;
+        if let Some(delivery) = &record.pending_delivery {
+            return Err(BusError::Conflict(format!(
+                "subscription '{name}' has pending delivery '{}'; acknowledge it or continue with peek",
+                delivery.delivery_id
+            )));
+        }
         let events = query_events(
             &tx,
             &self.project.project_id,
-            cursor_sequence,
+            record.cursor_sequence,
             limit,
-            &event_types,
+            &record.event_types,
         )?;
         let latest_sequence = latest_event_sequence(&tx, &self.project.project_id)?;
         let scanned_through_sequence = events
@@ -1444,13 +2851,14 @@ impl Bus {
             .unwrap_or(latest_sequence);
         let changed = tx.execute(
             "UPDATE subscriptions SET cursor_sequence = ?1, updated_at = ?2
-             WHERE project_id = ?3 AND id = ?4 AND cursor_sequence = ?5",
+             WHERE project_id = ?3 AND id = ?4 AND cursor_sequence = ?5
+               AND pending_delivery_id IS NULL",
             params![
                 scanned_through_sequence,
                 now,
                 self.project.project_id,
-                subscription_id,
-                cursor_sequence
+                record.subscription_id,
+                record.cursor_sequence
             ],
         )?;
         if changed != 1 {
@@ -1459,18 +2867,199 @@ impl Bus {
             )));
         }
         tx.commit()?;
+        record.cursor_sequence = scanned_through_sequence;
+        record.updated_at = now;
         Ok(SubscriptionPoll {
-            subscription: SubscriptionView {
-                subscription_id,
-                agent: actor.name,
-                name: name.to_owned(),
-                event_types,
-                cursor_sequence: scanned_through_sequence,
-                created_at,
-                updated_at: now,
-            },
+            subscription: record.view(&actor.name),
             events,
             scanned_through_sequence,
+        })
+    }
+
+    pub fn peek_subscription(
+        &mut self,
+        agent: &str,
+        token: &str,
+        name: &str,
+        limit: usize,
+    ) -> Result<SubscriptionPeek> {
+        validate_identifier("subscription name", name)?;
+        if !(1..=500).contains(&limit) {
+            return Err(BusError::Validation(
+                "subscription peek limit must be between 1 and 500".into(),
+            ));
+        }
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut record = load_subscription_record(&tx, &self.project.project_id, &actor.id, name)?
+            .ok_or_else(|| {
+                BusError::Validation(format!(
+                    "subscription '{name}' does not exist for agent '{}'",
+                    actor.name
+                ))
+            })?;
+
+        let (delivery, events) = if let Some(delivery) = record.pending_delivery.clone() {
+            let events = query_events_through(
+                &tx,
+                &self.project.project_id,
+                delivery.from_sequence,
+                delivery.through_sequence,
+                500,
+                &record.event_types,
+            )?;
+            (Some(delivery), events)
+        } else {
+            let events = query_events(
+                &tx,
+                &self.project.project_id,
+                record.cursor_sequence,
+                limit,
+                &record.event_types,
+            )?;
+            let latest_sequence = latest_event_sequence(&tx, &self.project.project_id)?;
+            let through_sequence = events
+                .last()
+                .map(|event| event.sequence)
+                .unwrap_or(latest_sequence);
+            if through_sequence > record.cursor_sequence {
+                let delivery = SubscriptionDeliveryView {
+                    delivery_id: format!("sdl_{}", Uuid::new_v4().simple()),
+                    from_sequence: record.cursor_sequence,
+                    through_sequence,
+                    created_at: now,
+                };
+                let changed = tx.execute(
+                    "UPDATE subscriptions
+                     SET pending_delivery_id = ?1, pending_from_sequence = ?2,
+                         pending_through_sequence = ?3, pending_created_at = ?4,
+                         updated_at = ?4
+                     WHERE project_id = ?5 AND id = ?6 AND cursor_sequence = ?7
+                       AND pending_delivery_id IS NULL",
+                    params![
+                        delivery.delivery_id,
+                        delivery.from_sequence,
+                        delivery.through_sequence,
+                        now,
+                        self.project.project_id,
+                        record.subscription_id,
+                        record.cursor_sequence
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(BusError::Conflict(format!(
+                        "subscription '{name}' was peeked concurrently"
+                    )));
+                }
+                record.pending_delivery = Some(delivery.clone());
+                record.updated_at = now;
+                (Some(delivery), events)
+            } else {
+                (None, events)
+            }
+        };
+        let scanned_through_sequence = delivery
+            .as_ref()
+            .map(|pending| pending.through_sequence)
+            .unwrap_or(record.cursor_sequence);
+        tx.commit()?;
+        Ok(SubscriptionPeek {
+            subscription: record.view(&actor.name),
+            delivery,
+            events,
+            scanned_through_sequence,
+        })
+    }
+
+    pub fn acknowledge_subscription(
+        &mut self,
+        agent: &str,
+        token: &str,
+        name: &str,
+        delivery_id: &str,
+    ) -> Result<SubscriptionAck> {
+        validate_identifier("subscription name", name)?;
+        validate_identifier("delivery id", delivery_id)?;
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = load_subscription_record(&tx, &self.project.project_id, &actor.id, name)?
+            .ok_or_else(|| {
+                BusError::Validation(format!(
+                    "subscription '{name}' does not exist for agent '{}'",
+                    actor.name
+                ))
+            })?;
+
+        if record.last_acked_delivery_id.as_deref() == Some(delivery_id) {
+            let cursor_sequence = record.last_acked_through_sequence.ok_or_else(|| {
+                BusError::Validation("subscription last ACK cursor is incomplete".into())
+            })?;
+            let acknowledged_at = record.last_acked_at.ok_or_else(|| {
+                BusError::Validation("subscription last ACK timestamp is incomplete".into())
+            })?;
+            tx.commit()?;
+            return Ok(SubscriptionAck {
+                subscription_id: record.subscription_id,
+                agent: actor.name,
+                name: record.name,
+                delivery_id: delivery_id.to_owned(),
+                cursor_sequence,
+                acknowledged_at,
+                replayed: true,
+            });
+        }
+
+        let pending = record.pending_delivery.ok_or_else(|| {
+            BusError::Conflict(format!(
+                "subscription '{name}' has no pending delivery to acknowledge"
+            ))
+        })?;
+        if pending.delivery_id != delivery_id {
+            return Err(BusError::Conflict(format!(
+                "subscription '{name}' expects delivery '{}', not '{delivery_id}'",
+                pending.delivery_id
+            )));
+        }
+        let changed = tx.execute(
+            "UPDATE subscriptions
+             SET cursor_sequence = ?1,
+                 pending_delivery_id = NULL,
+                 pending_from_sequence = NULL,
+                 pending_through_sequence = NULL,
+                 pending_created_at = NULL,
+                 last_acked_delivery_id = ?2,
+                 last_acked_through_sequence = ?1,
+                 last_acked_at = ?3,
+                 updated_at = ?3
+             WHERE project_id = ?4 AND id = ?5 AND pending_delivery_id = ?2",
+            params![
+                pending.through_sequence,
+                delivery_id,
+                now,
+                self.project.project_id,
+                record.subscription_id
+            ],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(format!(
+                "subscription '{name}' delivery was acknowledged concurrently"
+            )));
+        }
+        tx.commit()?;
+        Ok(SubscriptionAck {
+            subscription_id: record.subscription_id,
+            agent: actor.name,
+            name: record.name,
+            delivery_id: delivery_id.to_owned(),
+            cursor_sequence: pending.through_sequence,
+            acknowledged_at: now,
+            replayed: false,
         })
     }
 
@@ -1553,23 +3142,420 @@ impl Bus {
             .into_iter()
             .filter(|reservation| reservation.owner == agent)
             .collect();
+        let task_thread_bindings = self
+            .list_task_thread_bindings(None, true)?
+            .into_iter()
+            .filter(|binding| binding.agent == agent)
+            .collect();
         let recent_artifacts = self
             .list_artifacts(None)?
             .into_iter()
             .filter(|artifact| artifact.publisher == agent)
             .take(20)
             .collect();
-        let recent_events = self.list_events(after_sequence, 50, &[])?;
+        let retention_state = self.retention_state()?;
+        let recent_events = self.list_events(
+            after_sequence.max(retention_state.events_pruned_through_sequence),
+            50,
+            &[],
+        )?;
         let latest_event_sequence = latest_event_sequence(&self.conn, &self.project.project_id)?;
         Ok(HandoffSnapshot {
             agent: agent.to_owned(),
             unread_messages,
             owned_tasks,
             active_reservations,
+            task_thread_bindings,
             recent_artifacts,
             recent_events,
             latest_event_sequence,
+            retention_state,
         })
+    }
+
+    pub fn retention_state(&self) -> Result<RetentionStateView> {
+        load_retention_state(&self.conn, &self.project.project_id)
+    }
+
+    pub fn operator_status(&self) -> Result<OperatorStatusView> {
+        let row: Option<(i64, i64, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT generation, configured_at, rotated_at
+                 FROM operator_credentials WHERE project_id = ?1",
+                params![self.project.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((generation, configured_at, rotated_at)) => OperatorStatusView {
+                configured: true,
+                generation: Some(generation),
+                configured_at: Some(configured_at),
+                rotated_at,
+            },
+            None => OperatorStatusView {
+                configured: false,
+                generation: None,
+                configured_at: None,
+                rotated_at: None,
+            },
+        })
+    }
+
+    pub fn verify_operator_secret(&self, secret: &str) -> Result<i64> {
+        authenticate_operator(&self.conn, &self.project.project_id, secret)
+    }
+
+    pub fn initialize_operator(&mut self) -> Result<OperatorCredentialView> {
+        let now = now_ms();
+        let secret = generate_secret("vbo");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operator_credentials WHERE project_id = ?1)",
+            params![self.project.project_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(BusError::Conflict(
+                "an operator credential is already configured; rotate it instead".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO operator_credentials
+             (project_id, secret_hash, generation, configured_at, rotated_at)
+             VALUES (?1, ?2, 1, ?3, NULL)",
+            params![self.project.project_id, hash_secret(&secret), now],
+        )?;
+        tx.commit()?;
+        Ok(OperatorCredentialView {
+            operator_secret: secret,
+            generation: 1,
+            issued_at: now,
+        })
+    }
+
+    pub fn rotate_operator(&mut self, current_secret: &str) -> Result<OperatorCredentialView> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (secret_hash, generation): (String, i64) = tx
+            .query_row(
+                "SELECT secret_hash, generation FROM operator_credentials WHERE project_id = ?1",
+                params![self.project.project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| BusError::Conflict("operator credential is not configured".into()))?;
+        if current_secret.is_empty() || !secret_matches(current_secret, &secret_hash) {
+            return Err(BusError::OperatorUnauthorized);
+        }
+        let secret = generate_secret("vbo");
+        let next_generation = generation + 1;
+        let changed = tx.execute(
+            "UPDATE operator_credentials
+             SET secret_hash = ?1, generation = ?2, rotated_at = ?3
+             WHERE project_id = ?4 AND generation = ?5",
+            params![
+                hash_secret(&secret),
+                next_generation,
+                now,
+                self.project.project_id,
+                generation
+            ],
+        )?;
+        if changed != 1 {
+            return Err(BusError::Conflict(
+                "operator credential changed concurrently".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(OperatorCredentialView {
+            operator_secret: secret,
+            generation: next_generation,
+            issued_at: now,
+        })
+    }
+
+    pub fn approve_retention(
+        &mut self,
+        operator_secret: &str,
+        policy: &RetentionPolicy,
+        confirmed_plan_id: &str,
+        ttl_seconds: i64,
+    ) -> Result<RetentionApprovalView> {
+        validate_retention_policy(policy)?;
+        validate_retention_plan_id(confirmed_plan_id)?;
+        validate_operator_approval_ttl(ttl_seconds)?;
+        let now = now_ms();
+        let expires_at = now
+            .checked_add(ttl_seconds.checked_mul(1_000).ok_or_else(|| {
+                BusError::Validation("operator approval TTL is outside timestamp range".into())
+            })?)
+            .ok_or_else(|| {
+                BusError::Validation("operator approval expiry is outside timestamp range".into())
+            })?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation = authenticate_operator(&tx, &self.project.project_id, operator_secret)?;
+        let already_applied: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM retention_runs WHERE project_id = ?1 AND plan_id = ?2
+             )",
+            params![self.project.project_id, confirmed_plan_id],
+            |row| row.get(0),
+        )?;
+        if already_applied {
+            return Err(BusError::Conflict(format!(
+                "retention plan '{confirmed_plan_id}' has already been applied"
+            )));
+        }
+        let plan = build_retention_plan(&tx, &self.project.project_id, policy, now)?;
+        if plan.plan_id != confirmed_plan_id {
+            return Err(BusError::Conflict(format!(
+                "retention plan is stale: confirmed '{confirmed_plan_id}', current '{}'",
+                plan.plan_id
+            )));
+        }
+        let approval_id = format!("rap_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT INTO retention_approvals
+             (id, project_id, plan_id, operator_generation, policy_json, approved_at,
+              expires_at, consumed_at, consumed_by_agent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+            params![
+                approval_id,
+                self.project.project_id,
+                confirmed_plan_id,
+                generation,
+                serde_json::to_string(policy)?,
+                now,
+                expires_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(RetentionApprovalView {
+            approval_id,
+            plan_id: confirmed_plan_id.to_owned(),
+            operator_generation: generation,
+            approved_at: now,
+            expires_at,
+            consumed_at: None,
+            consumed_by: None,
+            plan,
+        })
+    }
+
+    pub fn plan_retention(
+        &self,
+        agent: &str,
+        token: &str,
+        policy: &RetentionPolicy,
+    ) -> Result<RetentionPlan> {
+        self.authenticate(agent, token)?;
+        validate_retention_policy(policy)?;
+        build_retention_plan(&self.conn, &self.project.project_id, policy, now_ms())
+    }
+
+    pub fn preview_retention_for_operator(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<RetentionPlan> {
+        validate_retention_policy(policy)?;
+        build_retention_plan(&self.conn, &self.project.project_id, policy, now_ms())
+    }
+
+    pub fn apply_retention(
+        &mut self,
+        agent: &str,
+        token: &str,
+        policy: &RetentionPolicy,
+        confirmed_plan_id: &str,
+    ) -> Result<RetentionReport> {
+        validate_retention_policy(policy)?;
+        validate_retention_plan_id(confirmed_plan_id)?;
+        let actor = self.authenticate(agent, token)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cached: Option<(String, String)> = tx
+            .query_row(
+                "SELECT policy_json, report_json FROM retention_runs
+                 WHERE project_id = ?1 AND plan_id = ?2",
+                params![self.project.project_id, confirmed_plan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_policy, cached_report)) = cached {
+            let stored_policy: RetentionPolicy = serde_json::from_str(&stored_policy)?;
+            if stored_policy != *policy {
+                return Err(BusError::Conflict(
+                    "retention plan retry must use the policy originally confirmed".into(),
+                ));
+            }
+            let mut report: RetentionReport = serde_json::from_str(&cached_report)?;
+            report.replayed = true;
+            tx.commit()?;
+            return Ok(report);
+        }
+
+        let plan = build_retention_plan(&tx, &self.project.project_id, policy, now)?;
+        if plan.plan_id != confirmed_plan_id {
+            return Err(BusError::Conflict(format!(
+                "retention plan is stale: confirmed '{confirmed_plan_id}', current '{}'",
+                plan.plan_id
+            )));
+        }
+
+        let approval: Option<String> = tx
+            .query_row(
+                "SELECT approval.id
+                 FROM retention_approvals approval
+                 JOIN operator_credentials operator
+                   ON operator.project_id = approval.project_id
+                  AND operator.generation = approval.operator_generation
+                 WHERE approval.project_id = ?1 AND approval.plan_id = ?2
+                   AND approval.consumed_at IS NULL AND approval.expires_at >= ?3
+                 ORDER BY approval.approved_at DESC, approval.id DESC
+                 LIMIT 1",
+                params![self.project.project_id, confirmed_plan_id, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let approval_id = approval.ok_or_else(|| {
+            BusError::OperatorApprovalRequired(format!(
+                "plan '{confirmed_plan_id}' needs an unexpired interactive CLI approval"
+            ))
+        })?;
+
+        let deleted_events = tx.execute(
+            "DELETE FROM events
+             WHERE project_id = ?1 AND sequence > ?2 AND sequence <= ?3",
+            params![
+                self.project.project_id,
+                plan.protection.events_pruned_through_sequence,
+                plan.protection.event_prune_through_sequence
+            ],
+        )? as i64;
+        let closed_message_cutoff = retention_cutoff(now, policy.closed_message_max_age_days)?;
+        let deleted_receipts = tx.execute(
+            "DELETE FROM message_receipts
+             WHERE closed_at IS NOT NULL AND closed_at < ?1
+               AND EXISTS (
+                 SELECT 1 FROM messages m
+                 WHERE m.id = message_receipts.message_id AND m.project_id = ?2
+               )",
+            params![closed_message_cutoff, self.project.project_id],
+        )? as i64;
+        let deleted_messages = tx.execute(
+            "DELETE FROM messages
+             WHERE project_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM message_receipts r WHERE r.message_id = messages.id
+               )",
+            params![self.project.project_id],
+        )? as i64;
+        let binding_cutoff = retention_cutoff(now, policy.terminal_binding_max_age_days)?;
+        let deleted_bindings = tx.execute(
+            "DELETE FROM task_thread_bindings
+             WHERE project_id = ?1 AND unbound_at IS NOT NULL AND unbound_at < ?2
+               AND EXISTS (
+                 SELECT 1 FROM tasks t
+                 WHERE t.project_id = task_thread_bindings.project_id
+                   AND t.id = task_thread_bindings.task_id
+                   AND t.status IN ('completed', 'abandoned')
+               )",
+            params![self.project.project_id, binding_cutoff],
+        )? as i64;
+        let idempotency_cutoff = retention_cutoff(now, policy.idempotency_max_age_days)?;
+        let deleted_idempotency = tx.execute(
+            "DELETE FROM idempotency_records
+             WHERE project_id = ?1 AND created_at < ?2",
+            params![self.project.project_id, idempotency_cutoff],
+        )? as i64;
+        let deleted = RetentionCounts {
+            events: deleted_events,
+            idempotency_records: deleted_idempotency,
+            message_receipts: deleted_receipts,
+            messages: deleted_messages,
+            task_thread_bindings: deleted_bindings,
+        };
+        if deleted != plan.candidates {
+            return Err(BusError::Conflict(
+                "retention candidates changed while applying the confirmed plan".into(),
+            ));
+        }
+
+        tx.execute(
+            "INSERT INTO retention_state
+             (project_id, events_pruned_through_sequence, last_applied_at, last_plan_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET
+               events_pruned_through_sequence = excluded.events_pruned_through_sequence,
+               last_applied_at = excluded.last_applied_at,
+               last_plan_id = excluded.last_plan_id",
+            params![
+                self.project.project_id,
+                plan.protection.event_prune_through_sequence,
+                now,
+                plan.plan_id
+            ],
+        )?;
+        append_event(
+            &tx,
+            &self.project.project_id,
+            Some(&actor.id),
+            "retention_applied",
+            "retention_plan",
+            &plan.plan_id,
+            json!({
+                "operatorApprovalId": &approval_id,
+                "policy": &plan.policy,
+                "deleted": &deleted,
+                "eventsPrunedThroughSequence": plan.protection.event_prune_through_sequence
+            }),
+        )?;
+        let report = RetentionReport {
+            plan_id: plan.plan_id.clone(),
+            operator_approval_id: Some(approval_id.clone()),
+            applied_at: now,
+            deleted,
+            events_pruned_through_sequence: plan.protection.event_prune_through_sequence,
+            replayed: false,
+        };
+        let consumed = tx.execute(
+            "UPDATE retention_approvals
+             SET consumed_at = ?1, consumed_by_agent_id = ?2
+             WHERE id = ?3 AND project_id = ?4 AND consumed_at IS NULL",
+            params![now, actor.id, approval_id, self.project.project_id],
+        )?;
+        if consumed != 1 {
+            return Err(BusError::Conflict(
+                "operator approval changed concurrently".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO retention_runs
+             (project_id, plan_id, actor_agent_id, operator_approval_id,
+              policy_json, report_json, applied_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                self.project.project_id,
+                plan.plan_id,
+                actor.id,
+                approval_id,
+                serde_json::to_string(&plan.policy)?,
+                serde_json::to_string(&report)?,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(report)
     }
 
     pub fn doctor(&self) -> Result<DoctorReport> {
@@ -1587,14 +3573,18 @@ impl Bus {
             [],
             |row| row.get(0),
         )?;
-        let counts: (i64, i64, i64, i64, i64) = self.conn.query_row(
+        let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM agents WHERE project_id = ?1),
                (SELECT COUNT(*) FROM messages WHERE project_id = ?1),
                (SELECT COUNT(*) FROM tasks WHERE project_id = ?1),
                (SELECT COUNT(*) FROM reservations
                  WHERE project_id = ?1 AND released_at IS NULL AND expires_at > ?2),
-               (SELECT COUNT(*) FROM artifacts WHERE project_id = ?1)",
+               (SELECT COUNT(*) FROM artifacts WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM decisions WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM responsibility_overrides WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM git_commit_facts WHERE project_id = ?1),
+               (SELECT COUNT(*) FROM test_result_facts WHERE project_id = ?1)",
             params![self.project.project_id, now_ms()],
             |row| {
                 Ok((
@@ -1603,6 +3593,10 @@ impl Bus {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )?;
@@ -1622,41 +3616,230 @@ impl Bus {
             tasks: counts.2,
             active_reservations: counts.3,
             artifacts: counts.4,
+            decisions: counts.5,
+            responsibility_overrides: counts.6,
+            git_commit_facts: counts.7,
+            test_result_facts: counts.8,
         })
     }
 
     pub fn backup_to(&self, destination: &Path) -> Result<BackupView> {
-        if destination.exists() {
-            return Err(BusError::Conflict(format!(
-                "backup destination '{}' already exists",
-                destination.display()
+        backup_connection_to(&self.conn, destination)
+    }
+
+    pub fn compact_offline(
+        start: &Path,
+        data_home: Option<&Path>,
+        operator_secret: &str,
+        backup_destination: &Path,
+    ) -> Result<CompactionView> {
+        let (_project_root, project) = discover_project(start)?;
+        let database_path = database_path(&project.project_id, data_home)?;
+        if !database_path.is_file() {
+            return Err(BusError::Validation(format!(
+                "database '{}' does not exist; offline compaction never creates a database",
+                database_path.display()
             )));
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+        if backup_destination == database_path {
+            return Err(BusError::Validation(
+                "backup destination must differ from the live database".into(),
+            ));
         }
-        let temporary =
-            destination.with_extension(format!("vibebus-tmp-{}", Uuid::new_v4().simple()));
-        let backup_result = (|| -> Result<()> {
-            let mut destination_connection = Connection::open(&temporary)?;
-            let backup = rusqlite::backup::Backup::new(&self.conn, &mut destination_connection)?;
-            backup.run_to_completion(64, Duration::from_millis(10), None)?;
-            drop(backup);
-            destination_connection.close().map_err(|(_, error)| error)?;
-            fs::rename(&temporary, destination)?;
-            Ok(())
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut connection = Connection::open_with_flags(&database_path, flags)?;
+        connection.busy_timeout(Duration::ZERO)?;
+        connection.execute_batch(
+            "PRAGMA busy_timeout=0;
+             PRAGMA foreign_keys=ON;
+             PRAGMA locking_mode=EXCLUSIVE;",
+        )?;
+
+        let checkpoint: (i64, i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(exclusive_compaction_error)?;
+        if checkpoint.0 != 0 || checkpoint.1 != checkpoint.2 {
+            return Err(BusError::Conflict(
+                "offline compaction could not checkpoint WAL without another active database user"
+                    .into(),
+            ));
+        }
+        connection
+            .execute_batch("BEGIN EXCLUSIVE; COMMIT;")
+            .map_err(exclusive_compaction_error)?;
+
+        let original_journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !original_journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(BusError::Conflict(format!(
+                "offline compaction requires WAL mode, found '{original_journal_mode}'"
+            )));
+        }
+        let exclusive_journal_mode: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .map_err(exclusive_compaction_error)?;
+        if !exclusive_journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(BusError::Conflict(format!(
+                "offline compaction could not acquire the DELETE journal boundary; SQLite returned '{exclusive_journal_mode}'"
+            )));
+        }
+
+        let operation = (|| -> Result<CompactionView> {
+            let schema_version: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )?;
+            if schema_version != SCHEMA_VERSION {
+                return Err(BusError::Conflict(format!(
+                    "offline compaction requires schema version {SCHEMA_VERSION}, found {schema_version}"
+                )));
+            }
+            let project_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                params![project.project_id],
+                |row| row.get(0),
+            )?;
+            if !project_exists {
+                return Err(BusError::Conflict(format!(
+                    "database does not contain project '{}'",
+                    project.project_id
+                )));
+            }
+            let operator_generation =
+                authenticate_operator(&connection, &project.project_id, operator_secret)?;
+            let active_state: (i64, i64, i64) = connection.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM tasks
+                      WHERE project_id = ?1 AND status NOT IN ('completed', 'abandoned')),
+                    (SELECT COUNT(*) FROM task_thread_bindings
+                      WHERE project_id = ?1 AND unbound_at IS NULL),
+                    (SELECT COUNT(*) FROM reservations
+                      WHERE project_id = ?1 AND released_at IS NULL AND expires_at > ?2)",
+                params![project.project_id, now_ms()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if active_state != (0, 0, 0) {
+                return Err(BusError::Conflict(format!(
+                    "offline compaction requires zero active tasks, bindings, and reservations; found {}, {}, {}",
+                    active_state.0, active_state.1, active_state.2
+                )));
+            }
+
+            let backup = backup_connection_to(&connection, backup_destination)?;
+            if let Err(error) = verify_database_file(backup_destination, &project.project_id) {
+                let _ = fs::remove_file(backup_destination);
+                return Err(error);
+            }
+
+            let initial_bytes = fs::metadata(&database_path)?.len();
+            let database_parent = database_path.parent().ok_or_else(|| {
+                BusError::Validation("database path has no parent directory".into())
+            })?;
+            let available_bytes = fs2::available_space(database_parent)?;
+            let required_bytes = initial_bytes.saturating_mul(2);
+            if available_bytes < required_bytes {
+                return Err(BusError::Validation(format!(
+                    "offline compaction requires at least {required_bytes} free bytes beside the database; found {available_bytes}"
+                )));
+            }
+
+            let compaction_id = format!("cmp_{}", Uuid::new_v4().simple());
+            let started = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            append_event(
+                &started,
+                &project.project_id,
+                None,
+                "compaction_started",
+                "maintenance_compaction",
+                &compaction_id,
+                json!({
+                    "backupPath": &backup.path,
+                    "backupSha256": &backup.sha256,
+                    "operatorGeneration": operator_generation
+                }),
+            )?;
+            started.commit()?;
+            let before = compaction_metrics(&connection, &database_path)?;
+
+            connection.execute_batch("VACUUM;")?;
+            let restored_mode: String =
+                connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+            if !restored_mode.eq_ignore_ascii_case("wal") {
+                return Err(BusError::Conflict(format!(
+                    "compaction completed but WAL restoration returned '{restored_mode}'"
+                )));
+            }
+
+            let completed_at = now_ms();
+            let completed = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            append_event(
+                &completed,
+                &project.project_id,
+                None,
+                "compaction_completed",
+                "maintenance_compaction",
+                &compaction_id,
+                json!({
+                    "backupSha256": &backup.sha256,
+                    "beforeBytes": before.bytes,
+                    "beforeFreelistPages": before.freelist_pages,
+                    "operatorGeneration": operator_generation
+                }),
+            )?;
+            completed.commit()?;
+            let final_checkpoint: (i64, i64, i64) =
+                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if final_checkpoint.0 != 0 || final_checkpoint.1 != final_checkpoint.2 {
+                return Err(BusError::Conflict(
+                    "compaction completed but the final WAL checkpoint was busy".into(),
+                ));
+            }
+
+            let (integrity, foreign_key_violations, final_schema_version) =
+                verify_open_database(&connection, &project.project_id)?;
+            let final_journal_mode: String =
+                connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            let after = compaction_metrics(&connection, &database_path)?;
+            let verified = integrity == "ok"
+                && foreign_key_violations == 0
+                && final_schema_version == SCHEMA_VERSION
+                && final_journal_mode.eq_ignore_ascii_case("wal");
+            if !verified {
+                return Err(BusError::Conflict(
+                    "post-compaction database verification failed".into(),
+                ));
+            }
+            let reclaimed_bytes = before.bytes.saturating_sub(after.bytes);
+            Ok(CompactionView {
+                compaction_id,
+                database_path: database_path.to_string_lossy().into_owned(),
+                operator_generation,
+                backup,
+                before,
+                after,
+                reclaimed_bytes,
+                journal_mode: final_journal_mode,
+                integrity,
+                foreign_key_violations,
+                schema_version: final_schema_version,
+                verified,
+                completed_at,
+            })
         })();
-        if backup_result.is_err() && temporary.exists() {
-            let _ = fs::remove_file(&temporary);
+
+        if operation.is_err() {
+            let _ = connection
+                .query_row::<String, _, _>("PRAGMA journal_mode=WAL", [], |row| row.get(0));
         }
-        backup_result?;
-        let metadata = fs::metadata(destination)?;
-        Ok(BackupView {
-            path: destination.to_string_lossy().into_owned(),
-            bytes: metadata.len(),
-            sha256: sha256_file(destination)?,
-            created_at: now_ms(),
-        })
+        let _ = connection.execute_batch("PRAGMA locking_mode=NORMAL;");
+        drop(connection);
+        operation
     }
 
     fn update_receipt(
@@ -1671,6 +3854,37 @@ impl Bus {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(Option<i64>, Option<i64>, Option<i64>)> = tx
+            .query_row(
+                "SELECT read_at, ack_at, closed_at FROM message_receipts
+                 WHERE message_id = ?1 AND recipient_agent_id = ?2",
+                params![message_id, actor.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (read_at, ack_at, closed_at) = current.ok_or_else(|| {
+            BusError::Unauthorized(format!(
+                "message '{message_id}' is not addressed to agent '{}'",
+                actor.name
+            ))
+        })?;
+        if closed_at.is_some() {
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' is already closed"
+            )));
+        }
+        if acknowledge && ack_at.is_some() || !acknowledge && read_at.is_some() {
+            tx.commit()?;
+            return Ok(MessageReceipt {
+                message_id: message_id.to_owned(),
+                recipient: actor.name,
+                read_at: read_at
+                    .or(ack_at)
+                    .expect("receipt operation has a timestamp"),
+                ack_at,
+                closed_at: None,
+            });
+        }
         let changed = if acknowledge {
             tx.execute(
                 "UPDATE message_receipts SET read_at = COALESCE(read_at, ?1), ack_at = COALESCE(ack_at, ?1)
@@ -1685,9 +3899,8 @@ impl Bus {
             )?
         };
         if changed != 1 {
-            return Err(BusError::Unauthorized(format!(
-                "message '{message_id}' is not addressed to agent '{}'",
-                actor.name
+            return Err(BusError::Conflict(format!(
+                "message '{message_id}' receipt changed concurrently"
             )));
         }
         append_event(
@@ -1703,11 +3916,11 @@ impl Bus {
             message_id,
             json!({"agent": actor.name, "at": now}),
         )?;
-        let (read_at, ack_at): (i64, Option<i64>) = tx.query_row(
-            "SELECT read_at, ack_at FROM message_receipts
+        let (read_at, ack_at, closed_at): (i64, Option<i64>, Option<i64>) = tx.query_row(
+            "SELECT read_at, ack_at, closed_at FROM message_receipts
              WHERE message_id = ?1 AND recipient_agent_id = ?2",
             params![message_id, actor.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         tx.commit()?;
         Ok(MessageReceipt {
@@ -1715,19 +3928,20 @@ impl Bus {
             recipient: actor.name,
             read_at,
             ack_at,
+            closed_at,
         })
     }
 
     fn authenticate(&self, name: &str, token: &str) -> Result<AuthenticatedAgent> {
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, String)> = self
             .conn
             .query_row(
-                "SELECT id, token_hash FROM agents WHERE project_id = ?1 AND name = ?2",
+                "SELECT id, token_hash, role FROM agents WHERE project_id = ?1 AND name = ?2",
                 params![self.project.project_id, name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let (id, token_hash) = row.ok_or_else(|| BusError::AgentNotFound(name.to_owned()))?;
+        let (id, token_hash, role) = row.ok_or_else(|| BusError::AgentNotFound(name.to_owned()))?;
         if token.is_empty() || !secret_matches(token, &token_hash) {
             return Err(BusError::Unauthorized(name.to_owned()));
         }
@@ -1738,6 +3952,7 @@ impl Bus {
         Ok(AuthenticatedAgent {
             id,
             name: name.to_owned(),
+            role,
         })
     }
 
@@ -1826,10 +4041,22 @@ impl Bus {
                 FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
                 FOREIGN KEY(project_id, depends_on_task_id) REFERENCES tasks(project_id, id)
              );
+             CREATE TABLE IF NOT EXISTS task_thread_bindings (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                bound_at INTEGER NOT NULL,
+                unbound_at INTEGER,
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(agent_id) REFERENCES agents(id)
+             );
              CREATE TABLE IF NOT EXISTS reservations (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 owner_agent_id TEXT NOT NULL,
+                task_id TEXT,
                 path_pattern TEXT NOT NULL,
                 exclusive INTEGER NOT NULL,
                 reason TEXT,
@@ -1837,7 +4064,8 @@ impl Bus {
                 expires_at INTEGER NOT NULL,
                 released_at INTEGER,
                 FOREIGN KEY(project_id) REFERENCES projects(id),
-                FOREIGN KEY(owner_agent_id) REFERENCES agents(id)
+                FOREIGN KEY(owner_agent_id) REFERENCES agents(id),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
              );
              CREATE TABLE IF NOT EXISTS artifacts (
                 id TEXT PRIMARY KEY,
@@ -1853,6 +4081,64 @@ impl Bus {
                 FOREIGN KEY(project_id) REFERENCES projects(id),
                 FOREIGN KEY(publisher_agent_id) REFERENCES agents(id),
                 FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
+             );
+             CREATE TABLE IF NOT EXISTS decisions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                decision_key TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                author_agent_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                artifact_ids_json TEXT NOT NULL,
+                confirmed_at INTEGER NOT NULL,
+                UNIQUE(project_id, decision_key),
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(author_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS responsibility_overrides (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                grantee_agent_id TEXT NOT NULL,
+                granted_by_agent_id TEXT NOT NULL,
+                path_pattern TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(grantee_agent_id) REFERENCES agents(id),
+                FOREIGN KEY(granted_by_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS git_commit_facts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                author_agent_id TEXT NOT NULL,
+                commit_sha TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                changed_paths_json TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(project_id, task_id, commit_sha),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(author_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS test_result_facts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                author_agent_id TEXT NOT NULL,
+                result_key TEXT NOT NULL,
+                suite TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                command TEXT,
+                report_artifact_id TEXT,
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(project_id, task_id, result_key),
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id),
+                FOREIGN KEY(author_agent_id) REFERENCES agents(id),
+                FOREIGN KEY(report_artifact_id) REFERENCES artifacts(id)
              );
              CREATE TABLE IF NOT EXISTS idempotency_records (
                 project_id TEXT NOT NULL,
@@ -1873,6 +4159,13 @@ impl Bus {
                 name TEXT NOT NULL,
                 event_types_json TEXT NOT NULL,
                 cursor_sequence INTEGER NOT NULL,
+                pending_delivery_id TEXT,
+                pending_from_sequence INTEGER,
+                pending_through_sequence INTEGER,
+                pending_created_at INTEGER,
+                last_acked_delivery_id TEXT,
+                last_acked_through_sequence INTEGER,
+                last_acked_at INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(project_id, agent_id, name),
@@ -1893,20 +4186,76 @@ impl Bus {
                 FOREIGN KEY(project_id) REFERENCES projects(id),
                 FOREIGN KEY(actor_agent_id) REFERENCES agents(id)
              );
+             CREATE TABLE IF NOT EXISTS retention_state (
+                project_id TEXT PRIMARY KEY,
+                events_pruned_through_sequence INTEGER NOT NULL DEFAULT 0,
+                last_applied_at INTEGER,
+                last_plan_id TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+             );
+             CREATE TABLE IF NOT EXISTS retention_runs (
+                project_id TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                actor_agent_id TEXT NOT NULL,
+                operator_approval_id TEXT,
+                policy_json TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                applied_at INTEGER NOT NULL,
+                PRIMARY KEY(project_id, plan_id),
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(actor_agent_id) REFERENCES agents(id)
+             );
+             CREATE TABLE IF NOT EXISTS operator_credentials (
+                project_id TEXT PRIMARY KEY,
+                secret_hash TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation >= 1),
+                configured_at INTEGER NOT NULL,
+                rotated_at INTEGER,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+             );
+             CREATE TABLE IF NOT EXISTS retention_approvals (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                operator_generation INTEGER NOT NULL CHECK(operator_generation >= 1),
+                policy_json TEXT NOT NULL,
+                approved_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL CHECK(expires_at > approved_at),
+                consumed_at INTEGER,
+                consumed_by_agent_id TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(consumed_by_agent_id) REFERENCES agents(id)
+             );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency
                 ON events(project_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_receipts_agent_unread
                 ON message_receipts(recipient_agent_id, read_at);
              CREATE INDEX IF NOT EXISTS idx_tasks_status
                 ON tasks(project_id, status);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_task_thread_binding_active
+                ON task_thread_bindings(project_id, task_id) WHERE unbound_at IS NULL;
+             CREATE INDEX IF NOT EXISTS idx_task_thread_binding_history
+                ON task_thread_bindings(project_id, thread_id, bound_at);
              CREATE INDEX IF NOT EXISTS idx_reservations_active
                 ON reservations(project_id, released_at, expires_at);
              CREATE INDEX IF NOT EXISTS idx_artifacts_task
                 ON artifacts(project_id, task_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_decisions_task
+                ON decisions(project_id, task_id, confirmed_at);
+             CREATE INDEX IF NOT EXISTS idx_responsibility_overrides_active
+                ON responsibility_overrides(project_id, grantee_agent_id, task_id, expires_at);
+             CREATE INDEX IF NOT EXISTS idx_git_commit_facts_task
+                ON git_commit_facts(project_id, task_id, recorded_at);
+             CREATE INDEX IF NOT EXISTS idx_test_result_facts_task
+                ON test_result_facts(project_id, task_id, recorded_at);
              CREATE INDEX IF NOT EXISTS idx_idempotency_created
                 ON idempotency_records(project_id, created_at);
              CREATE INDEX IF NOT EXISTS idx_subscriptions_agent
-                ON subscriptions(project_id, agent_id, name);",
+                ON subscriptions(project_id, agent_id, name);
+             CREATE INDEX IF NOT EXISTS idx_retention_runs_applied
+                ON retention_runs(project_id, applied_at);
+             CREATE INDEX IF NOT EXISTS idx_retention_approvals_active
+                ON retention_approvals(project_id, plan_id, consumed_at, expires_at);",
         )?;
         ensure_column(&self.conn, "agents", "recovery_hash", "TEXT")?;
         ensure_column(
@@ -1915,6 +4264,36 @@ impl Bus {
             "token_generation",
             "INTEGER NOT NULL DEFAULT 1",
         )?;
+        ensure_column(&self.conn, "message_receipts", "closed_at", "INTEGER")?;
+        ensure_column(&self.conn, "reservations", "task_id", "TEXT")?;
+        ensure_column(&self.conn, "subscriptions", "pending_delivery_id", "TEXT")?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "pending_from_sequence",
+            "INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "pending_through_sequence",
+            "INTEGER",
+        )?;
+        ensure_column(&self.conn, "subscriptions", "pending_created_at", "INTEGER")?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "last_acked_delivery_id",
+            "TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "subscriptions",
+            "last_acked_through_sequence",
+            "INTEGER",
+        )?;
+        ensure_column(&self.conn, "subscriptions", "last_acked_at", "INTEGER")?;
+        ensure_column(&self.conn, "retention_runs", "operator_approval_id", "TEXT")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![SCHEMA_VERSION, now_ms()],
@@ -1947,6 +4326,382 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         created_at: row.get(8)?,
         read_at: row.get(9)?,
         ack_at: row.get(10)?,
+        closed_at: row.get(11)?,
+    })
+}
+
+fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionView> {
+    let artifact_ids_json: String = row.get(5)?;
+    let artifact_ids = serde_json::from_str(&artifact_ids_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(DecisionView {
+        decision_id: row.get(0)?,
+        key: row.get(1)?,
+        task_id: row.get(2)?,
+        author: row.get(3)?,
+        summary: row.get(4)?,
+        artifact_ids,
+        confirmed_at: row.get(6)?,
+    })
+}
+
+fn map_responsibility_override(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ResponsibilityOverrideView> {
+    Ok(ResponsibilityOverrideView {
+        override_id: row.get(0)?,
+        task_id: row.get(1)?,
+        grantee: row.get(2)?,
+        granted_by: row.get(3)?,
+        path_pattern: row.get(4)?,
+        reason: row.get(5)?,
+        created_at: row.get(6)?,
+        expires_at: row.get(7)?,
+    })
+}
+
+fn map_git_commit_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitCommitFactView> {
+    let changed_paths_json: String = row.get(5)?;
+    Ok(GitCommitFactView {
+        fact_id: row.get(0)?,
+        task_id: row.get(1)?,
+        author: row.get(2)?,
+        commit_sha: row.get(3)?,
+        summary: row.get(4)?,
+        changed_paths: parse_json_column(&changed_paths_json, 5)?,
+        recorded_at: row.get(6)?,
+    })
+}
+
+fn map_test_result_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<TestResultFactView> {
+    Ok(TestResultFactView {
+        fact_id: row.get(0)?,
+        task_id: row.get(1)?,
+        author: row.get(2)?,
+        result_key: row.get(3)?,
+        suite: row.get(4)?,
+        outcome: row.get(5)?,
+        summary: row.get(6)?,
+        command: row.get(7)?,
+        report_artifact_id: row.get(8)?,
+        recorded_at: row.get(9)?,
+    })
+}
+
+fn map_task_thread_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskThreadBindingView> {
+    Ok(TaskThreadBindingView {
+        binding_id: row.get(0)?,
+        task_id: row.get(1)?,
+        thread_id: row.get(2)?,
+        agent: row.get(3)?,
+        bound_at: row.get(4)?,
+        unbound_at: row.get(5)?,
+    })
+}
+
+fn map_subscription_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubscriptionRecord> {
+    let event_types_json: String = row.get(2)?;
+    let pending_delivery_id: Option<String> = row.get(6)?;
+    let pending_from_sequence: Option<i64> = row.get(7)?;
+    let pending_through_sequence: Option<i64> = row.get(8)?;
+    let pending_created_at: Option<i64> = row.get(9)?;
+    let pending_delivery = match (
+        pending_delivery_id,
+        pending_from_sequence,
+        pending_through_sequence,
+        pending_created_at,
+    ) {
+        (Some(delivery_id), Some(from_sequence), Some(through_sequence), Some(created_at)) => {
+            Some(SubscriptionDeliveryView {
+                delivery_id,
+                from_sequence,
+                through_sequence,
+                created_at,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "subscription pending delivery columns are inconsistent",
+                )),
+            ));
+        }
+    };
+    Ok(SubscriptionRecord {
+        subscription_id: row.get(0)?,
+        name: row.get(1)?,
+        event_types: parse_json_column(&event_types_json, 2)?,
+        cursor_sequence: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        pending_delivery,
+        last_acked_delivery_id: row.get(10)?,
+        last_acked_through_sequence: row.get(11)?,
+        last_acked_at: row.get(12)?,
+    })
+}
+
+fn load_subscription_record(
+    connection: &Connection,
+    project_id: &str,
+    agent_id: &str,
+    name: &str,
+) -> Result<Option<SubscriptionRecord>> {
+    Ok(connection
+        .query_row(
+            "SELECT id, name, event_types_json, cursor_sequence, created_at, updated_at,
+                    pending_delivery_id, pending_from_sequence, pending_through_sequence,
+                    pending_created_at, last_acked_delivery_id,
+                    last_acked_through_sequence, last_acked_at
+             FROM subscriptions
+             WHERE project_id = ?1 AND agent_id = ?2 AND name = ?3",
+            params![project_id, agent_id, name],
+            map_subscription_record,
+        )
+        .optional()?)
+}
+
+fn load_retention_state(connection: &Connection, project_id: &str) -> Result<RetentionStateView> {
+    let stored: Option<(i64, Option<i64>, Option<String>)> = connection
+        .query_row(
+            "SELECT events_pruned_through_sequence, last_applied_at, last_plan_id
+             FROM retention_state WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (events_pruned_through_sequence, last_applied_at, last_plan_id) =
+        stored.unwrap_or((0, None, None));
+    Ok(RetentionStateView {
+        events_pruned_through_sequence,
+        earliest_available_event_sequence: events_pruned_through_sequence.saturating_add(1),
+        last_applied_at,
+        last_plan_id,
+    })
+}
+
+fn validate_retained_event_cursor(after_sequence: i64, state: &RetentionStateView) -> Result<()> {
+    if after_sequence < state.events_pruned_through_sequence {
+        return Err(BusError::Conflict(format!(
+            "event cursor {after_sequence} predates retained history; use afterSequence {} or later",
+            state.events_pruned_through_sequence
+        )));
+    }
+    Ok(())
+}
+
+fn validate_retention_policy(policy: &RetentionPolicy) -> Result<()> {
+    for (label, days) in [
+        ("eventMaxAgeDays", policy.event_max_age_days),
+        ("idempotencyMaxAgeDays", policy.idempotency_max_age_days),
+        (
+            "closedMessageMaxAgeDays",
+            policy.closed_message_max_age_days,
+        ),
+        (
+            "terminalBindingMaxAgeDays",
+            policy.terminal_binding_max_age_days,
+        ),
+    ] {
+        if !(1..=3_650).contains(&days) {
+            return Err(BusError::Validation(format!(
+                "{label} must be between 1 and 3650"
+            )));
+        }
+    }
+    if !(1..=1_000_000).contains(&policy.keep_recent_events) {
+        return Err(BusError::Validation(
+            "keepRecentEvents must be between 1 and 1000000".into(),
+        ));
+    }
+    if policy.closed_message_max_age_days < policy.idempotency_max_age_days {
+        return Err(BusError::Validation(
+            "closedMessageMaxAgeDays must be greater than or equal to idempotencyMaxAgeDays so cached message retries never reference deleted messages"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retention_plan_id(plan_id: &str) -> Result<()> {
+    let valid = plan_id.starts_with("rtp_")
+        && plan_id.len() == 68
+        && plan_id[4..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "retention confirmation must be a plan ID returned by retention plan".into(),
+        ))
+    }
+}
+
+fn validate_operator_approval_ttl(ttl_seconds: i64) -> Result<()> {
+    if (MIN_OPERATOR_APPROVAL_TTL_SECONDS..=MAX_OPERATOR_APPROVAL_TTL_SECONDS)
+        .contains(&ttl_seconds)
+    {
+        Ok(())
+    } else {
+        Err(BusError::Validation(format!(
+            "operator approval TTL must be between {MIN_OPERATOR_APPROVAL_TTL_SECONDS} and {MAX_OPERATOR_APPROVAL_TTL_SECONDS} seconds"
+        )))
+    }
+}
+
+fn authenticate_operator(connection: &Connection, project_id: &str, secret: &str) -> Result<i64> {
+    let row: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT secret_hash, generation FROM operator_credentials WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (secret_hash, generation) = row.ok_or_else(|| {
+        BusError::OperatorApprovalRequired("operator credential is not configured".into())
+    })?;
+    if secret.is_empty() || !secret_matches(secret, &secret_hash) {
+        return Err(BusError::OperatorUnauthorized);
+    }
+    Ok(generation)
+}
+
+fn retention_cutoff(now: i64, days: i64) -> Result<i64> {
+    let age = days
+        .checked_mul(DAY_MS)
+        .ok_or_else(|| BusError::Validation("retention age is too large".into()))?;
+    now.checked_sub(age)
+        .ok_or_else(|| BusError::Validation("retention cutoff is outside timestamp range".into()))
+}
+
+fn build_retention_plan(
+    connection: &Connection,
+    project_id: &str,
+    policy: &RetentionPolicy,
+    generated_at: i64,
+) -> Result<RetentionPlan> {
+    validate_retention_policy(policy)?;
+    let state = load_retention_state(connection, project_id)?;
+    let latest_event_sequence = latest_event_sequence(connection, project_id)?;
+    let (subscription_count, pending_delivery_count, slowest_cursor): (i64, i64, Option<i64>) =
+        connection.query_row(
+            "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN pending_delivery_id IS NULL THEN 0 ELSE 1 END), 0),
+                MIN(cursor_sequence)
+         FROM subscriptions WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let safe_event_sequence = slowest_cursor.unwrap_or(latest_event_sequence);
+    let event_cutoff = retention_cutoff(generated_at, policy.event_max_age_days)?;
+    let age_boundary: i64 = connection.query_row(
+        "SELECT COALESCE(MIN(sequence) - 1, ?3)
+         FROM events
+         WHERE project_id = ?1 AND sequence > ?2 AND created_at >= ?4",
+        params![
+            project_id,
+            state.events_pruned_through_sequence,
+            latest_event_sequence,
+            event_cutoff
+        ],
+        |row| row.get(0),
+    )?;
+    let recent_offset = policy.keep_recent_events - 1;
+    let recent_floor: Option<i64> = connection
+        .query_row(
+            "SELECT sequence FROM events
+             WHERE project_id = ?1 ORDER BY sequence DESC LIMIT 1 OFFSET ?2",
+            params![project_id, recent_offset],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let recent_boundary = recent_floor
+        .map(|sequence| sequence.saturating_sub(1))
+        .unwrap_or(state.events_pruned_through_sequence);
+    let event_prune_through_sequence = safe_event_sequence
+        .min(age_boundary)
+        .min(recent_boundary)
+        .max(state.events_pruned_through_sequence);
+    let event_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM events
+         WHERE project_id = ?1 AND sequence > ?2 AND sequence <= ?3",
+        params![
+            project_id,
+            state.events_pruned_through_sequence,
+            event_prune_through_sequence
+        ],
+        |row| row.get(0),
+    )?;
+
+    let idempotency_cutoff = retention_cutoff(generated_at, policy.idempotency_max_age_days)?;
+    let idempotency_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM idempotency_records
+         WHERE project_id = ?1 AND created_at < ?2",
+        params![project_id, idempotency_cutoff],
+        |row| row.get(0),
+    )?;
+    let closed_message_cutoff = retention_cutoff(generated_at, policy.closed_message_max_age_days)?;
+    let receipt_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM message_receipts r JOIN messages m ON m.id = r.message_id
+         WHERE m.project_id = ?1 AND r.closed_at IS NOT NULL AND r.closed_at < ?2",
+        params![project_id, closed_message_cutoff],
+        |row| row.get(0),
+    )?;
+    let message_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM messages m
+         WHERE m.project_id = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM message_receipts r
+             WHERE r.message_id = m.id
+               AND (r.closed_at IS NULL OR r.closed_at >= ?2)
+           )",
+        params![project_id, closed_message_cutoff],
+        |row| row.get(0),
+    )?;
+    let binding_cutoff = retention_cutoff(generated_at, policy.terminal_binding_max_age_days)?;
+    let binding_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM task_thread_bindings b
+         JOIN tasks t ON t.project_id = b.project_id AND t.id = b.task_id
+         WHERE b.project_id = ?1 AND b.unbound_at IS NOT NULL AND b.unbound_at < ?2
+           AND t.status IN ('completed', 'abandoned')",
+        params![project_id, binding_cutoff],
+        |row| row.get(0),
+    )?;
+    let candidates = RetentionCounts {
+        events: event_candidates,
+        idempotency_records: idempotency_candidates,
+        message_receipts: receipt_candidates,
+        messages: message_candidates,
+        task_thread_bindings: binding_candidates,
+    };
+    let protection = RetentionProtectionView {
+        latest_event_sequence,
+        events_pruned_through_sequence: state.events_pruned_through_sequence,
+        safe_event_sequence,
+        event_prune_through_sequence,
+        subscription_count,
+        pending_delivery_count,
+    };
+    let plan_hash = hash_json(&json!({
+        "projectId": project_id,
+        "policy": policy,
+        "protection": &protection,
+        "candidates": &candidates
+    }))?;
+    Ok(RetentionPlan {
+        plan_id: format!("rtp_{plan_hash}"),
+        generated_at,
+        policy: policy.clone(),
+        protection,
+        candidates,
     })
 }
 
@@ -2024,6 +4779,47 @@ fn query_events(
     limit: usize,
     event_types: &[String],
 ) -> Result<Vec<EventView>> {
+    query_events_window(
+        connection,
+        project_id,
+        after_sequence,
+        None,
+        limit,
+        event_types,
+    )
+}
+
+fn query_events_through(
+    connection: &Connection,
+    project_id: &str,
+    after_sequence: i64,
+    through_sequence: i64,
+    limit: usize,
+    event_types: &[String],
+) -> Result<Vec<EventView>> {
+    if through_sequence < after_sequence {
+        return Err(BusError::Validation(
+            "event delivery range cannot move backwards".into(),
+        ));
+    }
+    query_events_window(
+        connection,
+        project_id,
+        after_sequence,
+        Some(through_sequence),
+        limit,
+        event_types,
+    )
+}
+
+fn query_events_window(
+    connection: &Connection,
+    project_id: &str,
+    after_sequence: i64,
+    through_sequence: Option<i64>,
+    limit: usize,
+    event_types: &[String],
+) -> Result<Vec<EventView>> {
     validate_event_query(after_sequence, limit, event_types)?;
     let mut sql = String::from(
         "SELECT e.sequence, e.id, actor.name, e.event_type, e.entity_type,
@@ -2032,6 +4828,9 @@ fn query_events(
          LEFT JOIN agents actor ON actor.id = e.actor_agent_id
          WHERE e.project_id = ? AND e.sequence > ?",
     );
+    if through_sequence.is_some() {
+        sql.push_str(" AND e.sequence <= ?");
+    }
     if !event_types.is_empty() {
         sql.push_str(" AND e.event_type IN (");
         sql.push_str(&vec!["?"; event_types.len()].join(", "));
@@ -2039,9 +4838,12 @@ fn query_events(
     }
     sql.push_str(" ORDER BY e.sequence LIMIT ?");
 
-    let mut values = Vec::with_capacity(event_types.len() + 3);
+    let mut values = Vec::with_capacity(event_types.len() + 4);
     values.push(rusqlite::types::Value::Text(project_id.to_owned()));
     values.push(rusqlite::types::Value::Integer(after_sequence));
+    if let Some(through_sequence) = through_sequence {
+        values.push(rusqlite::types::Value::Integer(through_sequence));
+    }
     values.extend(
         event_types
             .iter()
@@ -2162,6 +4964,36 @@ fn dependencies_complete(
     Ok(true)
 }
 
+fn require_task_owner(
+    connection: &Connection,
+    project_id: &str,
+    task_id: &str,
+    actor: &AuthenticatedAgent,
+    allow_terminal: bool,
+) -> Result<String> {
+    let current: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT status, owner_agent_id FROM tasks WHERE project_id = ?1 AND id = ?2",
+            params![project_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (status, owner_agent_id) =
+        current.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+    if owner_agent_id.as_deref() != Some(actor.id.as_str()) {
+        return Err(BusError::Unauthorized(format!(
+            "agent '{}' must own task '{task_id}' to manage its thread binding",
+            actor.name
+        )));
+    }
+    if !allow_terminal && matches!(status.as_str(), "completed" | "abandoned") {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot be bound to a thread"
+        )));
+    }
+    Ok(status)
+}
+
 fn unlock_ready_tasks(tx: &Transaction<'_>, project_id: &str, now: i64) -> Result<()> {
     tx.execute(
         "UPDATE tasks SET status = 'ready', version = version + 1, updated_at = ?1
@@ -2176,6 +5008,126 @@ fn unlock_ready_tasks(tx: &Transaction<'_>, project_id: &str, now: i64) -> Resul
         params![now, project_id],
     )?;
     Ok(())
+}
+
+fn authorize_project_path(
+    connection: &Connection,
+    project_id: &str,
+    policy: &ResponsibilityPolicy,
+    actor: &AuthenticatedAgent,
+    task_id: Option<&str>,
+    project_path: &str,
+    now: i64,
+) -> Result<()> {
+    let task_status = if let Some(task_id) = task_id {
+        let status: Option<String> = connection
+            .query_row(
+                "SELECT status FROM tasks WHERE project_id = ?1 AND id = ?2",
+                params![project_id, task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let status = status
+            .ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+        Some(status)
+    } else {
+        None
+    };
+    if policy.allows(&actor.role, project_path) {
+        return Ok(());
+    }
+    let task_id = task_id.ok_or_else(|| {
+        BusError::Conflict(format!(
+            "path '{project_path}' is outside responsibility role '{}' and requires a task-scoped override",
+            actor.role
+        ))
+    })?;
+    if task_status
+        .as_deref()
+        .is_some_and(|status| matches!(status, "completed" | "abandoned"))
+    {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot authorize responsibility overrides"
+        )));
+    }
+    let mut statement = connection.prepare(
+        "SELECT path_pattern FROM responsibility_overrides
+         WHERE project_id = ?1 AND task_id = ?2 AND grantee_agent_id = ?3
+           AND expires_at > ?4
+         ORDER BY created_at, id",
+    )?;
+    let patterns = statement.query_map(params![project_id, task_id, actor.id, now], |row| {
+        row.get::<_, String>(0)
+    })?;
+    if patterns
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|pattern| policy_pattern_matches(pattern, project_path))
+    {
+        return Ok(());
+    }
+    Err(BusError::Conflict(format!(
+        "path '{project_path}' is outside responsibility role '{}' and task '{task_id}' has no active matching override",
+        actor.role
+    )))
+}
+
+fn ensure_nonterminal_task_exists(
+    connection: &Connection,
+    project_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM tasks WHERE project_id = ?1 AND id = ?2",
+            params![project_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let status =
+        status.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+    if matches!(status.as_str(), "completed" | "abandoned") {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot be associated with a new reservation"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_owned_nonterminal_task(
+    connection: &Connection,
+    project_id: &str,
+    actor: &AuthenticatedAgent,
+    task_id: &str,
+) -> Result<String> {
+    let task: Option<(Option<String>, String)> = connection
+        .query_row(
+            "SELECT owner_agent_id, status FROM tasks WHERE project_id = ?1 AND id = ?2",
+            params![project_id, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (owner, status) =
+        task.ok_or_else(|| BusError::Validation(format!("task '{task_id}' does not exist")))?;
+    if owner.as_deref() != Some(actor.id.as_str()) {
+        return Err(BusError::Unauthorized(format!(
+            "agent '{}' must own task '{task_id}'",
+            actor.name
+        )));
+    }
+    if matches!(status.as_str(), "completed" | "abandoned") {
+        return Err(BusError::Conflict(format!(
+            "terminal task '{task_id}' cannot accept new facts or overrides"
+        )));
+    }
+    Ok(status)
+}
+
+fn bounded_tail<T>(mut values: Vec<T>, limit: usize) -> Vec<T> {
+    if values.len() > limit {
+        values.drain(0..values.len() - limit);
+    }
+    values
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
@@ -2204,6 +5156,158 @@ fn validate_task_id(task_id: &str) -> Result<()> {
     } else {
         Err(BusError::Validation(
             "task id must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
+        ))
+    }
+}
+
+fn validate_result_key(key: &str) -> Result<()> {
+    let valid = !key.is_empty()
+        && key.len() <= 96
+        && key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "test result key must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
+        ))
+    }
+}
+
+fn normalize_commit_sha(commit_sha: &str) -> Result<String> {
+    let normalized = commit_sha.trim().to_ascii_lowercase();
+    if matches!(normalized.len(), 40 | 64)
+        && normalized
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        Ok(normalized)
+    } else {
+        Err(BusError::Validation(
+            "Git commit SHA must contain exactly 40 or 64 hexadecimal characters".into(),
+        ))
+    }
+}
+
+fn validate_decision_key(key: &str) -> Result<()> {
+    let valid = !key.is_empty()
+        && key.len() <= 96
+        && key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "decision key must be 1-96 ASCII letters, digits, '-', '_' or '.'".into(),
+        ))
+    }
+}
+
+fn validate_context_budget(item_limit: usize, byte_budget: usize) -> Result<()> {
+    if item_limit == 0 || item_limit > MAX_CONTEXT_ITEM_LIMIT {
+        return Err(BusError::Validation(format!(
+            "context item limit must be between 1 and {MAX_CONTEXT_ITEM_LIMIT}"
+        )));
+    }
+    if !(MIN_CONTEXT_BYTE_BUDGET..=MAX_CONTEXT_BYTE_BUDGET).contains(&byte_budget) {
+        return Err(BusError::Validation(format!(
+            "context byte budget must be between {MIN_CONTEXT_BYTE_BUDGET} and {MAX_CONTEXT_BYTE_BUDGET} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn context_task_candidate(category: &str, kind: &'static str, task: &TaskView) -> ContextCandidate {
+    let (title, title_truncated) = text_preview(&task.title, 128);
+    let (description_preview, description_truncated) = task
+        .description
+        .as_deref()
+        .map(|description| text_preview(description, 256))
+        .unwrap_or_default();
+    let (blocked_reason, blocked_reason_truncated) = task
+        .blocked_reason
+        .as_deref()
+        .map(|reason| text_preview(reason, 128))
+        .unwrap_or_default();
+    let depends_on = task.depends_on.iter().take(8).cloned().collect::<Vec<_>>();
+    ContextCandidate {
+        sort_key: format!("{category}|{}", task.task_id),
+        kind,
+        value: json!({
+            "taskId": task.task_id,
+            "title": title,
+            "titleTruncated": title_truncated,
+            "descriptionPreview": description_preview,
+            "descriptionTruncated": description_truncated,
+            "status": task.status,
+            "owner": task.owner,
+            "version": task.version,
+            "blockedReason": blocked_reason,
+            "blockedReasonTruncated": blocked_reason_truncated,
+            "dependsOn": depends_on,
+            "dependsOnTruncated": task.depends_on.len() > 8,
+            "createdAt": task.created_at,
+            "updatedAt": task.updated_at
+        }),
+    }
+}
+
+fn text_preview(value: &str, max_chars: usize) -> (String, bool) {
+    let preview = value.chars().take(max_chars).collect::<String>();
+    let truncated = value.chars().count() > max_chars;
+    (preview, truncated)
+}
+
+fn encode_context_cursor(sort_key: &str) -> String {
+    let encoded = sort_key
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("ctx1:{encoded}")
+}
+
+fn decode_context_cursor(cursor: &str) -> Result<String> {
+    let encoded = cursor
+        .strip_prefix("ctx1:")
+        .ok_or_else(|| BusError::Validation("context cursor has an unsupported version".into()))?;
+    if encoded.is_empty() || encoded.len() > 1_024 || encoded.len() % 2 != 0 {
+        return Err(BusError::Validation("context cursor is malformed".into()));
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| BusError::Validation("context cursor is malformed".into()))?;
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| BusError::Validation("context cursor is malformed".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sort_key = String::from_utf8(bytes)
+        .map_err(|_| BusError::Validation("context cursor is malformed".into()))?;
+    if !matches!(
+        sort_key.as_bytes(),
+        [b'1' | b'2' | b'3' | b'4' | b'5' | b'6' | b'7', b'|', ..]
+    ) {
+        return Err(BusError::Validation("context cursor is malformed".into()));
+    }
+    Ok(sort_key)
+}
+
+fn validate_thread_id(thread_id: &str) -> Result<()> {
+    let valid = !thread_id.is_empty()
+        && thread_id.len() <= 128
+        && thread_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BusError::Validation(
+            "thread id must be 1-128 ASCII letters, digits, '-', '_', '.', ':' or '/'".into(),
         ))
     }
 }
@@ -2262,6 +5366,15 @@ fn validate_reservation_ttl(ttl_seconds: i64) -> Result<()> {
     Ok(())
 }
 
+fn validate_responsibility_ttl(ttl_seconds: i64) -> Result<()> {
+    if !(60..=86_400).contains(&ttl_seconds) {
+        return Err(BusError::Validation(
+            "responsibility override TTL must be between 60 and 86400 seconds".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
@@ -2301,36 +5414,98 @@ fn sha256_file(path: &Path) -> Result<String> {
         .collect())
 }
 
-fn now_ms() -> i64 {
-    Utc::now().timestamp_millis()
+fn backup_connection_to(source: &Connection, destination: &Path) -> Result<BackupView> {
+    if destination.exists() {
+        return Err(BusError::Conflict(format!(
+            "backup destination '{}' already exists",
+            destination.display()
+        )));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = destination.with_extension(format!("vibebus-tmp-{}", Uuid::new_v4().simple()));
+    let backup_result = (|| -> Result<()> {
+        let mut destination_connection = Connection::open(&temporary)?;
+        let backup = rusqlite::backup::Backup::new(source, &mut destination_connection)?;
+        backup.run_to_completion(64, Duration::from_millis(10), None)?;
+        drop(backup);
+        destination_connection.close().map_err(|(_, error)| error)?;
+        fs::rename(&temporary, destination)?;
+        Ok(())
+    })();
+    if backup_result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    backup_result?;
+    let metadata = fs::metadata(destination)?;
+    Ok(BackupView {
+        path: destination.to_string_lossy().into_owned(),
+        bytes: metadata.len(),
+        sha256: sha256_file(destination)?,
+        created_at: now_ms(),
+    })
 }
 
-fn normalize_path_pattern(path: &str) -> Result<String> {
-    let trimmed = path.trim();
-    let candidate = Path::new(trimmed);
-    if candidate.is_absolute()
-        || trimmed.starts_with('/')
-        || trimmed.starts_with('\\')
-        || trimmed.as_bytes().get(1).is_some_and(|byte| *byte == b':')
-    {
-        return Err(BusError::Validation(
-            "reservation path must be project-relative".into(),
-        ));
-    }
-    let normalized = trimmed.replace('\\', "/").trim_matches('/').to_owned();
-    if normalized.is_empty()
-        || normalized.starts_with("..")
-        || normalized.split('/').any(|segment| segment == "..")
-    {
-        return Err(BusError::Validation(
-            "reservation path must be project-relative and cannot contain '..'".into(),
-        ));
-    }
-    Ok(if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
+fn compaction_metrics(connection: &Connection, path: &Path) -> Result<CompactionMetricsView> {
+    Ok(CompactionMetricsView {
+        bytes: fs::metadata(path)?.len(),
+        page_count: connection.query_row("PRAGMA page_count", [], |row| row.get(0))?,
+        page_size: connection.query_row("PRAGMA page_size", [], |row| row.get(0))?,
+        freelist_pages: connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?,
+        sha256: sha256_file(path)?,
     })
+}
+
+fn verify_database_file(path: &Path, project_id: &str) -> Result<()> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection = Connection::open_with_flags(path, flags)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let (integrity, foreign_key_violations, schema_version) =
+        verify_open_database(&connection, project_id)?;
+    connection.close().map_err(|(_, error)| error)?;
+    if integrity != "ok" || foreign_key_violations != 0 || schema_version != SCHEMA_VERSION {
+        return Err(BusError::Conflict(format!(
+            "backup verification failed: integrity={integrity}, foreignKeyViolations={foreign_key_violations}, schemaVersion={schema_version}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_open_database(connection: &Connection, project_id: &str) -> Result<(String, i64, i64)> {
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let mut foreign_keys = connection.prepare("PRAGMA foreign_key_check")?;
+    let foreign_key_violations = foreign_keys
+        .query_map([], |_| Ok(()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .len() as i64;
+    drop(foreign_keys);
+    let schema_version: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    let project_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    if !project_exists {
+        return Err(BusError::Conflict(format!(
+            "database does not contain project '{project_id}'"
+        )));
+    }
+    Ok((integrity, foreign_key_violations, schema_version))
+}
+
+fn exclusive_compaction_error(error: rusqlite::Error) -> BusError {
+    BusError::Conflict(format!(
+        "offline compaction could not obtain an exclusive SQLite boundary: {error}"
+    ))
+}
+
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
 fn validate_task_transition(current: &str, next: &str) -> Result<()> {

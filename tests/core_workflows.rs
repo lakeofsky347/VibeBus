@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use rusqlite::Connection;
 use tempfile::TempDir;
-use vibebus::{Bus, BusError, initialize_project};
+use vibebus::{Bus, BusError, RetentionPolicy, initialize_project};
 
 struct Harness {
     project: TempDir,
@@ -85,6 +86,103 @@ fn directed_messages_are_isolated_and_acknowledged() {
         .expect("full inbox after ack");
     assert!(all[0].read_at.is_some());
     assert!(all[0].ack_at.is_some());
+}
+
+#[test]
+fn messages_require_ack_before_close_and_closed_items_are_hidden_by_default() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let sender = bus.register_agent("closer-sender", "coordination").unwrap();
+    let recipient = bus
+        .register_agent("closer-recipient", "implementation")
+        .unwrap();
+    let unrelated = bus.register_agent("closer-other", "review").unwrap();
+
+    let required = bus
+        .send_message(
+            "closer-sender",
+            &sender.token,
+            std::slice::from_ref(&recipient.name),
+            "Approval needed",
+            "Acknowledge before closing",
+            Some("close/001"),
+            "high",
+            true,
+        )
+        .unwrap();
+    assert!(matches!(
+        bus.close_message("closer-recipient", &recipient.token, &required.message_id),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.close_message("closer-other", &unrelated.token, &required.message_id),
+        Err(BusError::Unauthorized(_))
+    ));
+
+    let acknowledged = bus
+        .acknowledge_message("closer-recipient", &recipient.token, &required.message_id)
+        .unwrap();
+    assert!(acknowledged.ack_at.is_some());
+    let closed = bus
+        .close_message("closer-recipient", &recipient.token, &required.message_id)
+        .unwrap();
+    assert!(closed.closed_at.is_some());
+    let closed_retry = bus
+        .close_message("closer-recipient", &recipient.token, &required.message_id)
+        .unwrap();
+    assert_eq!(closed.closed_at, closed_retry.closed_at);
+    assert!(matches!(
+        bus.mark_read("closer-recipient", &recipient.token, &required.message_id),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.acknowledge_message("closer-recipient", &recipient.token, &required.message_id),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(
+        bus.inbox("closer-recipient", &recipient.token, false)
+            .unwrap()
+            .is_empty()
+    );
+    let including_closed = bus
+        .inbox_with_options("closer-recipient", &recipient.token, false, true)
+        .unwrap();
+    assert_eq!(including_closed.len(), 1);
+    assert_eq!(including_closed[0].closed_at, closed.closed_at);
+
+    let informational = bus
+        .send_message(
+            "closer-sender",
+            &sender.token,
+            std::slice::from_ref(&recipient.name),
+            "For information",
+            "No acknowledgement required",
+            None,
+            "normal",
+            false,
+        )
+        .unwrap();
+    let informational_closed = bus
+        .close_message(
+            "closer-recipient",
+            &recipient.token,
+            &informational.message_id,
+        )
+        .unwrap();
+    assert!(informational_closed.closed_at.is_some());
+    assert_eq!(
+        informational_closed.read_at,
+        informational_closed.closed_at.unwrap()
+    );
+
+    let closed_events = bus
+        .list_events(0, 100, &["message_closed".to_owned()])
+        .unwrap();
+    assert_eq!(
+        closed_events.len(),
+        2,
+        "close retries must not duplicate events"
+    );
 }
 
 #[test]
@@ -171,6 +269,506 @@ fn task_dependencies_versions_and_unlocking_are_enforced() {
         None,
     );
     assert!(matches!(stale, Err(BusError::Conflict(_))));
+}
+
+#[test]
+fn task_thread_bindings_are_owner_scoped_idempotent_and_terminal_safe() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let owner = bus
+        .register_agent("thread-owner", "implementation")
+        .unwrap();
+    let other = bus.register_agent("thread-other", "review").unwrap();
+    bus.create_task(
+        "thread-owner",
+        &owner.token,
+        "THREAD-001",
+        "Exercise thread binding",
+        None,
+        &[],
+    )
+    .unwrap();
+    let claimed = bus
+        .claim_task("thread-owner", &owner.token, "THREAD-001")
+        .unwrap();
+
+    assert!(matches!(
+        bus.bind_task_thread("thread-other", &other.token, "THREAD-001", "codex:other"),
+        Err(BusError::Unauthorized(_))
+    ));
+    assert!(matches!(
+        bus.bind_task_thread("thread-owner", &owner.token, "THREAD-001", "bad thread id"),
+        Err(BusError::Validation(_))
+    ));
+    let first = bus
+        .bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    let first_retry = bus
+        .bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    assert_eq!(first.binding_id, first_retry.binding_id);
+    assert!(matches!(
+        bus.bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-2"),
+        Err(BusError::Conflict(_))
+    ));
+    let snapshot = bus
+        .handoff_snapshot("thread-owner", &owner.token, 0)
+        .unwrap();
+    assert_eq!(snapshot.task_thread_bindings.len(), 1);
+
+    let unbound = bus
+        .unbind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    let unbound_retry = bus
+        .unbind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-1")
+        .unwrap();
+    assert_eq!(unbound.binding_id, unbound_retry.binding_id);
+    assert_eq!(unbound.unbound_at, unbound_retry.unbound_at);
+    let second = bus
+        .bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-2")
+        .unwrap();
+    assert_ne!(first.binding_id, second.binding_id);
+
+    let working = bus
+        .update_task(
+            "thread-owner",
+            &owner.token,
+            "THREAD-001",
+            claimed.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    bus.update_task(
+        "thread-owner",
+        &owner.token,
+        "THREAD-001",
+        working.version,
+        "completed",
+        None,
+    )
+    .unwrap();
+    assert!(
+        bus.list_task_thread_bindings(None, true)
+            .unwrap()
+            .is_empty()
+    );
+    let history = bus
+        .list_task_thread_bindings(Some("THREAD-001"), false)
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|binding| binding.unbound_at.is_some()));
+    assert!(matches!(
+        bus.bind_task_thread("thread-owner", &owner.token, "THREAD-001", "codex:thread-3"),
+        Err(BusError::Conflict(_))
+    ));
+}
+
+#[test]
+fn concurrent_thread_binding_allows_exactly_one_winner() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let owner = bus
+        .register_agent("thread-racer", "implementation")
+        .unwrap();
+    bus.create_task(
+        "thread-racer",
+        &owner.token,
+        "THREAD-RACE",
+        "Bind once",
+        None,
+        &[],
+    )
+    .unwrap();
+    bus.claim_task("thread-racer", &owner.token, "THREAD-RACE")
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = ["codex:race-a", "codex:race-b"]
+        .into_iter()
+        .map(|thread_id| {
+            let root = harness.project.path().to_path_buf();
+            let data = harness.data.path().to_path_buf();
+            let token = owner.token.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.bind_task_thread("thread-racer", &token, "THREAD-RACE", thread_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(bus.list_task_thread_bindings(None, true).unwrap().len(), 1);
+}
+
+#[test]
+fn retention_is_previewed_subscription_safe_stale_checked_and_replayable() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let owner = bus.register_agent("retention-owner", "operations").unwrap();
+    let operator = bus.initialize_operator().unwrap();
+    assert!(bus.operator_status().unwrap().configured);
+    bus.create_subscription(
+        "retention-owner",
+        &owner.token,
+        "protect-history",
+        &[],
+        Some(0),
+    )
+    .unwrap();
+
+    let message = bus
+        .send_message_idempotent(
+            "retention-owner",
+            &owner.token,
+            std::slice::from_ref(&owner.name),
+            "Old closed message",
+            "Eligible after the retention window",
+            None,
+            "normal",
+            false,
+            Some("retention-message:001"),
+        )
+        .unwrap();
+    bus.close_message("retention-owner", &owner.token, &message.message_id)
+        .unwrap();
+    bus.create_task(
+        "retention-owner",
+        &owner.token,
+        "RETENTION-HISTORY",
+        "Produce terminal binding history",
+        None,
+        &[],
+    )
+    .unwrap();
+    let claimed = bus
+        .claim_task("retention-owner", &owner.token, "RETENTION-HISTORY")
+        .unwrap();
+    bus.bind_task_thread(
+        "retention-owner",
+        &owner.token,
+        "RETENTION-HISTORY",
+        "codex:retention-history",
+    )
+    .unwrap();
+    let working = bus
+        .update_task(
+            "retention-owner",
+            &owner.token,
+            "RETENTION-HISTORY",
+            claimed.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    bus.update_task(
+        "retention-owner",
+        &owner.token,
+        "RETENTION-HISTORY",
+        working.version,
+        "completed",
+        None,
+    )
+    .unwrap();
+
+    let peeked = bus
+        .peek_subscription("retention-owner", &owner.token, "protect-history", 500)
+        .unwrap();
+    let delivery = peeked.delivery.clone().expect("pending delivery");
+    let database = Connection::open(bus.database_path()).unwrap();
+    database
+        .execute(
+            "UPDATE events SET created_at = 0 WHERE project_id = ?1",
+            [bus.project().project_id.as_str()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE idempotency_records SET created_at = 0 WHERE project_id = ?1",
+            [bus.project().project_id.as_str()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE message_receipts SET closed_at = 0 WHERE message_id = ?1",
+            [message.message_id.as_str()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE task_thread_bindings SET unbound_at = 0
+             WHERE project_id = ?1 AND task_id = 'RETENTION-HISTORY'",
+            [bus.project().project_id.as_str()],
+        )
+        .unwrap();
+    drop(database);
+
+    let policy = RetentionPolicy {
+        event_max_age_days: 1,
+        keep_recent_events: 1,
+        idempotency_max_age_days: 1,
+        closed_message_max_age_days: 1,
+        terminal_binding_max_age_days: 1,
+    };
+    let unsafe_policy = RetentionPolicy {
+        idempotency_max_age_days: 2,
+        ..policy.clone()
+    };
+    assert!(matches!(
+        bus.plan_retention("retention-owner", &owner.token, &unsafe_policy),
+        Err(BusError::Validation(_))
+    ));
+    let protected = bus
+        .plan_retention("retention-owner", &owner.token, &policy)
+        .unwrap();
+    assert_eq!(protected.protection.safe_event_sequence, 0);
+    assert_eq!(protected.protection.pending_delivery_count, 1);
+    assert_eq!(protected.candidates.events, 0);
+    assert_eq!(protected.candidates.idempotency_records, 1);
+    assert_eq!(protected.candidates.message_receipts, 1);
+    assert_eq!(protected.candidates.messages, 1);
+    assert_eq!(protected.candidates.task_thread_bindings, 1);
+
+    bus.acknowledge_subscription(
+        "retention-owner",
+        &owner.token,
+        "protect-history",
+        &delivery.delivery_id,
+    )
+    .unwrap();
+    assert!(matches!(
+        bus.apply_retention("retention-owner", &owner.token, &policy, &protected.plan_id,),
+        Err(BusError::Conflict(_))
+    ));
+    let applicable = bus
+        .plan_retention("retention-owner", &owner.token, &policy)
+        .unwrap();
+    assert!(applicable.candidates.events > 0);
+    assert_eq!(applicable.protection.pending_delivery_count, 0);
+    assert!(
+        applicable.protection.event_prune_through_sequence
+            <= applicable.protection.safe_event_sequence
+    );
+    assert!(matches!(
+        bus.apply_retention(
+            "retention-owner",
+            &owner.token,
+            &policy,
+            &applicable.plan_id,
+        ),
+        Err(BusError::OperatorApprovalRequired(_))
+    ));
+    assert!(matches!(
+        bus.approve_retention("wrong-operator-secret", &policy, &applicable.plan_id, 600),
+        Err(BusError::OperatorUnauthorized)
+    ));
+    let approval = bus
+        .approve_retention(&operator.operator_secret, &policy, &applicable.plan_id, 600)
+        .unwrap();
+    assert_eq!(approval.plan.candidates, applicable.candidates);
+    assert_eq!(approval.operator_generation, 1);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = (0..2)
+        .map(|_| {
+            let root = harness.project.path().to_path_buf();
+            let data = harness.data.path().to_path_buf();
+            let token = owner.token.clone();
+            let policy = policy.clone();
+            let plan_id = applicable.plan_id.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.apply_retention("retention-owner", &token, &policy, &plan_id)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let reports = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(reports.iter().filter(|report| report.replayed).count(), 1);
+    assert_eq!(reports.iter().filter(|report| !report.replayed).count(), 1);
+    let applied = reports.iter().find(|report| !report.replayed).unwrap();
+    assert_eq!(applied.deleted, applicable.candidates);
+    assert_eq!(
+        applied.operator_approval_id.as_deref(),
+        Some(approval.approval_id.as_str())
+    );
+    let changed_retry_policy = RetentionPolicy {
+        event_max_age_days: 2,
+        ..policy.clone()
+    };
+    assert!(matches!(
+        bus.apply_retention(
+            "retention-owner",
+            &owner.token,
+            &changed_retry_policy,
+            &applicable.plan_id,
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let state = bus.retention_state().unwrap();
+    assert_eq!(
+        state.events_pruned_through_sequence,
+        applicable.protection.event_prune_through_sequence
+    );
+    assert_eq!(
+        state.last_plan_id.as_deref(),
+        Some(applicable.plan_id.as_str())
+    );
+    assert!(matches!(
+        bus.list_events(0, 100, &[]),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.create_subscription("retention-owner", &owner.token, "too-old", &[], Some(0),),
+        Err(BusError::Conflict(_))
+    ));
+    let snapshot = bus
+        .handoff_snapshot("retention-owner", &owner.token, 0)
+        .unwrap();
+    assert_eq!(
+        snapshot.retention_state.events_pruned_through_sequence,
+        state.events_pruned_through_sequence
+    );
+    assert!(
+        snapshot
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "retention_applied")
+    );
+    assert!(
+        bus.inbox_with_options("retention-owner", &owner.token, false, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bus.list_task_thread_bindings(Some("RETENTION-HISTORY"), false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn operator_approval_is_generation_bound_expiring_and_replay_safe() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let agent = bus.register_agent("operator-agent", "operations").unwrap();
+    let first_operator = bus.initialize_operator().unwrap();
+    assert!(matches!(
+        bus.initialize_operator(),
+        Err(BusError::Conflict(_))
+    ));
+    let policy = RetentionPolicy::default();
+    let plan = bus
+        .plan_retention("operator-agent", &agent.token, &policy)
+        .unwrap();
+    assert!(matches!(
+        bus.approve_retention(&first_operator.operator_secret, &policy, &plan.plan_id, 59,),
+        Err(BusError::Validation(_))
+    ));
+    assert!(matches!(
+        bus.approve_retention(
+            &first_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            3_601,
+        ),
+        Err(BusError::Validation(_))
+    ));
+    let stale_generation_approval = bus
+        .approve_retention(&first_operator.operator_secret, &policy, &plan.plan_id, 600)
+        .unwrap();
+    let second_operator = bus
+        .rotate_operator(&first_operator.operator_secret)
+        .unwrap();
+    assert_eq!(second_operator.generation, 2);
+    assert!(matches!(
+        bus.rotate_operator(&first_operator.operator_secret),
+        Err(BusError::OperatorUnauthorized)
+    ));
+    assert!(matches!(
+        bus.apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id),
+        Err(BusError::OperatorApprovalRequired(_))
+    ));
+
+    let expired_approval = bus
+        .approve_retention(
+            &second_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            600,
+        )
+        .unwrap();
+    let database = Connection::open(bus.database_path()).unwrap();
+    database
+        .execute(
+            "UPDATE retention_approvals SET approved_at = 0, expires_at = 1 WHERE id = ?1",
+            [expired_approval.approval_id.as_str()],
+        )
+        .unwrap();
+    drop(database);
+    assert!(matches!(
+        bus.apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id),
+        Err(BusError::OperatorApprovalRequired(_))
+    ));
+
+    let active_approval = bus
+        .approve_retention(
+            &second_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            600,
+        )
+        .unwrap();
+    let applied = bus
+        .apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id)
+        .unwrap();
+    assert_eq!(
+        applied.operator_approval_id.as_deref(),
+        Some(active_approval.approval_id.as_str())
+    );
+    assert_ne!(
+        applied.operator_approval_id.as_deref(),
+        Some(stale_generation_approval.approval_id.as_str())
+    );
+    let replayed = bus
+        .apply_retention("operator-agent", &agent.token, &policy, &plan.plan_id)
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.operator_approval_id, applied.operator_approval_id);
+    assert!(matches!(
+        bus.approve_retention(
+            &second_operator.operator_secret,
+            &policy,
+            &plan.plan_id,
+            600,
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let database = Connection::open(bus.database_path()).unwrap();
+    let consumed: (Option<i64>, Option<String>) = database
+        .query_row(
+            "SELECT consumed_at, consumed_by_agent_id FROM retention_approvals WHERE id = ?1",
+            [active_approval.approval_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(consumed.0.is_some());
+    assert!(consumed.1.is_some());
 }
 
 #[test]
@@ -387,6 +985,259 @@ fn artifacts_are_project_scoped_hashed_and_filterable() {
 }
 
 #[test]
+fn responsibility_policy_overrides_and_task_facts_are_enforced_and_projected() {
+    let harness = Harness::new();
+    fs::write(
+        harness
+            .project
+            .path()
+            .join(".vibebus")
+            .join("responsibility.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "defaultAllowedPaths": [],
+            "roles": {
+                "owner-role": {"allowedPaths": ["src/**"]},
+                "grantee-role": {"allowedPaths": []}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(harness.project.path().join("docs")).unwrap();
+    fs::write(
+        harness.project.path().join("docs").join("report.txt"),
+        "bounded report\n",
+    )
+    .unwrap();
+
+    let mut bus = harness.bus();
+    let owner = bus.register_agent("policy-owner", "owner-role").unwrap();
+    let grantee = bus
+        .register_agent("policy-grantee", "grantee-role")
+        .unwrap();
+    bus.create_task(
+        &owner.name,
+        &owner.token,
+        "POLICY-001",
+        "Policy task",
+        None,
+        &[],
+    )
+    .unwrap();
+    bus.claim_task(&owner.name, &owner.token, "POLICY-001")
+        .unwrap();
+
+    assert!(matches!(
+        bus.reserve_path_for_task_idempotent(
+            &owner.name,
+            &owner.token,
+            "src/missing-task",
+            300,
+            true,
+            Some("invalid task association"),
+            Some("POLICY-MISSING"),
+            None,
+        ),
+        Err(BusError::Validation(_))
+    ));
+
+    assert!(matches!(
+        bus.publish_artifact(
+            &owner.name,
+            &owner.token,
+            "report",
+            "docs/report.txt",
+            "Outside owner role",
+            Some("POLICY-001"),
+            None,
+        ),
+        Err(BusError::Conflict(_))
+    ));
+    assert!(matches!(
+        bus.reserve_path_for_task_idempotent(
+            &grantee.name,
+            &grantee.token,
+            "external/resource",
+            300,
+            true,
+            Some("cross-domain work"),
+            Some("POLICY-001"),
+            Some("policy-reserve-before-override"),
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let self_override = bus
+        .grant_responsibility_override_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &owner.name,
+            "docs/**",
+            "Task needs a bounded report",
+            600,
+            Some("policy-self-override"),
+        )
+        .unwrap();
+    let self_override_retry = bus
+        .grant_responsibility_override_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &owner.name,
+            "docs/**",
+            "Task needs a bounded report",
+            600,
+            Some("policy-self-override"),
+        )
+        .unwrap();
+    assert_eq!(self_override, self_override_retry);
+    bus.grant_responsibility_override_idempotent(
+        &owner.name,
+        &owner.token,
+        "POLICY-001",
+        &grantee.name,
+        "external/**",
+        "Delegate one cross-domain resource",
+        600,
+        Some("policy-grantee-override"),
+    )
+    .unwrap();
+
+    let delegated = bus
+        .reserve_path_for_task_idempotent(
+            &grantee.name,
+            &grantee.token,
+            "external/resource",
+            300,
+            true,
+            Some("cross-domain work"),
+            Some("POLICY-001"),
+            Some("policy-reserve-after-override"),
+        )
+        .unwrap();
+    assert_eq!(delegated.task_id.as_deref(), Some("POLICY-001"));
+
+    let artifact = bus
+        .publish_artifact_idempotent(
+            &owner.name,
+            &owner.token,
+            "report",
+            "docs/report.txt",
+            "Task-scoped report",
+            Some("POLICY-001"),
+            None,
+            Some("policy-artifact"),
+        )
+        .unwrap();
+    let changed_paths = vec!["src/store.rs".to_owned(), "docs/report.txt".to_owned()];
+    let commit = bus
+        .record_git_commit_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &"a".repeat(40),
+            "feat: enforce responsibility policy",
+            &changed_paths,
+            Some("policy-commit"),
+        )
+        .unwrap();
+    let commit_retry = bus
+        .record_git_commit_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &"a".repeat(40),
+            "feat: enforce responsibility policy",
+            &changed_paths,
+            Some("policy-commit"),
+        )
+        .unwrap();
+    assert_eq!(commit, commit_retry);
+    assert!(matches!(
+        bus.record_git_commit_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            &"a".repeat(40),
+            "changed semantics",
+            &changed_paths,
+            Some("policy-commit-drift"),
+        ),
+        Err(BusError::Conflict(_))
+    ));
+
+    let test_result = bus
+        .record_test_result_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            "unit-1",
+            "cargo test",
+            "passed",
+            "All responsibility tests passed",
+            Some("cargo test --all-targets --locked"),
+            Some(&artifact.artifact_id),
+            Some("policy-test-result"),
+        )
+        .unwrap();
+    let test_retry = bus
+        .record_test_result_idempotent(
+            &owner.name,
+            &owner.token,
+            "POLICY-001",
+            "unit-1",
+            "cargo test",
+            "passed",
+            "All responsibility tests passed",
+            Some("cargo test --all-targets --locked"),
+            Some(&artifact.artifact_id),
+            Some("policy-test-result"),
+        )
+        .unwrap();
+    assert_eq!(test_result, test_retry);
+
+    let inspection = bus
+        .inspect_responsibility_policy(&owner.name, &owner.token)
+        .unwrap();
+    assert!(inspection.configured);
+    assert_eq!(inspection.allowed_paths, vec!["src/**"]);
+    assert_eq!(inspection.active_overrides.len(), 1);
+    assert_eq!(
+        inspection.active_overrides[0].override_id,
+        self_override.override_id
+    );
+
+    let context = bus
+        .context_sync(&owner.name, &owner.token, None, 100, 65_536)
+        .unwrap();
+    assert!(
+        context
+            .items
+            .iter()
+            .any(|item| item.kind == "gitCommitFact")
+    );
+    assert!(
+        context
+            .items
+            .iter()
+            .any(|item| item.kind == "testResultFact")
+    );
+    let proposal = bus
+        .handoff_proposal(&owner.name, &owner.token, "POLICY-001", 10)
+        .unwrap();
+    assert_eq!(proposal.git_commits, vec![commit]);
+    assert_eq!(proposal.test_results, vec![test_result]);
+    assert_eq!(proposal.artifacts[0].artifact_id, artifact.artifact_id);
+
+    let doctor = bus.doctor().unwrap();
+    assert_eq!(doctor.responsibility_overrides, 2);
+    assert_eq!(doctor.git_commit_facts, 1);
+    assert_eq!(doctor.test_result_facts, 1);
+}
+
+#[test]
 fn doctor_reports_healthy_database_and_backup_is_consistent() {
     let harness = Harness::new();
     let mut bus = harness.bus();
@@ -397,7 +1248,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 5);
+    assert_eq!(doctor.schema_version, 11);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -410,6 +1261,124 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
         .unwrap();
     assert_eq!(integrity, "ok");
     assert!(bus.backup_to(&destination).is_err());
+}
+
+#[test]
+fn offline_compaction_is_backup_first_verified_and_reclaims_disposable_space() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let operator = bus.initialize_operator().unwrap();
+    let database_path = bus.database_path().to_path_buf();
+    drop(bus);
+
+    let fixture = Connection::open(&database_path).unwrap();
+    fixture
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE compaction_fixture (payload BLOB NOT NULL);
+             WITH RECURSIVE sequence(value) AS (
+               VALUES(1) UNION ALL SELECT value + 1 FROM sequence WHERE value < 256
+             )
+             INSERT INTO compaction_fixture(payload)
+             SELECT zeroblob(16384) FROM sequence;
+             DELETE FROM compaction_fixture;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    let fragmented_pages: i64 = fixture
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap();
+    assert!(fragmented_pages > 0);
+    drop(fixture);
+
+    let backup_path = harness.data.path().join("offline-before-vacuum.db");
+    let report = Bus::compact_offline(
+        harness.project.path(),
+        Some(harness.data.path()),
+        &operator.operator_secret,
+        &backup_path,
+    )
+    .unwrap();
+    assert!(report.verified);
+    assert_eq!(report.journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(report.integrity, "ok");
+    assert_eq!(report.foreign_key_violations, 0);
+    assert_eq!(report.schema_version, 11);
+    assert_eq!(report.operator_generation, 1);
+    assert_eq!(report.backup.path, backup_path.to_string_lossy());
+    assert_eq!(report.backup.sha256.len(), 64);
+    assert_eq!(report.before.sha256.len(), 64);
+    assert_eq!(report.after.sha256.len(), 64);
+    assert!(report.before.freelist_pages > 0);
+    assert_eq!(report.after.freelist_pages, 0);
+    assert!(report.after.bytes < report.before.bytes);
+    assert_eq!(
+        report.reclaimed_bytes,
+        report.before.bytes - report.after.bytes
+    );
+
+    let bus = harness.bus();
+    assert!(bus.doctor().unwrap().ok);
+    let events = bus
+        .list_events(
+            0,
+            10,
+            &["compaction_started".into(), "compaction_completed".into()],
+        )
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].entity_id, report.compaction_id);
+    assert_eq!(events[1].entity_id, report.compaction_id);
+}
+
+#[test]
+fn offline_compaction_refuses_active_coordination_state_before_backup() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let operator = bus.initialize_operator().unwrap();
+    let agent = bus.register_agent("compact-active", "operations").unwrap();
+    bus.create_task(
+        &agent.name,
+        &agent.token,
+        "COMPACT-ACTIVE-001",
+        "Still active",
+        None,
+        &[],
+    )
+    .unwrap();
+    drop(bus);
+
+    let backup_path = harness.data.path().join("must-not-exist.db");
+    let result = Bus::compact_offline(
+        harness.project.path(),
+        Some(harness.data.path()),
+        &operator.operator_secret,
+        &backup_path,
+    );
+    assert!(matches!(result, Err(BusError::Conflict(_))));
+    assert!(!backup_path.exists());
+}
+
+#[test]
+fn offline_compaction_fails_fast_when_sqlite_is_busy() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let operator = bus.initialize_operator().unwrap();
+    let database_path = bus.database_path().to_path_buf();
+    drop(bus);
+
+    let busy_connection = Connection::open(&database_path).unwrap();
+    busy_connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let backup_path = harness.data.path().join("busy-must-not-exist.db");
+    let result = Bus::compact_offline(
+        harness.project.path(),
+        Some(harness.data.path()),
+        &operator.operator_secret,
+        &backup_path,
+    );
+    assert!(matches!(result, Err(BusError::Conflict(_))));
+    assert!(!backup_path.exists());
+    busy_connection.execute_batch("ROLLBACK;").unwrap();
 }
 
 #[test]
@@ -496,6 +1465,14 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
                 created_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL,
                 UNIQUE(project_id, name)
+             );
+             CREATE TABLE message_receipts (
+                message_id TEXT NOT NULL,
+                recipient_agent_id TEXT NOT NULL,
+                delivered_at INTEGER NOT NULL,
+                read_at INTEGER,
+                ack_at INTEGER,
+                PRIMARY KEY(message_id, recipient_agent_id)
              );",
         )
         .unwrap();
@@ -512,6 +1489,104 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
         .unwrap();
     assert!(columns.contains(&"recovery_hash".to_owned()));
     assert!(columns.contains(&"token_generation".to_owned()));
+    let receipt_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(message_receipts)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(receipt_columns.contains(&"closed_at".to_owned()));
+    let subscription_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(subscriptions)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(subscription_columns.contains(&"pending_delivery_id".to_owned()));
+    assert!(subscription_columns.contains(&"pending_from_sequence".to_owned()));
+    assert!(subscription_columns.contains(&"pending_through_sequence".to_owned()));
+    assert!(subscription_columns.contains(&"pending_created_at".to_owned()));
+    assert!(subscription_columns.contains(&"last_acked_delivery_id".to_owned()));
+    assert!(subscription_columns.contains(&"last_acked_through_sequence".to_owned()));
+    assert!(subscription_columns.contains(&"last_acked_at".to_owned()));
+    let thread_binding_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(task_thread_bindings)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(thread_binding_columns.contains(&"thread_id".to_owned()));
+    assert!(thread_binding_columns.contains(&"unbound_at".to_owned()));
+    let retention_state_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(retention_state)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(retention_state_columns.contains(&"events_pruned_through_sequence".to_owned()));
+    let retention_run_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(retention_runs)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(retention_run_columns.contains(&"report_json".to_owned()));
+    assert!(retention_run_columns.contains(&"operator_approval_id".to_owned()));
+    let operator_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(operator_credentials)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(operator_columns.contains(&"secret_hash".to_owned()));
+    assert!(operator_columns.contains(&"generation".to_owned()));
+    let approval_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(retention_approvals)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(approval_columns.contains(&"operator_generation".to_owned()));
+    assert!(approval_columns.contains(&"consumed_at".to_owned()));
+    let decision_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(decisions)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(decision_columns.contains(&"decision_key".to_owned()));
+    assert!(decision_columns.contains(&"artifact_ids_json".to_owned()));
+    let reservation_columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(reservations)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(reservation_columns.contains(&"task_id".to_owned()));
+    for table in [
+        "responsibility_overrides",
+        "git_commit_facts",
+        "test_result_facts",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "migration must create {table}");
+    }
+    assert_eq!(bus.doctor().unwrap().schema_version, 11);
 }
 
 #[test]
@@ -734,6 +1809,608 @@ fn event_subscriptions_filter_and_advance_a_durable_cursor() {
         .unwrap();
     assert_eq!(subscriptions.len(), 1);
     assert_eq!(subscriptions[0].name, "messages");
+}
+
+#[test]
+fn subscription_peek_replays_until_idempotent_ack_and_blocks_legacy_poll() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let sender = bus.register_agent("peek-sender", "coordination").unwrap();
+    let receiver = bus
+        .register_agent("peek-receiver", "implementation")
+        .unwrap();
+    bus.create_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "replay-safe",
+        &["message_sent".to_owned()],
+        Some(0),
+    )
+    .unwrap();
+
+    let first = bus
+        .send_message(
+            "peek-sender",
+            &sender.token,
+            &["peek-receiver".to_owned()],
+            "First",
+            "First replay-safe message",
+            None,
+            "normal",
+            false,
+        )
+        .unwrap();
+    bus.send_message(
+        "peek-sender",
+        &sender.token,
+        &["peek-receiver".to_owned()],
+        "Second",
+        "Second replay-safe message",
+        None,
+        "normal",
+        false,
+    )
+    .unwrap();
+
+    let peeked = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 1)
+        .unwrap();
+    let delivery = peeked.delivery.clone().expect("pending delivery");
+    assert_eq!(peeked.events.len(), 1);
+    assert_eq!(peeked.events[0].entity_id, first.message_id);
+    assert_eq!(
+        peeked
+            .subscription
+            .pending_delivery
+            .as_ref()
+            .unwrap()
+            .delivery_id,
+        delivery.delivery_id
+    );
+    assert_eq!(peeked.subscription.cursor_sequence, 0);
+
+    bus.send_message(
+        "peek-sender",
+        &sender.token,
+        &["peek-receiver".to_owned()],
+        "Third",
+        "Created while the first delivery is pending",
+        None,
+        "normal",
+        false,
+    )
+    .unwrap();
+    let replayed = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 500)
+        .unwrap();
+    assert_eq!(
+        replayed.delivery.as_ref().unwrap().delivery_id,
+        delivery.delivery_id
+    );
+    assert_eq!(replayed.events.len(), 1);
+    assert_eq!(replayed.events[0].entity_id, first.message_id);
+    assert!(
+        bus.poll_subscription("peek-receiver", &receiver.token, "replay-safe", 10)
+            .is_err(),
+        "legacy consume-on-poll must not cross a pending replay-safe delivery"
+    );
+    assert!(
+        bus.acknowledge_subscription("peek-receiver", &receiver.token, "replay-safe", "sdl_wrong",)
+            .is_err()
+    );
+
+    let acknowledged = bus
+        .acknowledge_subscription(
+            "peek-receiver",
+            &receiver.token,
+            "replay-safe",
+            &delivery.delivery_id,
+        )
+        .unwrap();
+    assert!(!acknowledged.replayed);
+    assert_eq!(acknowledged.cursor_sequence, delivery.through_sequence);
+    let acknowledged_retry = bus
+        .acknowledge_subscription(
+            "peek-receiver",
+            &receiver.token,
+            "replay-safe",
+            &delivery.delivery_id,
+        )
+        .unwrap();
+    assert!(acknowledged_retry.replayed);
+    assert_eq!(
+        acknowledged_retry.acknowledged_at,
+        acknowledged.acknowledged_at
+    );
+
+    let next = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 10)
+        .unwrap();
+    let next_delivery = next.delivery.clone().unwrap();
+    assert_eq!(next.events.len(), 2);
+    assert!(
+        next.events
+            .iter()
+            .all(|event| event.event_type == "message_sent")
+    );
+    bus.acknowledge_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "replay-safe",
+        &next_delivery.delivery_id,
+    )
+    .unwrap();
+    let caught_up = bus
+        .peek_subscription("peek-receiver", &receiver.token, "replay-safe", 10)
+        .unwrap();
+    assert!(caught_up.delivery.is_none());
+    assert!(caught_up.events.is_empty());
+
+    bus.create_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "filtered-empty",
+        &["artifact_published".to_owned()],
+        Some(0),
+    )
+    .unwrap();
+    let empty = bus
+        .peek_subscription("peek-receiver", &receiver.token, "filtered-empty", 10)
+        .unwrap();
+    let empty_delivery = empty.delivery.clone().unwrap();
+    assert!(empty.events.is_empty());
+    assert!(empty_delivery.through_sequence > empty_delivery.from_sequence);
+    let empty_replay = bus
+        .peek_subscription("peek-receiver", &receiver.token, "filtered-empty", 10)
+        .unwrap();
+    assert_eq!(
+        empty_replay.delivery.unwrap().delivery_id,
+        empty_delivery.delivery_id
+    );
+    bus.acknowledge_subscription(
+        "peek-receiver",
+        &receiver.token,
+        "filtered-empty",
+        &empty_delivery.delivery_id,
+    )
+    .unwrap();
+}
+
+#[test]
+fn concurrent_subscription_peek_and_ack_converge_on_one_delivery() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    let sender = bus
+        .register_agent("concurrent-peek-sender", "coordination")
+        .unwrap();
+    let receiver = bus
+        .register_agent("concurrent-peek-receiver", "implementation")
+        .unwrap();
+    bus.create_subscription(
+        "concurrent-peek-receiver",
+        &receiver.token,
+        "concurrent",
+        &["message_sent".to_owned()],
+        Some(0),
+    )
+    .unwrap();
+    bus.send_message(
+        "concurrent-peek-sender",
+        &sender.token,
+        &["concurrent-peek-receiver".to_owned()],
+        "Concurrent delivery",
+        "Both peekers must receive one delivery identity",
+        None,
+        "normal",
+        false,
+    )
+    .unwrap();
+    drop(bus);
+
+    let root = harness.project.path().to_path_buf();
+    let data = harness.data.path().to_path_buf();
+    let barrier = Arc::new(Barrier::new(3));
+    let peek_handles = (0..2)
+        .map(|_| {
+            let root = root.clone();
+            let data = data.clone();
+            let token = receiver.token.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.peek_subscription("concurrent-peek-receiver", &token, "concurrent", 10)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let peeks = peek_handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    let delivery_id = peeks[0].delivery.as_ref().unwrap().delivery_id.clone();
+    assert_eq!(peeks[1].delivery.as_ref().unwrap().delivery_id, delivery_id);
+    assert_eq!(peeks[0].events.len(), 1);
+    assert_eq!(peeks[1].events.len(), 1);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let ack_handles = (0..2)
+        .map(|_| {
+            let root = root.clone();
+            let data = data.clone();
+            let token = receiver.token.clone();
+            let delivery_id = delivery_id.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut bus = Bus::open(&root, Some(&data)).unwrap();
+                barrier.wait();
+                bus.acknowledge_subscription(
+                    "concurrent-peek-receiver",
+                    &token,
+                    "concurrent",
+                    &delivery_id,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let acknowledgements = ack_handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        acknowledgements[0].cursor_sequence,
+        acknowledgements[1].cursor_sequence
+    );
+    assert_eq!(
+        acknowledgements.iter().filter(|ack| ack.replayed).count(),
+        1
+    );
+}
+
+#[test]
+fn context_sync_is_scoped_budgeted_paginated_and_semantically_deduplicated() {
+    let harness = Harness::new();
+    fs::write(
+        harness.project.path().join("dependency.txt"),
+        "DEPENDENCY FILE CONTENT MUST NOT ENTER CONTEXT\n",
+    )
+    .unwrap();
+    fs::write(
+        harness.project.path().join("owned.txt"),
+        "OWNED FILE CONTENT MUST NOT ENTER CONTEXT\n",
+    )
+    .unwrap();
+    fs::write(
+        harness.project.path().join("unrelated.txt"),
+        "UNRELATED FILE CONTENT\n",
+    )
+    .unwrap();
+
+    let mut bus = harness.bus();
+    let owner = bus
+        .register_agent("context-owner", "implementation")
+        .unwrap();
+    let dependency_owner = bus
+        .register_agent("context-dependency", "implementation")
+        .unwrap();
+    let unrelated = bus
+        .register_agent("context-unrelated", "implementation")
+        .unwrap();
+    let sender = bus
+        .register_agent("context-sender", "coordination")
+        .unwrap();
+
+    let dependency = bus
+        .create_task(
+            "context-dependency",
+            &dependency_owner.token,
+            "CTX-DEPENDENCY",
+            "Direct dependency",
+            Some("A bounded dependency description"),
+            &[],
+        )
+        .unwrap();
+    let dependency = bus
+        .claim_task(
+            "context-dependency",
+            &dependency_owner.token,
+            &dependency.task_id,
+        )
+        .unwrap();
+    let dependency = bus
+        .update_task(
+            "context-dependency",
+            &dependency_owner.token,
+            &dependency.task_id,
+            dependency.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    let dependency_artifact = bus
+        .publish_artifact(
+            "context-dependency",
+            &dependency_owner.token,
+            "report",
+            "dependency.txt",
+            "Dependency report reference",
+            Some(&dependency.task_id),
+            None,
+        )
+        .unwrap();
+    let dependency_decision = bus
+        .confirm_decision_idempotent(
+            "context-dependency",
+            &dependency_owner.token,
+            "dependency.contract",
+            &dependency.task_id,
+            "The dependency contract is stable.",
+            std::slice::from_ref(&dependency_artifact.artifact_id),
+            Some("context-decision-dependency"),
+        )
+        .unwrap();
+    let dependency_decision_retry = bus
+        .confirm_decision_idempotent(
+            "context-dependency",
+            &dependency_owner.token,
+            "dependency.contract",
+            &dependency.task_id,
+            "The dependency contract is stable.",
+            std::slice::from_ref(&dependency_artifact.artifact_id),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        dependency_decision.decision_id,
+        dependency_decision_retry.decision_id
+    );
+    assert!(matches!(
+        bus.confirm_decision_idempotent(
+            "context-dependency",
+            &dependency_owner.token,
+            "dependency.contract",
+            &dependency.task_id,
+            "A conflicting semantic payload.",
+            &[],
+            Some("context-decision-conflict"),
+        ),
+        Err(BusError::Conflict(_))
+    ));
+    bus.update_task(
+        "context-dependency",
+        &dependency_owner.token,
+        &dependency.task_id,
+        dependency.version,
+        "completed",
+        None,
+    )
+    .unwrap();
+
+    let owned = bus
+        .create_task(
+            "context-owner",
+            &owner.token,
+            "CTX-OWNED",
+            "Owned context task",
+            Some(&"bounded ".repeat(200)),
+            std::slice::from_ref(&dependency.task_id),
+        )
+        .unwrap();
+    let owned = bus
+        .claim_task("context-owner", &owner.token, &owned.task_id)
+        .unwrap();
+    let owned = bus
+        .update_task(
+            "context-owner",
+            &owner.token,
+            &owned.task_id,
+            owned.version,
+            "working",
+            None,
+        )
+        .unwrap();
+    let owned_artifact = bus
+        .publish_artifact(
+            "context-owner",
+            &owner.token,
+            "report",
+            "owned.txt",
+            "Owned report reference",
+            Some(&owned.task_id),
+            None,
+        )
+        .unwrap();
+    let owned_decision = bus
+        .confirm_decision_idempotent(
+            "context-owner",
+            &owner.token,
+            "owned.storage",
+            &owned.task_id,
+            "SQLite remains authoritative.",
+            std::slice::from_ref(&owned_artifact.artifact_id),
+            Some("context-decision-owned"),
+        )
+        .unwrap();
+    assert!(matches!(
+        bus.confirm_decision_idempotent(
+            "context-unrelated",
+            &unrelated.token,
+            "owned.unauthorized",
+            &owned.task_id,
+            "This must be rejected.",
+            &[],
+            None,
+        ),
+        Err(BusError::Unauthorized(_))
+    ));
+
+    let unrelated_task = bus
+        .create_task(
+            "context-unrelated",
+            &unrelated.token,
+            "CTX-UNRELATED",
+            "Unrelated task",
+            None,
+            &[],
+        )
+        .unwrap();
+    let unrelated_task = bus
+        .claim_task(
+            "context-unrelated",
+            &unrelated.token,
+            &unrelated_task.task_id,
+        )
+        .unwrap();
+    let unrelated_artifact = bus
+        .publish_artifact(
+            "context-unrelated",
+            &unrelated.token,
+            "report",
+            "unrelated.txt",
+            "Unrelated report",
+            Some(&unrelated_task.task_id),
+            None,
+        )
+        .unwrap();
+    let unrelated_decision = bus
+        .confirm_decision_idempotent(
+            "context-unrelated",
+            &unrelated.token,
+            "unrelated.choice",
+            &unrelated_task.task_id,
+            "This fact belongs only to the unrelated task.",
+            std::slice::from_ref(&unrelated_artifact.artifact_id),
+            None,
+        )
+        .unwrap();
+    assert_eq!(bus.doctor().unwrap().decisions, 3);
+
+    let acknowledged = bus
+        .send_message(
+            "context-sender",
+            &sender.token,
+            std::slice::from_ref(&owner.name),
+            "Already handled",
+            "ACKNOWLEDGED MESSAGE MUST NOT ENTER CONTEXT",
+            Some(&owned.task_id),
+            "normal",
+            true,
+        )
+        .unwrap();
+    bus.acknowledge_message("context-owner", &owner.token, &acknowledged.message_id)
+        .unwrap();
+    bus.close_message("context-owner", &owner.token, &acknowledged.message_id)
+        .unwrap();
+    let unread = bus
+        .send_message(
+            "context-sender",
+            &sender.token,
+            std::slice::from_ref(&owner.name),
+            "Action required",
+            "This unread directed fact is relevant.",
+            Some(&owned.task_id),
+            "high",
+            true,
+        )
+        .unwrap();
+    for index in 0..12 {
+        bus.send_message(
+            "context-sender",
+            &sender.token,
+            std::slice::from_ref(&owner.name),
+            &format!("Budget fact {index:02}"),
+            &format!("{}-{index:02}", "x".repeat(300)),
+            Some(&owned.task_id),
+            "normal",
+            false,
+        )
+        .unwrap();
+    }
+
+    let full = bus
+        .context_sync("context-owner", &owner.token, None, 500, 1_048_576)
+        .unwrap();
+    assert_eq!(full.scope.owned_task_ids, vec![owned.task_id.clone()]);
+    assert_eq!(
+        full.scope.direct_dependency_task_ids,
+        vec![dependency.task_id.clone()]
+    );
+    assert!(full.items.iter().any(|item| {
+        item.kind == "confirmedDecision"
+            && item.value["decisionId"] == dependency_decision.decision_id
+    }));
+    assert!(full.items.iter().any(|item| {
+        item.kind == "confirmedDecision" && item.value["decisionId"] == owned_decision.decision_id
+    }));
+    assert!(full.items.iter().any(|item| {
+        item.kind == "relevantArtifact"
+            && item.value["artifactId"] == dependency_artifact.artifact_id
+    }));
+    assert!(full.items.iter().any(|item| {
+        item.kind == "unreadMessage" && item.value["messageId"] == unread.message_id
+    }));
+    let serialized = serde_json::to_string(&full).unwrap();
+    assert!(!serialized.contains(&unrelated_task.task_id));
+    assert!(!serialized.contains(&unrelated_decision.decision_id));
+    assert!(!serialized.contains(&unrelated_artifact.artifact_id));
+    assert!(!serialized.contains(&acknowledged.message_id));
+    assert!(!serialized.contains("MUST NOT ENTER CONTEXT"));
+    assert_eq!(full.item_count, full.items.len());
+    assert!(full.bytes_used <= full.byte_budget);
+
+    let mut cursor = None;
+    let mut seen = HashSet::new();
+    loop {
+        let page = bus
+            .context_sync("context-owner", &owner.token, cursor.as_deref(), 2, 4_096)
+            .unwrap();
+        assert!(page.items.len() <= 2);
+        assert!(page.bytes_used <= 4_096);
+        for item in &page.items {
+            assert!(seen.insert(item.cursor.clone()), "cursor must not repeat");
+        }
+        if page.has_more {
+            cursor = page.next_cursor;
+            assert!(cursor.is_some());
+        } else {
+            assert!(page.next_cursor.is_none());
+            break;
+        }
+    }
+    assert_eq!(seen.len(), full.items.len());
+    let byte_limited = bus
+        .context_sync("context-owner", &owner.token, None, 500, 4_096)
+        .unwrap();
+    assert!(byte_limited.has_more);
+    assert!(byte_limited.bytes_used <= 4_096);
+    assert!(matches!(
+        bus.context_sync("context-owner", &owner.token, None, 10, 4_095),
+        Err(BusError::Validation(_))
+    ));
+    assert!(matches!(
+        bus.context_sync(
+            "context-owner",
+            &owner.token,
+            Some("not-a-context-cursor"),
+            10,
+            4_096,
+        ),
+        Err(BusError::Validation(_))
+    ));
+    assert!(matches!(
+        bus.context_sync("context-owner", &unrelated.token, None, 10, 4_096),
+        Err(BusError::Unauthorized(_))
+    ));
+
+    bus.acknowledge_message("context-owner", &owner.token, &unread.message_id)
+        .unwrap();
+    let after_ack = bus
+        .context_sync("context-owner", &owner.token, None, 500, 1_048_576)
+        .unwrap();
+    assert!(!after_ack.items.iter().any(|item| {
+        item.kind == "unreadMessage" && item.value["messageId"] == unread.message_id
+    }));
 }
 
 #[test]

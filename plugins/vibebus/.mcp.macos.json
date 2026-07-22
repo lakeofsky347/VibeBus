@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "vibebus": {
+      "cwd": ".",
+      "command": "./bin/vibebus",
+      "args": ["mcp"]
+    }
+  }
+}

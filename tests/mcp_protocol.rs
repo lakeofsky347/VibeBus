@@ -1,22 +1,34 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf, sync::Arc};
 
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use vibebus::{initialize_project, mcp::VibeBusMcp};
+use vibebus::{MemoryCredentialVault, initialize_project, mcp::VibeBusMcp};
 
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_negotiates_lists_tools_and_calls_status() {
     let project = TempDir::new().unwrap();
     let data_home = TempDir::new().unwrap();
     initialize_project(project.path(), "MCP test", Some(data_home.path())).unwrap();
+    fs::create_dir_all(project.path().join(".vibebus")).unwrap();
+    fs::write(
+        project.path().join(".vibebus/responsibility.json"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "defaultAllowedPaths": [],
+            "roles": {"test": {"allowedPaths": ["src/**"]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
     let project_root = project.path().to_path_buf();
     let server_data_home = data_home.path().to_path_buf();
+    let vault = Arc::new(MemoryCredentialVault::default());
     let server_task = tokio::spawn(async move {
-        let service = VibeBusMcp::new(project_root, Some(server_data_home))
+        let service = VibeBusMcp::with_vault(project_root, Some(server_data_home), vault)
             .serve(server_stream)
             .await
             .unwrap();
@@ -75,8 +87,27 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
     assert!(names.contains(&"vibebus_reservation_renew"));
     assert!(names.contains(&"vibebus_events"));
     assert!(names.contains(&"vibebus_subscription_poll"));
+    assert!(names.contains(&"vibebus_subscription_peek"));
+    assert!(names.contains(&"vibebus_subscription_ack"));
     assert!(names.contains(&"vibebus_handoff_send"));
     assert!(names.contains(&"vibebus_handoff_snapshot"));
+    assert!(names.contains(&"vibebus_decision_confirm"));
+    assert!(names.contains(&"vibebus_context_sync"));
+    assert!(names.contains(&"vibebus_responsibility_inspect"));
+    assert!(names.contains(&"vibebus_responsibility_override"));
+    assert!(names.contains(&"vibebus_git_commit_record"));
+    assert!(names.contains(&"vibebus_test_result_record"));
+    assert!(names.contains(&"vibebus_handoff_propose"));
+    assert!(names.contains(&"vibebus_close"));
+    assert!(names.contains(&"vibebus_thread_bind"));
+    assert!(names.contains(&"vibebus_thread_unbind"));
+    assert!(names.contains(&"vibebus_thread_list"));
+    assert!(names.contains(&"vibebus_retention_plan"));
+    assert!(names.contains(&"vibebus_retention_apply"));
+    assert!(names.contains(&"vibebus_retention_status"));
+    assert!(names.contains(&"vibebus_credential_status"));
+    assert!(names.contains(&"vibebus_credential_delete"));
+    assert!(names.iter().all(|name| !name.contains("operator")));
 
     send(
         &mut writer,
@@ -98,6 +129,372 @@ async fn mcp_negotiates_lists_tools_and_calls_status() {
             .as_str()
             .unwrap()
             .contains("MCP test")
+    );
+    let status = tool_text(&called);
+    assert_eq!(status["operator"]["configured"], false);
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_register",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "name": "mcp-vault-agent",
+                    "role": "test",
+                    "storeCredentials": true
+                }
+            }
+        }),
+    )
+    .await;
+    let registered = response(&mut lines, 4).await;
+    let registered = tool_text(&registered);
+    assert_eq!(registered["secretsRedacted"], true);
+    assert!(registered.get("token").is_none());
+    assert_eq!(registered["credentials"]["stored"], true);
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_inbox",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    let inbox = response(&mut lines, 5).await;
+    assert_eq!(inbox["result"]["isError"], false);
+    assert_eq!(tool_text(&inbox), json!([]));
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_task_create",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "title": "MCP context projection"
+                }
+            }
+        }),
+    )
+    .await;
+    let created = tool_text(&response(&mut lines, 6).await);
+    assert_eq!(created["status"], "ready");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_task_claim",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001"
+                }
+            }
+        }),
+    )
+    .await;
+    let claimed = tool_text(&response(&mut lines, 7).await);
+    assert_eq!(claimed["owner"], "mcp-vault-agent");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_responsibility_inspect",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    let policy = tool_text(&response(&mut lines, 20).await);
+    assert_eq!(policy["configured"], true);
+    assert_eq!(policy["allowedPaths"][0], "src/**");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_responsibility_override",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "grantee": "mcp-vault-agent",
+                    "pathPattern": "docs/**",
+                    "reason": "Record task documentation",
+                    "ttlSeconds": 600,
+                    "idempotencyKey": "mcp-responsibility-override"
+                }
+            }
+        }),
+    )
+    .await;
+    let granted = tool_text(&response(&mut lines, 21).await);
+    assert_eq!(granted["pathPattern"], "docs/**");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_git_commit_record",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "commitSha": "0123456789abcdef0123456789abcdef01234567",
+                    "summary": "Document the MCP policy",
+                    "changedPaths": ["docs/policy.md"],
+                    "idempotencyKey": "mcp-git-fact"
+                }
+            }
+        }),
+    )
+    .await;
+    let git_fact = tool_text(&response(&mut lines, 22).await);
+    assert_eq!(git_fact["changedPaths"][0], "docs/policy.md");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_test_result_record",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "resultKey": "mcp-protocol-head",
+                    "suite": "MCP protocol",
+                    "outcome": "passed",
+                    "summary": "MCP fact tools passed",
+                    "command": "cargo test --test mcp_protocol",
+                    "idempotencyKey": "mcp-test-fact"
+                }
+            }
+        }),
+    )
+    .await;
+    let test_fact = tool_text(&response(&mut lines, 23).await);
+    assert_eq!(test_fact["outcome"], "passed");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_handoff_propose",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "taskId": "MCP-CONTEXT-001",
+                    "itemLimit": 5
+                }
+            }
+        }),
+    )
+    .await;
+    let proposal = tool_text(&response(&mut lines, 24).await);
+    assert_eq!(proposal["task"]["taskId"], "MCP-CONTEXT-001");
+    assert_eq!(proposal["gitCommits"].as_array().unwrap().len(), 1);
+    assert_eq!(proposal["testResults"].as_array().unwrap().len(), 1);
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_decision_confirm",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "key": "mcp.context",
+                    "taskId": "MCP-CONTEXT-001",
+                    "summary": "MCP uses the authoritative context projection.",
+                    "idempotencyKey": "mcp-context-decision"
+                }
+            }
+        }),
+    )
+    .await;
+    let decision = tool_text(&response(&mut lines, 8).await);
+    assert_eq!(decision["key"], "mcp.context");
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_context_sync",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "itemLimit": 100,
+                    "byteBudget": 65536
+                }
+            }
+        }),
+    )
+    .await;
+    let context = tool_text(&response(&mut lines, 9).await);
+    assert_eq!(context["scope"]["ownedTaskIds"][0], "MCP-CONTEXT-001");
+    assert!(
+        context["items"].as_array().unwrap().iter().any(
+            |item| item["kind"] == "confirmedDecision" && item["value"]["key"] == "mcp.context"
+        )
+    );
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_agent_recover",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "name": "mcp-vault-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    let recovered = tool_text(&response(&mut lines, 10).await);
+    assert_eq!(recovered["secretsRedacted"], true);
+    assert_eq!(recovered["tokenGeneration"], 2);
+    assert!(recovered.get("recoveryKey").is_none());
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_retention_plan",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    let plan = tool_text(&response(&mut lines, 11).await);
+    let plan_id = plan["planId"].as_str().unwrap();
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_retention_apply",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "planId": plan_id
+                }
+            }
+        }),
+    )
+    .await;
+    let unapproved = response(&mut lines, 12).await;
+    assert!(unapproved["error"].is_object());
+    assert!(
+        unapproved["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("operator approval required")
+    );
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_credential_delete",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent",
+                    "confirm": true
+                }
+            }
+        }),
+    )
+    .await;
+    let deleted = tool_text(&response(&mut lines, 13).await);
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(deleted["credentials"]["stored"], false);
+
+    send(
+        &mut writer,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "tools/call",
+            "params": {
+                "name": "vibebus_inbox",
+                "arguments": {
+                    "root": path_text(project.path()),
+                    "agent": "mcp-vault-agent"
+                }
+            }
+        }),
+    )
+    .await;
+    let missing = response(&mut lines, 14).await;
+    assert!(missing["error"].is_object());
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("credential vault")
     );
 
     drop(writer);
@@ -129,4 +526,8 @@ where
 
 fn path_text(path: &std::path::Path) -> String {
     PathBuf::from(path).to_string_lossy().into_owned()
+}
+
+fn tool_text(response: &Value) -> Value {
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }

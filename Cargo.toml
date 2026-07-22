@@ -1,6 +1,6 @@
 [package]
 name = "vibebus"
-version = "0.2.0"
+version = "0.10.0"
 edition = "2024"
 description = "Local coordination bus for independent Codex tasks"
 license = "MIT"
@@ -9,14 +9,24 @@ license = "MIT"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.2", features = ["derive"] }
 directories = "6.0.0"
+fs2 = "0.4.3"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io"] }
+rpassword = "7.5.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"
 thiserror = "2.0.18"
 tokio = { version = "1.47.1", features = ["macros", "rt", "io-std"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = "3.7.0"
+security-framework-sys = "2.17.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

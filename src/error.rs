@@ -11,6 +11,9 @@ pub enum BusError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("credential vault error: {0}")]
+    CredentialVault(String),
+
     #[error("VibeBus project not found from {0}")]
     ProjectNotFound(String),
 
@@ -19,6 +22,12 @@ pub enum BusError {
 
     #[error("authentication failed for agent: {0}")]
     Unauthorized(String),
+
+    #[error("operator authentication failed")]
+    OperatorUnauthorized,
+
+    #[error("operator approval required: {0}")]
+    OperatorApprovalRequired(String),
 
     #[error("conflict: {0}")]
     Conflict(String),

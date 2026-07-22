@@ -1,94 +1,89 @@
 # VibeBus
 
-VibeBus 是一个面向独立 Codex 顶层任务的本地结构化事实总线。它保留 Codex 原生的任务与 worktree 隔离，只共享明确登记的消息、ACK、任务状态、依赖、文件租约和产物，不共享整段聊天上下文。
+![VibeBus logo](plugins/vibebus/assets/vibebus-logo-light.png)
 
-当前版本 0.2 是可运行的 Windows MVP：一个 Rust 单文件程序同时提供 CLI 和 stdio MCP，状态写入项目级 SQLite WAL 数据库，并打包为 Codex 插件。
+VibeBus is a local, structured fact bus for independent Codex tasks. Tasks keep their own conversations and worktrees while sharing only explicit messages, acknowledgements, task state, decisions, path reservations, artifacts, and bounded test or Git facts through a project-scoped SQLite database.
 
-## 已实现
+VibeBus provides a Rust CLI, stdio MCP server, Codex plugin, and lifecycle Hooks. It runs natively on Windows and macOS; Linux is supported through the `amd64` container workflow.
 
-- 项目身份：仓库内 `.vibebus/project.json`，数据默认位于 `%LOCALAPPDATA%\VibeBus\projects\<project-id>\vibebus.db`。
-- Agent 注册、单次恢复密钥、bearer token 轮换与哈希存储。
-- 定向消息、未读收件箱、read/ACK 回执隔离。
-- 带依赖的任务、原子领取、所有者约束、状态机和乐观版本冲突。
-- 项目相对路径租约、重叠检测、TTL、所有者续期和显式释放。
-- 产物登记、项目边界验证和 SHA-256 校验。
-- 可重试写操作的幂等键与“同键异载荷”冲突语义。
-- 有序事件流、按类型过滤、命名订阅与持久游标。
-- 高优先级结构化 handoff、强制 ACK 意图与恢复快照。
-- SQLite 健康检查和一致性在线备份。
-- CLI、MCP、Codex Skill、SessionStart Hook 和本地 marketplace。
+## Install and run from source
 
-VibeBus 不承诺中断或唤醒正在生成中的模型。收件箱检查发生在任务启动、恢复、关键决策和交接等安全边界。
-
-## 构建与验证
-
-需要 Rust 2024 edition 兼容工具链。
+Windows:
 
 ```powershell
-cargo test --all-targets
-powershell -File .\scripts\package-plugin.ps1
-```
-
-第二条命令生成 `plugins\vibebus\bin\vibebus.exe`，插件的 `.mcp.json` 会从该路径启动 stdio MCP 服务。
-
-## 初始化项目
-
-```powershell
-.\target\release\vibebus.exe init --root D:\path\to\repo --name "My Project"
-.\target\release\vibebus.exe doctor --root D:\path\to\repo
-```
-
-初始化必须由用户在预期根目录显式执行；插件不会偷偷创建项目。
-
-## 最小 CLI 流程
-
-```powershell
-$registration = .\target\release\vibebus.exe register --root D:\path\to\repo --name api --role backend | ConvertFrom-Json
-$env:VIBEBUS_AGENT_TOKEN = $registration.result.token
-# 将 $registration.result.recoveryKey 存入安全的任务私有凭据区；不要写入仓库或消息。
-
-.\target\release\vibebus.exe task create --root D:\path\to\repo --agent api --id TASK-101 --title "Implement API"
-.\target\release\vibebus.exe task claim --root D:\path\to\repo --agent api --id TASK-101
-.\target\release\vibebus.exe reserve add --root D:\path\to\repo --agent api --path src/api --reason "TASK-101"
-.\target\release\vibebus.exe inbox --root D:\path\to\repo --agent api
-.\target\release\vibebus.exe subscription create --root D:\path\to\repo --agent api --name coordination --event-types message_sent,task_updated --from-sequence 0
-.\target\release\vibebus.exe handoff snapshot --root D:\path\to\repo --agent api
-```
-
-CLI 总是输出 JSON。也可以逐条传入 `--token`，避免设置进程环境变量。
-
-在 Windows 上登记复杂产物 metadata 时，优先把 JSON 写入文件并使用 `artifact publish --metadata-file <path>`，避免 PowerShell 改写 JSON 引号；MCP 可直接传原生 JSON 对象。
-
-## 安装本地 Codex 插件
-
-仓库已提供 `.agents/plugins/marketplace.json`。构建插件后二选一：
-
-1. 在 Codex 桌面应用的 Plugins 中打开这个本地 marketplace；或
-2. 使用 CLI 注册 marketplace 根目录，然后安装插件。
-
-```powershell
-codex plugin marketplace add D:\MyProjects\CoWork
+./scripts/package-plugin.ps1
+codex plugin marketplace add .
 codex plugin add vibebus@vibebus-local
 ```
 
-安装或更新后启动一个新任务，使 Skill、MCP 和 Hook 重新加载。SessionStart Hook 首次使用前需要在 Codex 中审查并信任；它只向上寻找并读取 `.vibebus/project.json`。
+macOS:
 
-## 文档
+```sh
+./scripts/package-plugin-macos.sh
+codex plugin marketplace add "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+codex plugin add vibebus@vibebus-local
+```
 
-- [架构](docs/architecture.md)
-- [CLI 与 MCP 协议](docs/protocol.md)
-- [方案对比与取舍](docs/design-research.md)
-- [验收记录](docs/acceptance.md)
-- [后续接手](docs/HANDOFF.md)
+After installing or changing Hooks, start a new Codex task and review the Hook changes. Initialize a project deliberately, then register an Agent with an explicit responsibility role:
 
-## 安全边界
+```sh
+vibebus init --root /path/to/project --name "My Project"
+vibebus register --root /path/to/project --name implementation --role implementation --store-credentials
+vibebus credential status --root /path/to/project --agent implementation
+```
 
-- token 与恢复密钥仅在注册、恢复或轮换时返回明文，数据库只保留 SHA-256 摘要；成功恢复会同时撤销旧 token 与旧恢复密钥。
-- 收件箱必须使用收件人身份认证，不能读取其他 Agent 的消息。
-- 任务更新要求当前所有者和最新版本。
-- 租约路径必须是无 `..`、无盘符、非绝对的项目相对路径。
-- 产物路径 canonicalize 后必须仍在项目根目录内。
-- 备份拒绝覆盖已有目标文件。
-- 幂等键按项目、Agent 与操作域隔离；同键重试必须使用完全相同的有效载荷。
+Before editing, claim a ready task, inspect the responsibility policy, reserve only the exact project-relative paths, and obtain a task-scoped expiring override for paths outside the role. Process required messages as read → ACK → close and use replay-safe subscription peek/ACK for event delivery.
 
-许可证：MIT。
+## Releases
+
+GitHub Releases are the only official distribution channel. A stable release is a `vX.Y.Z` tag whose commit is reachable from `main`; ordinary branches, pull-request artifacts, and local builds are not releases. SemVer is used for release versions:
+
+- patch releases fix compatible behavior;
+- minor releases add backwards-compatible capabilities;
+- major releases may introduce incompatible changes and include migration guidance.
+
+The first `v0.10.0` stable workflow is source-only. GitHub automatically provides the tagged Source code ZIP and tarball; the workflow uploads exactly `SHA256SUMS.txt`, a normalized CycloneDX SBOM, `supply-chain-evidence.json`, and `source-release-manifest.json`. The checksum file covers the other three uploaded evidence files. There are no MSI, portable ZIP, Codex plugin ZIP, signed executable, or installer assets in this first release. macOS, Windows, and Linux remain source and CI-supported paths until a later, separately reviewed binary-distribution contract is adopted. Release candidates are not currently published: tags such as `vX.Y.Z-rc.N` fail closed rather than being treated as stable releases.
+
+To verify a downloaded stable release, download the GitHub-generated source archive and the four uploaded evidence files from the same GitHub Release. Check that the manifest's tag and source revision identify the source archive, then verify `SHA256SUMS.txt` against its three listed evidence files. This source-only release has no installation, signature, upgrade, or binary rollback claim.
+
+Detailed maintainer and verifier instructions are in [docs/release.md](docs/release.md).
+
+## Development
+
+The repository pins Rust `1.97.1`. Run the checks that match the files you change:
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+python3 scripts/normalize-cyclonedx.py --self-test
+git diff --check
+```
+
+Windows packaging and MSI validation require Windows tooling:
+
+```powershell
+./scripts/build-release.ps1
+$msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
+./scripts/test-installer.ps1 -MsiPath $msi.FullName
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community standards.
+
+## Security and operating boundaries
+
+- Agent credentials belong in Windows Credential Manager or macOS Keychain; never commit tokens, recovery keys, signing material, databases, or generated release assets.
+- The Operator lifecycle and destructive maintenance require a real interactive terminal; those actions are intentionally unavailable through MCP.
+- VibeBus records durable facts but does not wake, interrupt, merge, or otherwise control native Codex tasks.
+- Replay-safe subscriptions are at-least-once deliveries. Consumers must make side effects idempotent.
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [CLI and MCP protocol](docs/protocol.md)
+- [Release engineering](docs/release.md)
+- [macOS development](docs/macos.md)
+- [Container development](docs/container.md)
+- [Maintainer handoff](docs/HANDOFF.md)
+
+VibeBus is released under the [MIT License](LICENSE).
