@@ -62,6 +62,15 @@ jobs:
               "VibeBus-$env:VIBEBUS_VERSION-source.zip",
           ):
               assert prohibited not in release, f"Source-only release workflow still requires: {prohibited}"
+
+          validation_step = "- name: Validate source-only evidence set"
+          validation_start = release.find(validation_step)
+          assert validation_start != -1, "Release workflow is missing the source-only evidence validation step."
+          next_step = release.find("\n      - name:", validation_start + len(validation_step))
+          validation = release[validation_start:next_step if next_step != -1 else None]
+          assert "working-directory: dist" in validation, "Checksum validation must run from dist."
+          assert "sha256sum --check SHA256SUMS.txt" in validation, "Checksum validation must use bare evidence names."
+          assert "sha256sum --check dist/SHA256SUMS.txt" not in validation, "Root-directory checksum validation must not return."
           PY
 
   supply-chain:
