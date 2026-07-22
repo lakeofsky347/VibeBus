@@ -8,7 +8,7 @@ COPY src ./src
 
 RUN cargo build --release --locked --bin vibebus
 
-FROM --platform=linux/amd64 debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e AS runtime
+FROM --platform=linux/amd64 debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 ARG VIBEBUS_VERSION=0.10.0
 ARG VIBEBUS_SOURCE_REVISION=unknown
