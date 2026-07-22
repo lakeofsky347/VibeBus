@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-Security fixes are developed for the latest stable GitHub Release and the `main` branch. Older releases may receive guidance, but are not guaranteed to receive backports. Check [GitHub Releases](https://github.com/lakeofsky347/VibeBus/releases) for the current stable version and its signed Windows evidence set.
+Security fixes are developed for the latest stable GitHub Release and the `main` branch. Older releases may receive guidance, but are not guaranteed to receive backports. Check [GitHub Releases](https://github.com/lakeofsky347/VibeBus/releases) for the current stable version, its GitHub-generated source archives, and its source-verification evidence set.
 
-Stable releases are protected by pinned GitHub Actions, `cargo deny` advisory/license/source gates, CycloneDX SBOM generation, SHA-256 checksums, and Windows Authenticode verification. These controls reduce risk; they do not replace independent review before deployment.
+Stable source-only releases are protected by pinned GitHub Actions, Rust quality gates, `cargo deny` advisory/license/source gates, normalized CycloneDX SBOM generation, immutable tag-to-`main` verification, and SHA-256 checksums for the uploaded evidence files. These controls reduce risk; they do not replace independent review before deployment.
 
 ## Reporting a vulnerability
 

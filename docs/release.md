@@ -2,39 +2,34 @@
 
 ## Distribution contract
 
-GitHub Releases are VibeBus's only official distribution channel. Stable releases use SemVer tags in the exact form `vX.Y.Z`. The workflow checks that the tag resolves to the checked-out commit and that the commit is reachable from `main`; it refuses release-candidate and branch names. A pull-request artifact, local package, container image, or manually copied file is never a release substitute.
+GitHub Releases are VibeBus's only official distribution channel. The first `v0.10.0` release is source-only: GitHub automatically provides the tagged **Source code (zip)** and **Source code (tar.gz)** archives, while the workflow uploads only source-verification evidence. Stable releases use SemVer tags in the exact form `vX.Y.Z`. The workflow checks that the tag resolves to the checked-out commit and that the commit is reachable from `main`; it refuses release-candidate and branch names. A pull-request artifact, local package, container image, or manually copied file is never a release substitute.
 
 Release candidates are intentionally disabled until the project adopts a separate, testable prerelease contract. Do not create `vX.Y.Z-rc.N` expecting the stable workflow to publish it.
 
 ## Stable release assets
 
-Each stable GitHub Release must contain one coherent evidence set:
+The source-only workflow hand-uploads exactly four evidence files:
 
 | Asset | Purpose |
 | --- | --- |
-| `VibeBus-X.Y.Z-source.zip` | Source archive from the tagged commit. |
-| `VibeBus-X.Y.Z-windows-x64.msi` | Signed per-user Windows installer. |
-| `VibeBus-X.Y.Z-windows-x64.zip` | Signed portable marketplace payload. |
-| `VibeBus-Codex-plugin-X.Y.Z.zip` | Signed standalone Codex plugin payload. |
-| `SHA256SUMS.txt` | SHA-256 values for distributable and supply-chain files. |
-| `release-manifest.json` | Version, source revision, source ref, platform, signing state, artifacts, and evidence names. |
-| `VibeBus-X.Y.Z-windows-x64.cdx.json` | Normalized CycloneDX SBOM. |
-| `supply-chain-evidence.json` | Source revision and completed `cargo deny` gates. |
+| `SHA256SUMS.txt` | SHA-256 values for the other three uploaded evidence files. |
+| `VibeBus-X.Y.Z.cdx.json` | Normalized CycloneDX SBOM for the tagged source. |
+| `supply-chain-evidence.json` | Tagged source revision and completed `cargo deny` gates. |
+| `source-release-manifest.json` | Version, tag, source revision, GitHub-provided source archive provenance, and evidence names. |
 
-macOS and Linux are source and CI-supported today. They are not GitHub Release assets until maintainers define and verify platform-specific public distribution, signing, and downloaded-artifact acceptance.
+GitHub supplies the source ZIP and tarball automatically from the immutable tag; VibeBus does not build or upload a duplicate source ZIP. There are no Windows MSI, portable ZIP, Codex plugin ZIP, signed executable, or installer assets in this first release. macOS, Windows, and Linux remain source and CI-supported paths. A future binary distribution must use a separately reviewed contract that restores the applicable platform signing, package verification, and downloaded-artifact acceptance.
 
 ## Maintainer procedure
 
 1. Merge reviewed changes to `main`; ensure required CI, supply-chain checks, and review gates pass.
 2. Confirm `Cargo.toml` and plugin manifest versions match the intended SemVer version. Update `CHANGELOG.md` before tagging.
 3. Create and push an annotated `vX.Y.Z` tag that points to a commit reachable from `main`.
-4. Configure the protected `release` environment and Windows signing secrets outside the repository. The workflow fails closed if either signing value is absent.
-5. Let `.github/workflows/release.yml` build from the existing tag. It does not create missing tags or publish from an untagged commit.
-6. Inspect the GitHub Release evidence set and workflow logs. Do not edit a release asset in place; publish a corrective patch release instead.
+4. Let `.github/workflows/release.yml` run from that existing tag. It does not create missing tags, publish from an untagged commit, use a protected release environment, or require Windows signing material for the source-only release.
+5. Inspect the GitHub-generated source archives, the four uploaded evidence files, and the workflow logs. Do not edit a release asset or rewrite a tag; publish a corrective patch release instead.
 
 ## Verifying a download
 
-Download every asset listed above from the same GitHub Release. Verify the checksums before installing:
+Download the GitHub-generated source archive and all four uploaded evidence files from the same GitHub Release. First verify `source-release-manifest.json`: its `tag` and `sourceRevision` must identify the immutable release tag and a commit reachable from `main`. Then verify the three evidence files covered by `SHA256SUMS.txt`:
 
 ```powershell
 Get-Content .\SHA256SUMS.txt | ForEach-Object {
@@ -43,22 +38,10 @@ Get-Content .\SHA256SUMS.txt | ForEach-Object {
   $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $parts[1]).Hash.ToLowerInvariant()
   if ($actual -ne $parts[0]) { throw "Checksum mismatch: $($parts[1])" }
 }
-Get-AuthenticodeSignature .\VibeBus-X.Y.Z-windows-x64.msi
 ```
 
-Then install on a disposable Windows user profile, verify `vibebus --version`, register the marketplace explicitly, and uninstall. The installer is per-user and does not modify Codex configuration through custom actions.
-
-For a subsequent upgrade, retain the prior downloaded MSI and run:
-
-```powershell
-./scripts/test-installer.ps1 `
-  -MsiPath .\VibeBus-X.Y.Z-windows-x64.msi `
-  -PreviousMsiPath .\VibeBus-X.Y.Z-previous-windows-x64.msi `
-  -ExerciseLifecycle
-```
-
-Windows MSI deliberately blocks an in-place downgrade. To roll back, preserve project data independently, uninstall the newer MSI, install the earlier verified MSI, then repeat smoke tests. A failed upgrade should use Windows Installer rollback behavior first; do not force-delete the installation directory or marketplace files while the installer transaction is active.
+Confirm that the manifest names the GitHub automatic source ZIP and tarball, the SBOM contains no local build path, and the supply-chain evidence records the same source revision. No first-install, upgrade, binary signature, or MSI rollback assertion applies to this source-only release.
 
 ## Local and CI acceptance
 
-Local and pull-request builds are unsigned acceptance artifacts. They exercise packaging, plugin validation, MSI extraction, and installer lifecycle checks but never claim a GitHub Release. The release workflow preserves the pinned three-platform CI, source-built plugin, `cargo deny`, normalized SBOM, checksums, and Windows signing gate.
+Pull-request CI continues to exercise Linux, macOS, and Windows source and package acceptance. The source-only release workflow itself runs the version, Rust quality, `cargo deny`, and normalized SBOM gates on Linux before publishing evidence; it does not use a Windows runner, build an installer, or create binary release assets.

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Revised the first `v0.10.0` GitHub Release to a source-only contract: GitHub provides the tagged source archives automatically, and the workflow uploads only checksums, normalized SBOM, supply-chain evidence, and a source-release manifest. Windows signing, installers, binary ZIPs, and self-built source ZIPs are deferred to a separate future distribution contract.
 - Established the public open-source release contract: GitHub Releases are the official distribution channel, stable SemVer tags must resolve to commits reachable from `main`, and prerelease publishing remains disabled until it has its own verified workflow.
 - Added source archives, release-evidence manifest fields, public contribution and conduct guidance, Issue/PR templates, Dependabot updates, download verification instructions, and explicit first-install, upgrade, and rollback rules.
 - Added native macOS Security.framework Keychain storage for Agent and Operator credentials, including redacted registration/rotation, vault fallback, status, explicit deletion, and an isolated real-Keychain acceptance fixture.

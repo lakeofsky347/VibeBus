@@ -1,4 +1,4 @@
-name: Publish GitHub Release
+name: Publish source-only GitHub Release
 
 on:
   push:
@@ -19,16 +19,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  windows-release:
-    name: Build and publish Windows release
-    runs-on: windows-latest
+  source-release:
+    name: Verify and publish source-only release evidence
+    runs-on: ubuntu-latest
     timeout-minutes: 40
-    environment: release
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      VIBEBUS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
-      VIBEBUS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
-      VIBEBUS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
 
     steps:
       - name: Check out release tag
@@ -38,170 +34,178 @@ jobs:
           fetch-depth: 0
 
       - name: Install pinned Rust toolchain
-        shell: pwsh
+        shell: bash
         run: |
           rustup set auto-self-update disable
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
           rustup show active-toolchain
 
-      - name: Install .NET SDK
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
-        with:
-          dotnet-version: 6.0.x
-
       - name: Verify stable main tag and source versions
-        shell: pwsh
+        shell: bash
         run: |
-          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
-            throw "Stable release tag must match vX.Y.Z; prerelease tags are not enabled."
-          }
-          $version = $Matches.version
-          $tagCommit = (git rev-parse "$env:RELEASE_TAG^{commit}").Trim()
-          if ($LASTEXITCODE -ne 0 -or $tagCommit -notmatch '^[0-9a-f]{40}$') {
-            throw "Release tag must resolve to a commit."
-          }
-          & git merge-base --is-ancestor $tagCommit origin/main
-          if ($LASTEXITCODE -ne 0) {
-            throw "Release tag must point to a commit reachable from main."
-          }
-          $checkoutCommit = (git rev-parse HEAD).Trim()
-          if ($checkoutCommit -ne $tagCommit) {
-            throw "Release checkout does not match the requested tag commit."
-          }
-          $cargoText = Get-Content -Raw -LiteralPath Cargo.toml
-          $cargoVersion = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"').Groups['version'].Value
-          $pluginVersion = (Get-Content -Raw -LiteralPath plugins/vibebus/.codex-plugin/plugin.json | ConvertFrom-Json).version
-          if ($version -ne $cargoVersion -or $version -ne $pluginVersion) {
-            throw "Tag, Cargo, and plugin versions must match (tag=$version cargo=$cargoVersion plugin=$pluginVersion)."
-          }
-          if ((git status --porcelain).Length -ne 0) {
-            throw "Release source checkout must be clean."
-          }
-          $trackedPluginBinary = & git ls-files --error-unmatch -- plugins/vibebus/bin/vibebus.exe 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            throw "Release source must not track plugins/vibebus/bin/vibebus.exe; build it from the tagged source."
-          }
-          "VIBEBUS_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if [[ ! "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Stable release tag must match vX.Y.Z; prerelease tags are not enabled." >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ ! "$tag_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release tag must resolve to a commit." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Release tag must point to a commit reachable from main." >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$tag_commit" ]]; then
+            echo "Release checkout does not match the requested tag commit." >&2
+            exit 1
+          fi
+          cargo_version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' Cargo.toml | head -n 1)"
+          plugin_version="$(python3 -c 'import json; print(json.load(open("plugins/vibebus/.codex-plugin/plugin.json", encoding="utf-8"))["version"])')"
+          if [[ "$version" != "$cargo_version" || "$version" != "$plugin_version" ]]; then
+            echo "Tag, Cargo, and plugin versions must match (tag=$version cargo=$cargo_version plugin=$plugin_version)." >&2
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "Release source checkout must be clean." >&2
+            exit 1
+          fi
+          {
+            echo "VIBEBUS_VERSION=$version"
+            echo "SOURCE_REVISION=$tag_commit"
+          } >> "$GITHUB_ENV"
 
-      - name: Run release gates
-        shell: pwsh
+      - name: Run source release gates
+        shell: bash
         run: |
           cargo fmt --all -- --check
           cargo test --all-targets --locked
           cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Install pinned supply-chain tools
-        shell: pwsh
+        shell: bash
         run: |
           cargo install cargo-deny --version 0.20.2 --locked
           cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: Gate Rust advisories, licenses, bans, and sources
-        shell: pwsh
+        shell: bash
         run: cargo deny check advisories bans licenses sources
 
-      - name: Generate normalized release SBOM and supply-chain evidence
-        shell: pwsh
+      - name: Generate normalized source SBOM and supply-chain evidence
+        shell: bash
         run: |
           cargo cyclonedx --format json
-          python scripts/normalize-cyclonedx.py --self-test
-          $sboms = @(Get-ChildItem -LiteralPath . -Filter "*.cdx.json")
-          if ($sboms.Count -ne 1) {
-            throw "Expected exactly one CycloneDX SBOM, found $($sboms.Count)."
-          }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $sbomPath = Join-Path dist "VibeBus-$env:VIBEBUS_VERSION-windows-x64.cdx.json"
-          python scripts/normalize-cyclonedx.py --input $sboms[0].FullName --output $sbomPath
-          [ordered]@{
-            version = $env:VIBEBUS_VERSION
-            sourceRevision = (git rev-parse HEAD).Trim()
-            sbom = [System.IO.Path]::GetFileName($sbomPath)
-            gates = @("cargo-deny advisories", "cargo-deny licenses", "cargo-deny bans", "cargo-deny sources")
-          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path dist "supply-chain-evidence.json") -Encoding utf8
+          python3 scripts/normalize-cyclonedx.py --self-test
+          mapfile -t sboms < <(find . -maxdepth 1 -type f -name '*.cdx.json' -print)
+          if [[ "${#sboms[@]}" -ne 1 ]]; then
+            echo "Expected exactly one CycloneDX SBOM, found ${#sboms[@]}." >&2
+            exit 1
+          fi
+          mkdir -p dist
+          sbom_path="dist/VibeBus-${VIBEBUS_VERSION}.cdx.json"
+          python3 scripts/normalize-cyclonedx.py --input "${sboms[0]}" --output "$sbom_path"
+          python3 - "$SOURCE_REVISION" "$(basename "$sbom_path")" > dist/supply-chain-evidence.json <<'PY'
+          import json
+          import os
+          import sys
 
-      - name: Build release assets
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:VIBEBUS_SIGNING_CERTIFICATE_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:VIBEBUS_SIGNING_CERTIFICATE_PASSWORD)) {
-            throw "Production releases require both Windows signing secrets. CI remains available for unsigned package validation."
-          }
-          ./scripts/build-release.ps1 -Version $env:VIBEBUS_VERSION -SourceRef $env:RELEASE_TAG -Sign
+          print(json.dumps({
+              "version": os.environ["VIBEBUS_VERSION"],
+              "tag": os.environ["RELEASE_TAG"],
+              "sourceRevision": sys.argv[1],
+              "sbom": sys.argv[2],
+              "gates": [
+                  "cargo-deny advisories",
+                  "cargo-deny licenses",
+                  "cargo-deny bans",
+                  "cargo-deny sources",
+              ],
+          }, indent=2))
+          PY
 
-      - name: Add supply-chain evidence to release checksums
-        shell: pwsh
+      - name: Generate source-release manifest and checksums
+        shell: bash
         run: |
-          $checksumPath = Join-Path dist "SHA256SUMS.txt"
-          $evidenceFiles = @(
-            Get-ChildItem -LiteralPath dist -File | Where-Object {
-              $_.Name -like '*.cdx.json' -or $_.Name -eq 'supply-chain-evidence.json'
-            }
+          sbom_name="VibeBus-${VIBEBUS_VERSION}.cdx.json"
+          python3 - "$SOURCE_REVISION" "$sbom_name" > dist/source-release-manifest.json <<'PY'
+          import json
+          import os
+          import sys
+
+          print(json.dumps({
+              "version": os.environ["VIBEBUS_VERSION"],
+              "tag": os.environ["RELEASE_TAG"],
+              "sourceRevision": sys.argv[1],
+              "sourceArchives": {
+                  "providedBy": "GitHub automatic source archives",
+                  "zip": "Source code (zip)",
+                  "tarball": "Source code (tar.gz)",
+              },
+              "evidence": {
+                  "checksums": "SHA256SUMS.txt",
+                  "sbom": sys.argv[2],
+                  "supplyChain": "supply-chain-evidence.json",
+              },
+          }, indent=2))
+          PY
+          (
+            cd dist
+            sha256sum "$sbom_name" supply-chain-evidence.json source-release-manifest.json > SHA256SUMS.txt
           )
-          if ($evidenceFiles.Count -ne 2) {
-            throw "Expected CycloneDX SBOM and supply-chain evidence, found $($evidenceFiles.Count) files."
-          }
-          $lines = @($evidenceFiles | ForEach-Object {
-            "$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())  $($_.Name)"
-          })
-          [System.IO.File]::AppendAllLines($checksumPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-          $manifestPath = Join-Path dist "release-manifest.json"
-          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-          $manifest | Add-Member -NotePropertyName evidence -NotePropertyValue ([ordered]@{
-            checksums = "SHA256SUMS.txt"
-            sbom = [System.IO.Path]::GetFileName($sbomPath)
-            supplyChain = "supply-chain-evidence.json"
-          })
-          $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 
-      - name: Validate MSI and extracted payload
-        shell: pwsh
+      - name: Validate source-only evidence set
+        shell: bash
         run: |
-          $msiFiles = @(Get-ChildItem -LiteralPath dist -Filter "VibeBus-*-windows-x64.msi")
-          if ($msiFiles.Count -ne 1) {
-            throw "Expected exactly one MSI, found $($msiFiles.Count)."
-          }
-          $msi = $msiFiles[0]
-          ./scripts/test-installer.ps1 -MsiPath $msi.FullName -ExpectedVersion $env:VIBEBUS_VERSION -ExerciseLifecycle
+          sbom_name="VibeBus-${VIBEBUS_VERSION}.cdx.json"
+          sha256sum --check dist/SHA256SUMS.txt
+          python3 - "$sbom_name" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
 
-      - name: Upload workflow assets
+          sbom_name = sys.argv[1]
+          expected = {sbom_name, "supply-chain-evidence.json", "source-release-manifest.json"}
+          rows = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
+          covered = {row.split(maxsplit=1)[1].lstrip("*") for row in rows if row.split(maxsplit=1)}
+          assert covered == expected, f"Checksums must cover only source evidence: {covered}"
+          manifest = json.loads(Path("dist/source-release-manifest.json").read_text(encoding="utf-8"))
+          assert manifest["sourceArchives"]["providedBy"] == "GitHub automatic source archives"
+          assert set(manifest["evidence"].values()) == {"SHA256SUMS.txt", *expected - {"source-release-manifest.json"}}
+          assert str(Path.cwd()) not in Path("dist/source-release-manifest.json").read_text(encoding="utf-8")
+          assert str(Path.cwd()) not in Path("dist/" + sbom_name).read_text(encoding="utf-8")
+          PY
+
+      - name: Upload source-only release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: vibebus-${{ env.VIBEBUS_VERSION }}-windows
+          name: vibebus-${{ env.VIBEBUS_VERSION }}-source-evidence
           path: |
-            dist/*.msi
-            dist/*.zip
             dist/SHA256SUMS.txt
-            dist/release-manifest.json
-            dist/*.cdx.json
+            dist/VibeBus-${{ env.VIBEBUS_VERSION }}.cdx.json
             dist/supply-chain-evidence.json
+            dist/source-release-manifest.json
           if-no-files-found: error
           retention-days: 30
 
       - name: Publish GitHub release
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $requiredNames = @(
-            "VibeBus-$env:VIBEBUS_VERSION-windows-x64.msi",
-            "VibeBus-$env:VIBEBUS_VERSION-windows-x64.zip",
-            "VibeBus-Codex-plugin-$env:VIBEBUS_VERSION.zip",
-            "VibeBus-$env:VIBEBUS_VERSION-source.zip",
-            "SHA256SUMS.txt",
-            "release-manifest.json",
-            "VibeBus-$env:VIBEBUS_VERSION-windows-x64.cdx.json",
+          required_names=(
+            "SHA256SUMS.txt"
+            "VibeBus-${VIBEBUS_VERSION}.cdx.json"
             "supply-chain-evidence.json"
+            "source-release-manifest.json"
           )
-          $available = @(Get-ChildItem -LiteralPath dist -File)
-          $missing = @($requiredNames | Where-Object { $_ -notin $available.Name })
-          if ($missing.Count -ne 0) {
-            throw "Release evidence set is incomplete: $($missing -join ', ')."
-          }
-          $assets = @($available | Where-Object { $_.Name -in $requiredNames })
-          $releaseArguments = @("release", "create", $env:RELEASE_TAG)
-          $releaseArguments += $assets.FullName
-          $releaseArguments += @("--verify-tag", "--generate-notes", "--title", "VibeBus $env:VIBEBUS_VERSION")
-          & gh @releaseArguments
-          if ($LASTEXITCODE -ne 0) {
-            throw "GitHub release publication failed with exit code $LASTEXITCODE."
-          }
+          assets=()
+          for name in "${required_names[@]}"; do
+            if [[ ! -f "dist/$name" ]]; then
+              echo "Release evidence set is incomplete: $name" >&2
+              exit 1
+            fi
+            assets+=("dist/$name")
+          done
+          gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --generate-notes --title "VibeBus $VIBEBUS_VERSION"

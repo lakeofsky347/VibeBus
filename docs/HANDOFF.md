@@ -4,7 +4,7 @@
 
 VibeBus is a continuously maintained open-source project. GitHub Releases are the official distribution channel; stable releases are `vX.Y.Z` tags from commits reachable from `main`. Do not treat a pull request, a CI artifact, local output, or a container image as a release.
 
-The release workflow creates a Windows x64 evidence set: source archive, signed MSI, portable ZIP, Codex plugin ZIP, SHA-256 checksums, release manifest, CycloneDX SBOM, and supply-chain evidence. macOS and Linux remain source and CI-supported until maintainers establish public platform-specific distribution contracts.
+The first `v0.10.0` release is source-only. GitHub automatically supplies the tag's source ZIP and tarball; the workflow uploads exactly `SHA256SUMS.txt`, a normalized CycloneDX SBOM, `supply-chain-evidence.json`, and `source-release-manifest.json`. It does not build or upload an MSI, portable ZIP, Codex plugin ZIP, signed executable, installer, or duplicate source ZIP. macOS, Windows, and Linux remain source and CI-supported until maintainers establish a separate binary-distribution contract.
 
 ## Before changing the repository
 
@@ -17,9 +17,9 @@ The release workflow creates a Windows x64 evidence set: source archive, signed 
 
 - Stable tags must be `vX.Y.Z`, match Cargo and plugin versions, and point to commits reachable from `main`.
 - Prerelease publishing is disabled; create a separate reviewed policy before enabling it.
-- GitHub Release assets must be verified as one set using `SHA256SUMS.txt`, the manifest, SBOM, and supply-chain evidence.
-- A first install uses the current MSI. A subsequent upgrade is tested with `scripts/test-installer.ps1 -PreviousMsiPath <prior.msi> -ExerciseLifecycle`.
-- Windows MSI downgrades are blocked by design. Preserve data, uninstall the newer version, install the earlier verified MSI, and run smoke tests to roll back.
+- GitHub supplies the tagged source archives automatically. Verify the `source-release-manifest.json` tag and source revision, then use `SHA256SUMS.txt` to verify the SBOM, supply-chain evidence, and manifest.
+- Do not rewrite a published tag or its assets. Withdraw a bad release and publish a higher patch version after the corrective change is reviewed and merged.
+- This source-only release has no binary installation, upgrade, signature, or installer rollback claim. A later binary-release contract must define and validate those lifecycle rules before it can publish platform artifacts.
 
 ## Coordination boundaries
 

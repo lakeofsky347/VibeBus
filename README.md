@@ -42,9 +42,9 @@ GitHub Releases are the only official distribution channel. A stable release is 
 - minor releases add backwards-compatible capabilities;
 - major releases may introduce incompatible changes and include migration guidance.
 
-The stable workflow publishes a source archive plus Windows x64 signed MSI, portable ZIP, Codex plugin ZIP, `SHA256SUMS.txt`, machine-readable manifest, CycloneDX SBOM, and supply-chain evidence. macOS and Linux remain source and CI-supported paths until their own public distribution contracts are implemented. Release candidates are not currently published: tags such as `vX.Y.Z-rc.N` fail closed rather than being treated as stable releases.
+The first `v0.10.0` stable workflow is source-only. GitHub automatically provides the tagged Source code ZIP and tarball; the workflow uploads exactly `SHA256SUMS.txt`, a normalized CycloneDX SBOM, `supply-chain-evidence.json`, and `source-release-manifest.json`. The checksum file covers the other three uploaded evidence files. There are no MSI, portable ZIP, Codex plugin ZIP, signed executable, or installer assets in this first release. macOS, Windows, and Linux remain source and CI-supported paths until a later, separately reviewed binary-distribution contract is adopted. Release candidates are not currently published: tags such as `vX.Y.Z-rc.N` fail closed rather than being treated as stable releases.
 
-To verify a downloaded stable release, download the complete evidence set from the same GitHub Release, verify `SHA256SUMS.txt`, verify Authenticode on the Windows executable and MSI, then test a first install. For an upgrade, use a prior MSI with `scripts/test-installer.ps1 -PreviousMsiPath <prior.msi> -ExerciseLifecycle`. Windows MSI downgrades are intentionally blocked: uninstall the newer version before installing an earlier MSI, and preserve any project data separately before that rollback.
+To verify a downloaded stable release, download the GitHub-generated source archive and the four uploaded evidence files from the same GitHub Release. Check that the manifest's tag and source revision identify the source archive, then verify `SHA256SUMS.txt` against its three listed evidence files. This source-only release has no installation, signature, upgrade, or binary rollback claim.
 
 Detailed maintainer and verifier instructions are in [docs/release.md](docs/release.md).
 

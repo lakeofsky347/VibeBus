@@ -47,10 +47,21 @@ jobs:
               "origin/main",
               "Release tag must point to a commit reachable from main.",
               "--verify-tag",
-              "VibeBus-$env:VIBEBUS_VERSION-source.zip",
+              "GitHub automatic source archives",
+              "source-release-manifest.json",
+              "SHA256SUMS.txt",
               "supply-chain-evidence.json",
           ):
               assert marker in release, f"Release workflow is missing: {marker}"
+          for prohibited in (
+              "windows-latest",
+              "environment: release",
+              "WINDOWS_SIGNING_CERTIFICATE",
+              "build-release.ps1",
+              "test-installer.ps1",
+              "VibeBus-$env:VIBEBUS_VERSION-source.zip",
+          ):
+              assert prohibited not in release, f"Source-only release workflow still requires: {prohibited}"
           PY
 
   supply-chain:
