@@ -157,9 +157,10 @@ jobs:
 
       - name: Validate source-only evidence set
         shell: bash
+        working-directory: dist
         run: |
           sbom_name="VibeBus-${VIBEBUS_VERSION}.cdx.json"
-          sha256sum --check dist/SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
           python3 - "$sbom_name" <<'PY'
           import json
           from pathlib import Path
@@ -167,14 +168,15 @@ jobs:
 
           sbom_name = sys.argv[1]
           expected = {sbom_name, "supply-chain-evidence.json", "source-release-manifest.json"}
-          rows = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
+          rows = Path("SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
           covered = {row.split(maxsplit=1)[1].lstrip("*") for row in rows if row.split(maxsplit=1)}
           assert covered == expected, f"Checksums must cover only source evidence: {covered}"
-          manifest = json.loads(Path("dist/source-release-manifest.json").read_text(encoding="utf-8"))
+          manifest = json.loads(Path("source-release-manifest.json").read_text(encoding="utf-8"))
           assert manifest["sourceArchives"]["providedBy"] == "GitHub automatic source archives"
           assert set(manifest["evidence"].values()) == {"SHA256SUMS.txt", *expected - {"source-release-manifest.json"}}
-          assert str(Path.cwd()) not in Path("dist/source-release-manifest.json").read_text(encoding="utf-8")
-          assert str(Path.cwd()) not in Path("dist/" + sbom_name).read_text(encoding="utf-8")
+          workspace_root = Path.cwd().parent
+          assert str(workspace_root) not in Path("source-release-manifest.json").read_text(encoding="utf-8")
+          assert str(workspace_root) not in Path(sbom_name).read_text(encoding="utf-8")
           PY
 
       - name: Upload source-only release evidence
