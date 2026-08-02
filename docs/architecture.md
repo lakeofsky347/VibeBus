@@ -2,7 +2,7 @@
 
 ## Goal
 
-VibeBus coordinates independent Codex top-level tasks without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, task/thread associations, dependencies, responsibility overrides, reservations, artifacts, confirmed decisions, Git/test facts, subscriptions, and audit events.
+VibeBus coordinates independent coding-agent tasks (Codex, Claude Code, Cursor, OpenCode, Antigravity) without collapsing their chat or worktree isolation. The shared layer contains durable facts only: recoverable agent identities, directed messages, receipts, tasks, task/thread associations, dependencies, responsibility overrides, reservations, artifacts, confirmed decisions, Git/test facts, subscriptions, and audit events. Per-tool wiring is described in [Multi-tool adapters](multi-tool-adapters.md).
 
 ## Runtime shape
 
@@ -175,15 +175,15 @@ Other cleanup domains are independent and age-bounded: idempotency records, clos
 
 Before `VACUUM`, VibeBus creates a new non-overwriting SQLite backup, verifies its integrity, foreign keys, schema, and project identity, and requires at least twice the current database size free beside the live database. It records a bounded start event, runs `VACUUM` under the exclusive boundary, restores WAL, records completion, checkpoints, and returns before/after file hashes, sizes, page/freelist counts, reclaimed bytes, backup identity, Operator generation, and final verification. On failure after the journal switch it best-effort restores WAL; the verified backup remains the recovery boundary. Repository acceptance invokes the core only against disposable project/data directories, never the live coordination database.
 
-## Codex plugin lifecycle
+## Plugin lifecycle (Codex adapter)
 
-The plugin contains:
+The Codex adapter (`plugins/vibebus/`) is the canonical plugin package. Sibling directories under `plugins/` provide Claude Code, Cursor, OpenCode, and Antigravity adapters; see [Multi-tool adapters](multi-tool-adapters.md). The Codex plugin contains:
 
 - `.mcp.json`, which launches the packaged native executable with `mcp`;
-- `skills/vibebus-coordination/SKILL.md`, which defines the coordination discipline;
+- `skills/vibebus-coordination/SKILL.md`, which defines the tool-agnostic coordination discipline;
 - `hooks/hooks.json`, which runs PowerShell implementations on Windows and native-binary SessionStart/PostToolUse/Stop implementations on macOS/Unix.
 
-The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call. Hook commands receive `PLUGIN_ROOT` and writable `PLUGIN_DATA`, require Codex trust review, and run at the session working directory. PostToolUse resolves only an active task/thread binding, reliable exit metadata, commit identity/subject/path names, and a hashed working state; Stop calls the bounded proposal read model and writes it under plugin data. Neither Hook reads the unstable transcript format, and Stop emits no continuation or automatic message mutation.
+The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call. Hook commands receive `PLUGIN_ROOT` and writable `PLUGIN_DATA`, require Codex trust review, and run at the session working directory. PostToolUse resolves only an active task/thread binding (matching the raw session id or any supported `{tool}:{session_id}` form), reliable exit metadata, commit identity/subject/path names, and a hashed working state; Stop calls the bounded proposal read model and writes it under plugin data. Neither Hook reads the unstable transcript format, and Stop emits no continuation or automatic message mutation.
 
 ## Release supply chain
 

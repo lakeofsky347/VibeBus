@@ -4,14 +4,19 @@ pub mod mcp;
 pub mod models;
 pub mod policy;
 pub mod project;
+pub mod spawn;
 pub mod store;
 pub mod vault;
 
 pub use error::{BusError, Result};
-pub use hooks::{CodexHook, run_codex_hook};
+pub use hooks::{AgentHook, run_agent_hook};
 pub use models::*;
 pub use policy::{ResponsibilityPolicy, normalize_policy_pattern, normalize_project_path};
 pub use project::{database_path, discover_project, initialize_project};
+pub use spawn::{
+    AgentProfile, AgentProfiles, ProfileSummary, SpawnOutcome, SpawnRegistry, SpawnState,
+    spawn_once,
+};
 pub use store::Bus;
 pub use vault::{
     CredentialVault, MemoryCredentialVault, ResolvedSecret, SecretSource, StoredAgentCredentials,

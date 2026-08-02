@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Bus, BusError, CredentialVault, ResolvedSecret, RetentionPolicy, SecretSource,
     recovery_delivery, recovery_key_delivery, registration_delivery, resolve_agent_recovery_key,
-    resolve_agent_token, system_credential_vault,
+    resolve_agent_token,
+    spawn::{AgentProfiles, SpawnRegistry, spawn_once},
+    system_credential_vault,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -474,11 +476,34 @@ pub struct BackupRequest {
     pub output: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSpawnRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    /// Profile name from .vibebus/agents.json (codex, claude, gemini, or a custom one).
+    pub agent: String,
+    /// Optional role injected into the protocol prompt (planner, reviewer, executor, ...).
+    pub role: Option<String>,
+    /// The task description to send to the spawned agent CLI.
+    pub task: String,
+    /// Timeout in seconds (1..=86400); defaults to 1800.
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatusRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct VibeBusMcp {
     default_root: PathBuf,
     data_home: Option<PathBuf>,
     vault: Arc<dyn CredentialVault>,
+    spawn_registry: Arc<SpawnRegistry>,
 }
 
 impl VibeBusMcp {
@@ -487,6 +512,7 @@ impl VibeBusMcp {
             default_root,
             data_home,
             vault: system_credential_vault(),
+            spawn_registry: SpawnRegistry::new(),
         }
     }
 
@@ -499,6 +525,7 @@ impl VibeBusMcp {
             default_root,
             data_home,
             vault,
+            spawn_registry: SpawnRegistry::new(),
         }
     }
 
@@ -1426,6 +1453,60 @@ impl VibeBusMcp {
             &bus.backup_to(std::path::Path::new(&request.output))
                 .map_err(bus_error)?,
         )
+    }
+
+    #[tool(
+        description = "Spawn an external agent CLI (codex/claude/gemini/...) as a tracked collaborator, send it a task wrapped in a marker protocol, and return its result, clarification question, or error"
+    )]
+    async fn vibebus_agent_spawn(
+        &self,
+        Parameters(request): Parameters<AgentSpawnRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = request
+            .root
+            .clone()
+            .unwrap_or_else(|| self.default_root.to_string_lossy().into_owned());
+        let profiles = AgentProfiles::load(std::path::Path::new(&root));
+        let profile = profiles.resolve(&request.agent).cloned().ok_or_else(|| {
+            bus_error(BusError::Validation(format!(
+                "unknown agent profile '{}'; available: {}",
+                request.agent,
+                profiles
+                    .list()
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        })?;
+        let outcome = spawn_once(
+            &profile,
+            &request.task,
+            request.role.as_deref(),
+            request.timeout_secs,
+        )
+        .await
+        .map_err(bus_error)?;
+        self.spawn_registry.record(&outcome);
+        json_text(&outcome)
+    }
+
+    #[tool(
+        description = "List spawned agent sessions recorded in this MCP server and the available agent profiles"
+    )]
+    async fn vibebus_agent_status(
+        &self,
+        Parameters(request): Parameters<AgentStatusRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = request
+            .root
+            .clone()
+            .unwrap_or_else(|| self.default_root.to_string_lossy().into_owned());
+        let profiles = AgentProfiles::load(std::path::Path::new(&root));
+        json_text(&serde_json::json!({
+            "sessions": self.spawn_registry.status(),
+            "profiles": profiles.list(),
+        }))
     }
 }
 

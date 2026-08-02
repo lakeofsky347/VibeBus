@@ -6,18 +6,18 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use vibebus::{
-    Bus, BusError, CodexHook, CredentialVault, Result, RetentionPolicy, SecretSource,
-    StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
+    AgentHook, AgentProfiles, Bus, BusError, CredentialVault, Result, RetentionPolicy,
+    SecretSource, StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
     operator_credential_delivery, recovery_delivery, recovery_key_delivery, registration_delivery,
-    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret, run_codex_hook,
-    system_credential_vault,
+    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret, run_agent_hook,
+    spawn_once, system_credential_vault,
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "vibebus",
     version,
-    about = "Local coordination bus for independent Codex tasks"
+    about = "Local coordination bus for independent coding-agent tasks"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
@@ -324,6 +324,17 @@ enum AgentCommand {
         token: Option<String>,
         #[arg(long)]
         store_credentials: bool,
+    },
+    /// Spawn an external agent CLI as a collaborator and print its outcome.
+    Spawn {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -660,11 +671,11 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Command::Hook { command } = &cli.command {
         let hook = match command {
-            HookCommand::SessionStart => CodexHook::SessionStart,
-            HookCommand::PostToolUse => CodexHook::PostToolUse,
-            HookCommand::Stop => CodexHook::Stop,
+            HookCommand::SessionStart => AgentHook::SessionStart,
+            HookCommand::PostToolUse => AgentHook::PostToolUse,
+            HookCommand::Stop => AgentHook::Stop,
         };
-        return match run_codex_hook(hook) {
+        return match run_agent_hook(hook) {
             Ok(Some(value)) => {
                 print_json(&value);
                 ExitCode::SUCCESS
@@ -681,6 +692,37 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("VibeBus MCP server failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Command::Agent {
+        command:
+            AgentCommand::Spawn {
+                agent,
+                role,
+                task,
+                timeout_secs,
+            },
+    } = &cli.command
+    {
+        return match handle_agent_spawn(&cli.root, agent, role.as_deref(), task, *timeout_secs)
+            .await
+        {
+            Ok(value) => {
+                print_json(&value);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "error": error.to_string(),
+                        "kind": error_kind(&error)
+                    }))
+                    .expect("serialize CLI error")
+                );
                 ExitCode::FAILURE
             }
         };
@@ -704,6 +746,30 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn handle_agent_spawn(
+    root: &std::path::Path,
+    agent: &str,
+    role: Option<&str>,
+    task: &str,
+    timeout_secs: Option<u64>,
+) -> Result<serde_json::Value> {
+    let profiles = AgentProfiles::load(root);
+    let profile = profiles.resolve(agent).cloned().ok_or_else(|| {
+        BusError::Validation(format!(
+            "unknown agent profile '{}'; available: {}",
+            agent,
+            profiles
+                .list()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    let outcome = spawn_once(&profile, task, role, timeout_secs).await?;
+    Ok(json!({ "ok": true, "result": outcome }))
 }
 
 fn run(cli: Cli) -> Result<serde_json::Value> {
@@ -792,6 +858,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     store_credentials,
                 )
             }
+            AgentCommand::Spawn { .. } => unreachable!("agent spawn is handled in main"),
         },
         Command::Credential { command } => match command {
             CredentialCommand::Status { agent } => {
