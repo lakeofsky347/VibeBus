@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "vibebus": {
+      "type": "local",
+      "command": ["vibebus", "mcp"],
+      "enabled": true
+    }
+  },
+  "instructions": [
+    "AGENTS.md",
+    "skills/vibebus-coordination/SKILL.md"
+  ]
+}

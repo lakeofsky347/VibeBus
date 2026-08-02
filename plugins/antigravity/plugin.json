@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "vibebus",
+  "description": "Project-scoped coordination for independent Antigravity agent tasks via a local SQLite fact bus."
+}

@@ -1,7 +1,7 @@
 {
   "name": "vibebus",
   "version": "0.10.0",
-  "description": "Project-scoped coordination for independent Codex tasks.",
+  "description": "Project-scoped coordination for independent coding-agent tasks (Codex adapter).",
   "author": {
     "name": "VibeBus Contributors",
     "url": "https://github.com/lakeofsky347/VibeBus"
@@ -9,12 +9,12 @@
   "homepage": "https://github.com/lakeofsky347/VibeBus",
   "repository": "https://github.com/lakeofsky347/VibeBus",
   "license": "MIT",
-  "keywords": ["codex", "coordination", "tasks", "sqlite"],
+  "keywords": ["codex", "claude-code", "cursor", "opencode", "antigravity", "coordination", "tasks", "sqlite", "mcp"],
   "skills": "./skills/",
   "interface": {
     "displayName": "VibeBus",
-    "shortDescription": "Coordinate independent Codex tasks",
-    "longDescription": "Use a local SQLite fact bus with Windows Credential Manager or macOS Keychain for recoverable agents, responsibility-domain policy, bounded Git/test lifecycle facts, directed message lifecycles, atomically claimed tasks, Codex thread bindings, renewable file reservations, replay-safe event subscriptions, operator-approved bounded retention, and structured handoffs across independent Codex tasks.",
+    "shortDescription": "Coordinate independent coding-agent tasks",
+    "longDescription": "Use a local SQLite fact bus with Windows Credential Manager or macOS Keychain for recoverable agents, responsibility-domain policy, bounded Git/test lifecycle facts, directed message lifecycles, atomically claimed tasks, agent task/thread bindings, renewable file reservations, replay-safe event subscriptions, operator-approved bounded retention, and structured handoffs across independent coding-agent tasks. This is the Codex adapter; sibling packages under plugins/ provide Claude Code, Cursor, OpenCode, and Antigravity adapters.",
     "developerName": "VibeBus Contributors",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],
