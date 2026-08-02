@@ -14,8 +14,8 @@ pub use models::*;
 pub use policy::{ResponsibilityPolicy, normalize_policy_pattern, normalize_project_path};
 pub use project::{database_path, discover_project, initialize_project};
 pub use spawn::{
-    AgentProfile, AgentProfiles, ProfileSummary, SpawnOutcome, SpawnRegistry, SpawnState,
-    spawn_once,
+    AgentProfile, AgentProfiles, ProfileSummary, SessionRegistry, SessionStatus, SpawnOutcome,
+    SpawnState, spawn_once,
 };
 pub use store::Bus;
 pub use vault::{

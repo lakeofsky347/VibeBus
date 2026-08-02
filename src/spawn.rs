@@ -21,7 +21,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex as AsyncMutex,
     time::timeout,
 };
 use uuid::Uuid;
@@ -201,56 +202,10 @@ pub struct SpawnOutcome {
 }
 
 /// A recorded spawn session kept in the registry for status queries.
-#[derive(Debug, Clone, Serialize)]
-pub struct SpawnRecord {
-    pub session_id: String,
-    pub agent: String,
-    pub role: Option<String>,
-    pub state: SpawnState,
-    pub message: String,
-    pub started_at_ms: u128,
-    pub elapsed_ms: u128,
-}
-
-/// In-memory registry of spawn sessions, shared across MCP tool calls.
-#[derive(Debug, Default)]
-pub struct SpawnRegistry {
-    records: Mutex<Vec<SpawnRecord>>,
-}
-
-impl SpawnRegistry {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn record(&self, outcome: &SpawnOutcome) {
-        let record = SpawnRecord {
-            session_id: outcome.session_id.clone(),
-            agent: outcome.agent.clone(),
-            role: outcome.role.clone(),
-            state: outcome.state.clone(),
-            message: outcome.message.clone(),
-            started_at_ms: 0,
-            elapsed_ms: outcome.elapsed_ms,
-        };
-        if let Ok(mut records) = self.records.lock() {
-            records.push(record);
-            // Keep the registry bounded.
-            let overflow = records.len().saturating_sub(200);
-            if overflow > 0 {
-                records.drain(0..overflow);
-            }
-        }
-    }
-
-    pub fn status(&self) -> Vec<SpawnRecord> {
-        self.records.lock().map(|r| r.clone()).unwrap_or_default()
-    }
-}
-
 enum ReadOutcome {
     Marker(SpawnState, String),
     Eof(String),
+    Timeout,
 }
 
 /// Spawn an external agent CLI, send it a task, and read stdout until a protocol
@@ -272,29 +227,11 @@ pub async fn spawn_once(
         .stdout
         .take()
         .ok_or_else(|| BusError::Validation("agent child produced no stdout pipe".into()))?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    let read = timeout(limit, async {
-        let mut acc = String::new();
-        while let Ok(Some(line)) = reader.next_line().await {
-            match parse_marker(&line) {
-                Marker::Result(text) => return ReadOutcome::Marker(SpawnState::Result, text),
-                Marker::Question(text) => return ReadOutcome::Marker(SpawnState::Question, text),
-                Marker::Error(text) => return ReadOutcome::Marker(SpawnState::Error, text),
-                Marker::None => {
-                    if !line.is_empty() {
-                        acc.push_str(&line);
-                        acc.push('\n');
-                    }
-                }
-            }
-        }
-        ReadOutcome::Eof(acc)
-    })
-    .await;
+    let mut lines = BufReader::new(stdout).lines();
+    let read = read_until_marker(&mut lines, limit).await;
 
     let (state, message) = match read {
-        Ok(ReadOutcome::Marker(state, text)) => {
+        ReadOutcome::Marker(state, text) => {
             let msg = if text.is_empty() {
                 "(empty marker body)".to_string()
             } else {
@@ -302,7 +239,7 @@ pub async fn spawn_once(
             };
             (state, msg)
         }
-        Ok(ReadOutcome::Eof(acc)) => {
+        ReadOutcome::Eof(acc) => {
             let trimmed = acc.trim();
             if trimmed.is_empty() {
                 (SpawnState::Error, "agent exited with no output".to_string())
@@ -310,7 +247,7 @@ pub async fn spawn_once(
                 (SpawnState::Result, limit_text(trimmed, MAX_MESSAGE_CHARS))
             }
         }
-        Err(_) => {
+        ReadOutcome::Timeout => {
             let _ = child.kill().await;
             (
                 SpawnState::Timeout,
@@ -369,6 +306,46 @@ async fn spawn_child(profile: &AgentProfile, prompt: &str) -> Result<Child, BusE
     Ok(child)
 }
 
+/// Spawn a child with stdin kept open for bidirectional reply (P2 session
+/// path). The prompt is sent as a trailing arg, or via the first stdin write
+/// when `prompt_via_stdin` is set; stdin is never closed so the host can reply.
+async fn spawn_session_child(
+    profile: &AgentProfile,
+    prompt: &str,
+) -> Result<(Child, ChildStdin, ChildStdout), BusError> {
+    let mut cmd = Command::new(&profile.command);
+    cmd.args(&profile.args);
+    for (key, value) in &profile.env {
+        cmd.env(key, value);
+    }
+    if !profile.prompt_via_stdin {
+        cmd.arg(prompt);
+    }
+    cmd.env("CI", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|error| {
+        BusError::Validation(format!(
+            "failed to spawn agent '{}': {error}. Is the CLI installed and on PATH?",
+            profile.command
+        ))
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| BusError::Validation("agent child produced no stdin pipe".into()))?;
+    if profile.prompt_via_stdin {
+        let _ = stdin.write_all(prompt.as_bytes()).await;
+        let _ = stdin.flush().await;
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BusError::Validation("agent child produced no stdout pipe".into()))?;
+    Ok((child, stdin, stdout))
+}
+
 fn limit_text(text: &str, maximum: usize) -> String {
     if text.chars().count() <= maximum {
         return text.to_string();
@@ -376,6 +353,248 @@ fn limit_text(text: &str, maximum: usize) -> String {
     let mut out: String = text.chars().take(maximum).collect();
     out.push('…');
     out
+}
+
+/// Read child stdout lines until a protocol marker, EOF, or timeout. Shared by
+/// the one-shot `spawn_once` path and the persistent `SpawnSession` path.
+async fn read_until_marker(
+    lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+    limit: Duration,
+) -> ReadOutcome {
+    match timeout(limit, async {
+        let mut acc = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            match parse_marker(&line) {
+                Marker::Result(text) => return ReadOutcome::Marker(SpawnState::Result, text),
+                Marker::Question(text) => return ReadOutcome::Marker(SpawnState::Question, text),
+                Marker::Error(text) => return ReadOutcome::Marker(SpawnState::Error, text),
+                Marker::None => {
+                    if !line.is_empty() {
+                        acc.push_str(&line);
+                        acc.push('\n');
+                    }
+                }
+            }
+        }
+        ReadOutcome::Eof(acc)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => ReadOutcome::Timeout,
+    }
+}
+
+/// A live spawn session kept in the registry so `reply` / `kill` can operate on
+/// it across MCP tool calls. The child stays alive while `state == Question`.
+pub struct SpawnSession {
+    pub id: String,
+    pub agent: String,
+    pub role: Option<String>,
+    pub task: String,
+    pub state: SpawnState,
+    pub started_at: Instant,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    lines: Option<tokio::io::Lines<BufReader<ChildStdout>>>,
+    last_message: String,
+}
+
+impl SpawnSession {
+    /// Drive the child until it emits a marker, exits, or times out. On a
+    /// terminal state the child is reaped; on `Question` it stays alive for a
+    /// later `reply`.
+    async fn advance(&mut self, limit: Duration) -> SpawnOutcome {
+        let Some(lines) = self.lines.as_mut() else {
+            return self
+                .finalize(SpawnState::Closed, "session has no stdout")
+                .await;
+        };
+        let read = read_until_marker(lines, limit).await;
+        let (state, message) = match read {
+            ReadOutcome::Marker(state, text) => {
+                let msg = if text.is_empty() {
+                    "(empty marker body)".to_string()
+                } else {
+                    text
+                };
+                (state, msg)
+            }
+            ReadOutcome::Eof(acc) => {
+                let trimmed = acc.trim();
+                if trimmed.is_empty() {
+                    (SpawnState::Error, "agent exited with no output".to_string())
+                } else {
+                    (SpawnState::Result, limit_text(trimmed, MAX_MESSAGE_CHARS))
+                }
+            }
+            ReadOutcome::Timeout => (
+                SpawnState::Timeout,
+                format!("agent timed out after {}s", limit.as_secs()),
+            ),
+        };
+        self.finalize(state, &message).await
+    }
+
+    /// Update state, reap the child on any terminal state, and emit an outcome.
+    async fn finalize(&mut self, state: SpawnState, message: &str) -> SpawnOutcome {
+        if !matches!(state, SpawnState::Question | SpawnState::Running) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+            self.stdin = None;
+            self.lines = None;
+        }
+        self.state = state.clone();
+        self.last_message = message.to_string();
+        SpawnOutcome {
+            session_id: self.id.clone(),
+            agent: self.agent.clone(),
+            role: self.role.clone(),
+            state,
+            message: message.to_string(),
+            elapsed_ms: self.started_at.elapsed().as_millis(),
+        }
+    }
+}
+
+/// In-memory registry of persistent spawn sessions, shared across MCP calls.
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: Mutex<HashMap<String, Arc<AsyncMutex<SpawnSession>>>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Spawn a child, run it to its first marker, and store the session. On
+    /// `Question` the child stays alive for a later `reply`.
+    pub async fn spawn(
+        &self,
+        profile: &AgentProfile,
+        task: &str,
+        role: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<SpawnOutcome, BusError> {
+        let session_id = format!("spawn-{}", &Uuid::new_v4().to_string()[..8]);
+        let limit = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let prompt = build_protocol_prompt(task, role);
+        let (child, stdin, stdout) = spawn_session_child(profile, &prompt).await?;
+        let lines = BufReader::new(stdout).lines();
+        let mut session = SpawnSession {
+            id: session_id.clone(),
+            agent: profile.command.clone(),
+            role: role.map(str::to_owned),
+            task: task.to_string(),
+            state: SpawnState::Running,
+            started_at: Instant::now(),
+            child: Some(child),
+            stdin: Some(stdin),
+            lines: Some(lines),
+            last_message: String::new(),
+        };
+        let outcome = session.advance(limit).await;
+        self.sessions
+            .lock()
+            .map(|mut map| {
+                map.insert(session_id, Arc::new(AsyncMutex::new(session)));
+            })
+            .ok();
+        Ok(outcome)
+    }
+
+    /// Continue a `Question`-state session by replying to the child and reading
+    /// its next marker.
+    pub async fn reply(
+        &self,
+        session_id: &str,
+        message: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<SpawnOutcome, BusError> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| BusError::Validation("spawn registry poisoned".into()))?
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| BusError::Validation(format!("unknown spawn session '{session_id}'")))?;
+        let mut session = session.lock().await;
+        if !matches!(session.state, SpawnState::Question) {
+            return Err(BusError::Validation(format!(
+                "spawn session '{}' is not awaiting a reply (state: {:?})",
+                session_id, session.state
+            )));
+        }
+        if let Some(stdin) = session.stdin.as_mut() {
+            stdin
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .map_err(|e| BusError::Validation(format!("failed to reply to agent: {e}")))?;
+            let _ = stdin.flush().await;
+        }
+        let limit = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        Ok(session.advance(limit).await)
+    }
+
+    /// Kill a live session and mark it closed.
+    pub async fn kill(&self, session_id: &str) -> Result<SpawnOutcome, BusError> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| BusError::Validation("spawn registry poisoned".into()))?
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| BusError::Validation(format!("unknown spawn session '{session_id}'")))?;
+        let mut session = session.lock().await;
+        Ok(session.finalize(SpawnState::Closed, "killed by host").await)
+    }
+
+    /// Snapshot of all sessions for status queries.
+    pub fn status(&self) -> Vec<SessionStatus> {
+        self.sessions
+            .lock()
+            .map(|map| {
+                map.values()
+                    .map(|session| {
+                        // Best-effort non-blocking snapshot; state may lag briefly.
+                        let session = session.clone();
+                        let session = match session.try_lock() {
+                            Ok(s) => s,
+                            Err(_) => {
+                                return SessionStatus {
+                                    id: String::new(),
+                                    agent: String::new(),
+                                    role: None,
+                                    state: SpawnState::Running,
+                                    message: "(locked)".into(),
+                                };
+                            }
+                        };
+                        SessionStatus {
+                            id: session.id.clone(),
+                            agent: session.agent.clone(),
+                            role: session.role.clone(),
+                            state: session.state.clone(),
+                            message: session.last_message.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A non-owning snapshot of a session for status reporting.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStatus {
+    pub id: String,
+    pub agent: String,
+    pub role: Option<String>,
+    pub state: SpawnState,
+    pub message: String,
 }
 
 #[cfg(test)]
@@ -440,22 +659,56 @@ mod tests {
         assert_eq!(parse_marker("[result] lower case"), Marker::None);
     }
 
-    #[test]
-    fn registry_records_and_lists_outcomes() {
-        let registry = SpawnRegistry::new();
-        let outcome = SpawnOutcome {
-            session_id: "spawn-deadbeef".into(),
-            agent: "codex".into(),
-            role: Some("reviewer".into()),
-            state: SpawnState::Result,
-            message: "looks good".into(),
-            elapsed_ms: 1234,
+    #[tokio::test]
+    async fn session_registry_spawn_status_kill_roundtrip() {
+        let registry = SessionRegistry::new();
+        let profile = AgentProfile {
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo '[RESULT] ok'".into()],
+            roles: vec![],
+            env: HashMap::new(),
+            prompt_via_stdin: false,
         };
-        registry.record(&outcome);
+        let outcome = registry
+            .spawn(&profile, "do a thing", None, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, SpawnState::Result);
+        assert_eq!(outcome.message, "ok");
+        // The session is recorded for status.
         let status = registry.status();
         assert_eq!(status.len(), 1);
-        assert_eq!(status[0].session_id, "spawn-deadbeef");
         assert_eq!(status[0].state, SpawnState::Result);
+        // Killing an already-terminal session is a no-op that reports Closed.
+        let killed = registry.kill(&outcome.session_id).await.unwrap();
+        assert_eq!(killed.state, SpawnState::Closed);
+    }
+
+    #[tokio::test]
+    async fn session_registry_reply_to_a_question() {
+        // Simulate an agent that asks a question, reads a reply from stdin, then
+        // emits a result. stdin stays open so the host can reply.
+        let script = "echo '[QUESTION] which cache?'; read -r ans; echo \"[RESULT] using $ans\"";
+        let profile = AgentProfile {
+            command: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            roles: vec![],
+            env: HashMap::new(),
+            prompt_via_stdin: false,
+        };
+        let registry = SessionRegistry::new();
+        let q = registry
+            .spawn(&profile, "add caching", None, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(q.state, SpawnState::Question);
+        assert_eq!(q.message, "which cache?");
+        let r = registry
+            .reply(&q.session_id, "redis", Some(5))
+            .await
+            .unwrap();
+        assert_eq!(r.state, SpawnState::Result);
+        assert_eq!(r.message, "using redis");
     }
 
     #[tokio::test]
