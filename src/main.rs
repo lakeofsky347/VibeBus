@@ -325,14 +325,23 @@ enum AgentCommand {
         #[arg(long)]
         store_credentials: bool,
     },
-    /// Spawn an external agent CLI as a collaborator and print its outcome.
+    /// Spawn an external agent CLI as a collaborator, link it to a VibeBus task,
+    /// and print the outcome.
     Spawn {
+        /// Agent CLI profile name (codex, claude, gemini, demo, or a custom one).
+        #[arg(long)]
+        profile: String,
+        /// Authenticated VibeBus agent that owns the delegation task.
         #[arg(long)]
         agent: String,
         #[arg(long)]
-        role: Option<String>,
+        token: Option<String>,
         #[arg(long)]
         task: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
         #[arg(long)]
         timeout_secs: Option<u64>,
     },
@@ -699,15 +708,27 @@ async fn main() -> ExitCode {
     if let Command::Agent {
         command:
             AgentCommand::Spawn {
+                profile,
                 agent,
-                role,
+                token,
                 task,
+                role,
+                task_id,
                 timeout_secs,
             },
     } = &cli.command
     {
-        return match handle_agent_spawn(&cli.root, agent, role.as_deref(), task, *timeout_secs)
-            .await
+        return match handle_agent_spawn(
+            &cli.root,
+            profile,
+            agent,
+            token.as_deref(),
+            task,
+            role.as_deref(),
+            task_id.as_deref(),
+            *timeout_secs,
+        )
+        .await
         {
             Ok(value) => {
                 print_json(&value);
@@ -748,18 +769,22 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_agent_spawn(
     root: &std::path::Path,
+    profile: &str,
     agent: &str,
-    role: Option<&str>,
+    token: Option<&str>,
     task: &str,
+    role: Option<&str>,
+    task_id: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<serde_json::Value> {
     let profiles = AgentProfiles::load(root);
-    let profile = profiles.resolve(agent).cloned().ok_or_else(|| {
+    let profile = profiles.resolve(profile).cloned().ok_or_else(|| {
         BusError::Validation(format!(
             "unknown agent profile '{}'; available: {}",
-            agent,
+            profile,
             profiles
                 .list()
                 .iter()
@@ -769,7 +794,28 @@ async fn handle_agent_spawn(
         ))
     })?;
     let outcome = spawn_once(&profile, task, role, timeout_secs).await?;
-    Ok(json!({ "ok": true, "result": outcome }))
+    // Link the spawn to a durable VibeBus task + message (same logic as the
+    // MCP tool). One-shot CLI cannot reply, so a Question state still leaves
+    // the task claimed for the host to handle.
+    let mut bus = Bus::open(root, None)?;
+    let project_id = bus.project().project_id.clone();
+    let vault = system_credential_vault();
+    let resolved = resolve_agent_token(vault.as_ref(), &project_id, agent, token, None)?;
+    let link = vibebus::spawn::link_spawn_outcome(
+        &mut bus,
+        agent,
+        &resolved.value,
+        &outcome,
+        task_id,
+        task,
+        role,
+        &profile.command,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "result": outcome,
+        "link": link,
+    }))
 }
 
 fn run(cli: Cli) -> Result<serde_json::Value> {

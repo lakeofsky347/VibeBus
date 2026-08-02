@@ -1519,67 +1519,28 @@ impl VibeBusMcp {
             .await
             .map_err(bus_error)?;
         // P1.5 durable fact linkage: create + claim + bind a task to the spawn
-        // session. On a terminal outcome, also record the result and complete.
+        // session, and on a terminal outcome record the result and complete.
         let mut bus = self.open(request.root.as_deref())?;
         let token = self
             .token(&bus, &request.agent, request.token.as_deref())?
             .value;
-        let task_id = request
-            .task_id
-            .clone()
-            .unwrap_or_else(|| outcome.session_id.clone());
-        let title = format!(
-            "spawn: {} {}",
-            profile.command,
-            request.role.as_deref().unwrap_or("default")
-        );
-        bus.create_task(
+        let link = crate::spawn::link_spawn_outcome(
+            &mut bus,
             &request.agent,
             &token,
-            &task_id,
-            &title,
-            Some(&request.task),
-            &[],
+            &outcome,
+            request.task_id.as_deref(),
+            &request.task,
+            request.role.as_deref(),
+            &profile.command,
         )
         .map_err(bus_error)?;
-        let claimed = bus
-            .claim_task(&request.agent, &token, &task_id)
-            .map_err(bus_error)?;
-        let thread_id = format!("spawn:{}", outcome.session_id);
-        let _ = bus.bind_task_thread(&request.agent, &token, &task_id, &thread_id);
-        let mut task_version = claimed.version;
-        if !matches!(
-            outcome.state,
-            crate::SpawnState::Question | crate::SpawnState::Running
-        ) {
-            let subject = format!("spawn result: {} ({:?})", profile.command, outcome.state);
-            let _ = bus.send_message_idempotent(
-                &request.agent,
-                &token,
-                std::slice::from_ref(&request.agent),
-                &subject,
-                &outcome.message,
-                Some(&thread_id),
-                "normal",
-                false,
-                Some(&format!("spawn-result-{}", outcome.session_id)),
-            );
-            if let Ok(completed) = bus.update_task(
-                &request.agent,
-                &token,
-                &task_id,
-                task_version,
-                "completed",
-                None,
-            ) {
-                task_version = completed.version;
-            }
-        }
         json_text(&serde_json::json!({
             "outcome": outcome,
-            "taskId": task_id,
-            "threadId": thread_id,
-            "taskVersion": task_version,
+            "taskId": link.task_id,
+            "threadId": link.thread_id,
+            "taskVersion": link.task_version,
+            "completed": link.completed,
         }))
     }
 

@@ -27,7 +27,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::BusError;
+use crate::{Bus, BusError};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 const RESULT_MARKER: &str = "[RESULT]";
@@ -117,6 +117,21 @@ impl AgentProfiles {
                 roles: vec!["researcher".into()],
                 env: HashMap::new(),
                 prompt_via_stdin: true,
+            },
+        );
+        // A no-dependency demo profile so the spawn bridge is runnable without
+        // any external agent CLI installed. Emits a [RESULT] marker immediately.
+        profiles.insert(
+            "demo".into(),
+            AgentProfile {
+                command: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "echo 'demo agent: acknowledged task'; echo '[RESULT] demo agent completed the task'".into(),
+                ],
+                roles: vec!["executor".into()],
+                env: HashMap::new(),
+                prompt_via_stdin: false,
             },
         );
         Self { profiles }
@@ -595,6 +610,72 @@ pub struct SessionStatus {
     pub role: Option<String>,
     pub state: SpawnState,
     pub message: String,
+}
+
+/// The durable fact-layer linkage created for a spawn outcome: a task bound to
+/// the spawn session, optionally completed with a recorded result message.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpawnLink {
+    pub task_id: String,
+    pub thread_id: String,
+    pub task_version: i64,
+    pub completed: bool,
+}
+
+/// Create + claim + bind a VibeBus task for a spawn outcome, and on a terminal
+/// outcome record a self-message with the result and complete the task. Shared
+/// by the MCP tool and the CLI one-shot path so both leave durable facts.
+///
+/// `task_description` is stored as the task description; `profile_command` and
+/// `role` form the task title. Bind/message/complete are best-effort (errors
+/// are ignored) so a spawn outcome is never lost because a fact write failed;
+/// create + claim are fatal because without them the linkage is meaningless.
+#[allow(clippy::too_many_arguments)]
+pub fn link_spawn_outcome(
+    bus: &mut Bus,
+    agent: &str,
+    token: &str,
+    outcome: &SpawnOutcome,
+    task_id: Option<&str>,
+    task_description: &str,
+    role: Option<&str>,
+    profile_command: &str,
+) -> Result<SpawnLink, BusError> {
+    let task_id = task_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| outcome.session_id.clone());
+    let title = format!("spawn: {} {}", profile_command, role.unwrap_or("default"));
+    bus.create_task(agent, token, &task_id, &title, Some(task_description), &[])?;
+    let claimed = bus.claim_task(agent, token, &task_id)?;
+    let thread_id = format!("spawn:{}", outcome.session_id);
+    let _ = bus.bind_task_thread(agent, token, &task_id, &thread_id);
+    let mut task_version = claimed.version;
+    let terminal = !matches!(outcome.state, SpawnState::Question | SpawnState::Running);
+    if terminal {
+        let subject = format!("spawn result: {} ({:?})", profile_command, outcome.state);
+        let _ = bus.send_message_idempotent(
+            agent,
+            token,
+            &[agent.to_string()],
+            &subject,
+            &outcome.message,
+            Some(&thread_id),
+            "normal",
+            false,
+            Some(&format!("spawn-result-{}", outcome.session_id)),
+        );
+        if let Ok(completed) =
+            bus.update_task(agent, token, &task_id, task_version, "completed", None)
+        {
+            task_version = completed.version;
+        }
+    }
+    Ok(SpawnLink {
+        task_id,
+        thread_id,
+        task_version,
+        completed: terminal,
+    })
 }
 
 #[cfg(test)]
