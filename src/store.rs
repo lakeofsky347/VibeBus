@@ -2976,7 +2976,6 @@ impl Bus {
     }
 
     /// List all registered skills in this project.
-    /// List all registered skills in this project.
     pub fn list_skills(&self) -> Result<Vec<crate::SkillRecord>> {
         let mut statement = self.conn.prepare(
             "SELECT id, project_id, version, name, description, agents_supported_json, deps_json, created_at
