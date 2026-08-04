@@ -156,7 +156,7 @@ jobs:
       - name: Build and validate macOS package
         run: |
           ./scripts/package-plugin-macos.sh
-          ./scripts/validate-plugin-macos.sh dist/staging/VibeBus-0.10.0-macos-$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)/plugins/vibebus
+          ./scripts/validate-plugin-macos.sh dist/staging/VibeBus-0.11.0-macos-$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)/plugins/vibebus
           cd dist
           shasum -a 256 -c SHA256SUMS-macos-*.txt
 

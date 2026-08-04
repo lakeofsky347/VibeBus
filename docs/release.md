@@ -2,7 +2,7 @@
 
 ## Distribution contract
 
-GitHub Releases are VibeBus's only official distribution channel. The first `v0.10.0` release is source-only: GitHub automatically provides the tagged **Source code (zip)** and **Source code (tar.gz)** archives, while the workflow uploads only source-verification evidence. Stable releases use SemVer tags in the exact form `vX.Y.Z`. The workflow checks that the tag resolves to the checked-out commit and that the commit is reachable from `main`; it refuses release-candidate and branch names. A pull-request artifact, local package, container image, or manually copied file is never a release substitute.
+GitHub Releases are VibeBus's only official distribution channel. The current release contract is source-only: GitHub automatically provides the tagged **Source code (zip)** and **Source code (tar.gz)** archives, while the workflow uploads only source-verification evidence. Stable releases use SemVer tags in the exact form `vX.Y.Z`. The workflow checks that the tag resolves to the checked-out commit and that the commit is reachable from `main`; it refuses release-candidate and branch names. A pull-request artifact, local package, container image, or manually copied file is never a release substitute.
 
 Release candidates are intentionally disabled until the project adopts a separate, testable prerelease contract. Do not create `vX.Y.Z-rc.N` expecting the stable workflow to publish it.
 

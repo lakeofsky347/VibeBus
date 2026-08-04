@@ -1,6 +1,6 @@
 # macOS development and local delivery
 
-VibeBus 0.10 has a native macOS path for CLI, stdio MCP, macOS Keychain credentials, SessionStart/PostToolUse/Stop Hooks, and Codex plugin packaging. The accepted local host is Apple Silicon (`arm64`); the packaging script also names native Intel builds as `x64`, but Intel has not yet received the same live acceptance.
+VibeBus has a native macOS path for CLI, stdio MCP, macOS Keychain credentials, SessionStart/PostToolUse/Stop Hooks, and Codex plugin packaging. The accepted local host is Apple Silicon (`arm64`); the packaging script also names native Intel builds as `x64`, but Intel has not yet received the same live acceptance.
 
 ## Prerequisites
 
@@ -26,7 +26,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 ./scripts/test-macos-keychain.sh
 ./scripts/package-plugin-macos.sh
 ./scripts/validate-plugin-macos.sh \
-  ./dist/staging/VibeBus-0.10.0-macos-arm64/plugins/vibebus
+  ./dist/staging/VibeBus-0.11.0-macos-arm64/plugins/vibebus
 (cd dist && shasum -a 256 -c SHA256SUMS-macos-arm64.txt)
 ```
 
@@ -56,7 +56,7 @@ Build first, then register the staged marketplace rather than the Windows-orient
 
 ```sh
 codex plugin marketplace add \
-  "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+  "$PWD/dist/staging/VibeBus-0.11.0-macos-arm64"
 codex plugin add vibebus@vibebus-local
 ```
 

@@ -30,7 +30,7 @@ Mutating or private reads require an Agent identity. CLI bearer resolution is `-
 
 The project operator is a separate procedural capability for destructive maintenance, not an Agent role. Its database row contains only a SHA-256 digest and generation; the secret is stored under `VibeBusOperator:<project-id>`, which cannot collide with `VibeBus:<project-id>:<agent>`. Operator mutation commands first require a real terminal and an exact typed confirmation. They are absent from MCP. Successful vault storage redacts the secret. If a post-initialize or post-rotate vault write fails, the interactive response returns the only usable secret plus `credentialStorageError`; after securing it, the maintainer repairs the entry with `operator restore-credential`, which reads the secret without echo. `operator status` reports DB/vault generation agreement as `ready` without exposing secret material. `operator delete-credential` requires the exact `delete:<project-id>` confirmation and removes only the OS vault entry; the database digest and generation remain configured so deletion cannot masquerade as revocation or project reset. Without another secured copy of the current secret, deletion is intentionally irreversible for that database.
 
-## API injection (phase 1 + 2)
+## API injection
 
 API providers let the plugin inject a Base URL, API key, and optional model into spawned agent CLIs (`codex`, `claude`, `gemini`, ...) without editing any user-global configuration. The design mirrors cc-switch's provider model but keeps secrets out of files: the provider metadata lives in `.vibebus/api/api.json` (project-scoped), and the API key lives only in the OS credential vault under `VibeBusApi:<project-id>:<provider>`.
 
@@ -38,7 +38,7 @@ API providers let the plugin inject a Base URL, API key, and optional model into
 | --- | --- | --- |
 | Add provider (+ store key in vault) | `api provider add --name X --base-url URL --format anthropic\|openai-chat\|openai-responses\|gemini [--model M] [--key K]` | — |
 | List providers | `api provider list` | `vibebus_api_provider_list` |
-| Activate provider | `api use --name X [--force]` | `vibebus_api_use` |
+| Activate provider | `api use --name X [--force] [--write-config]` | `vibebus_api_use` |
 | Deactivate | `api unuse` | `vibebus_api_unuse` |
 | Restore backup | `api restore --n N` (1 = newest, kept 10) | — |
 | Local health check | `api health --name X` | `vibebus_api_health` |
@@ -55,10 +55,36 @@ Injection semantics:
 - **Key never on disk**: `api.json`, CLI responses, and logs report variable *names* and key *presence*, never the key value. The env export files substitute the key as `$(vibebus api key get --name X)` (PowerShell: `(& vibebus api key get --name X)[0]`) so the secret is resolved from the vault at source time.
 - **Conflict guard**: `api use` fails with `conflict` if the process environment already sets one of the injected vars to a different value; `--force` overrides.
 - **Write-ahead backups**: every `use`/`unuse` snapshots the config under `.vibebus/api/backups/` (newest 10); `restore --n 1` reverts to the previous state. `unuse` keeps the key in the vault and removes the env export files; `restore` rewrites them to match the restored active provider.
+- **Opt-in config-file injection**: `api use --write-config` additionally deep-merges the injected env into Claude Code's project-level `.claude/settings.json` (backing up the original under `.vibebus/api/config-backups/`); `unuse` reverts it. Off by default so VibeBus never edits user-global configuration unless asked.
 - **Base URL normalization**: trailing slashes are stripped and only `http(s)` is accepted, avoiding the `//` path-join failure seen with manual configuration.
 - **Local health + optional network probe**: `api health` validates config + vault key presence + URL shape without network traffic; `--check-network` additionally opens a TCP connection to the Base URL host (std `TcpStream`, 5s connect timeout, no HTTP client dependency).
 - **Audit trail**: `api use`/`api unuse`/`api restore` append `api.provider_activated` / `api.provider_deactivated` / `api.config_restored` events to the bus (payload carries variable names only). MCP tools do the same through the shared handler.
 - **`api run`**: replaces the current process with `<cli> [args...]` under the active provider's env (key resolved from the vault at launch). Fails with a validation error when no provider is active.
+
+## Agent spawn
+
+The spawn bridge derives an external agent CLI as a tracked, bounded session.
+
+| Capability | CLI | MCP |
+| --- | --- | --- |
+| Spawn an agent session | `agent spawn --profile P --agent A [--api X] --task "..." [--role R] [--timeout-secs N]` | `vibebus_agent_spawn` |
+| Reply to a clarification question | — (MCP only) | `vibebus_agent_reply` |
+| Terminate a session | — (MCP only) | `vibebus_agent_kill` |
+| List active sessions | — (MCP only) | `vibebus_agent_status` |
+
+Profiles come from built-in defaults (`codex`, `claude`, `gemini`, `demo`) overlaid by `.vibebus/agents.json` at the project root. A spawn creates a task, binds the session thread, and runs the child; on a terminal outcome (`[RESULT]` marker) the bridge records a self-message and completes the task, while `[QUESTION]` keeps the session alive for a later `vibebus_agent_reply` and `[ERROR]`/timeout terminates it. Spawned children receive the caller's environment plus any API-provider injection and a trailing `CI=1`; session output is summarized to facts, never full transcripts.
+
+## Capability registry
+
+| Capability | CLI | MCP |
+| --- | --- | --- |
+| Register or update a skill from SKILL.md | `skill register --id <id> --name <name> --file <path> [--agents a,b] [--deps d1,d2]` | — |
+| List registered skills | `skill list` | `vibebus_skill_list` |
+| Install a skill for an agent CLI | `skill install --id <id> --agent <cli>` | `vibebus_skill_install` |
+| List registered plugins | `plugin list` | `vibebus_plugin_list` |
+| Sync providers from `api.json` into the bus | `api sync-providers` | — |
+
+The registry (`providers`, `skills`, `plugins`) is project-scoped and declarative: `skill register` stores id/version/name/agents-supported/dependencies and content; `skill install` copies the SKILL.md into the target agent's skill directory (for example `.claude/skills/`); `api sync-providers` upserts `.vibebus/api.json` providers. Registrations are queryable facts, so one provider or skill definition is reusable across every supported coding agent without duplicating secrets.
 
 ## Messages
 

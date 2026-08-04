@@ -21,7 +21,7 @@ Run the repository-owned drill after building the release binary:
 The script uses only a random directory below the system temporary directory. It creates one Agent and one task, takes an online backup, creates a second task after that recovery point, and imports the marker plus backup into a separate root and data home. Acceptance requires:
 
 - the imported file hash to equal the backup SHA-256;
-- `doctor.ok=true`, schema 11, WAL, and foreign keys enabled;
+- `doctor.ok=true`, schema 13, WAL, and foreign keys enabled;
 - the restored Agent credential digest to accept the original in-process token;
 - exactly the pre-backup task to exist in the restored project;
 - the post-backup task to remain absent;
