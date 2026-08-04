@@ -80,6 +80,9 @@ The serialized secret pair includes a format version and token generation. On Wi
 | `retention_runs` | Retry-safe immutable cleanup reports keyed by confirmation plan |
 | `operator_credentials` | Project operator secret digest, generation, and rotation timestamps |
 | `retention_approvals` | Short-lived plan approvals, generation binding, and atomic consumption audit |
+| `providers` | API providers synced from `.vibebus/api.json` (metadata only; keys stay in the OS vault) |
+| `skills` | Registered SKILL.md capabilities with version, supported agents, and dependencies |
+| `plugins` | Registered adapter packages with MCP servers, hooks, and referenced skills |
 | `schema_migrations` | Applied database schema versions |
 
 ## Invariants
@@ -185,6 +188,18 @@ The Codex adapter (`plugins/vibebus/`) is the canonical plugin package. Sibling 
 
 The MCP process starts from the installed plugin directory. For that reason every MCP tool accepts a `root` argument; the Skill requires an absolute project root on every call. Hook commands receive `PLUGIN_ROOT` and writable `PLUGIN_DATA`, require Codex trust review, and run at the session working directory. PostToolUse resolves only an active task/thread binding (matching the raw session id or any supported `{tool}:{session_id}` form), reliable exit metadata, commit identity/subject/path names, and a hashed working state; Stop calls the bounded proposal read model and writes it under plugin data. Neither Hook reads the unstable transcript format, and Stop emits no continuation or automatic message mutation.
 
+## Agent spawn bridge
+
+`vibebus agent spawn` (and the `vibebus_agent_spawn`/`vibebus_agent_reply`/`vibebus_agent_kill`/`vibebus_agent_status` MCP tools) derives an external agent CLI (`codex`, `claude`, `gemini`, a custom profile, or the built-in `demo` script profile) as a tracked, bounded session. The bridge does not hold business state: it creates a VibeBus task, binds the spawn session thread, runs the child over a line-framed stdin/stdout protocol, and on a terminal outcome records a self-message and completes the task. Clarification questions keep the session alive for a later `reply`. Sessions are summarized back to facts (never full transcripts), matching the no-transcript non-goal. Spawned children inherit the injecting Agent's environment plus any configured API-provider environment (see below), and `CI=1` is appended last so interactive prompts cannot hang automation.
+
+## API provider injection
+
+Project-scoped API providers let the plugin inject a Base URL, API key, and optional model into spawned agent CLIs without editing user-global configuration. Provider metadata lives in `.vibebus/api.json`; the API key lives only in the OS credential vault under `VibeBusApi:<project-id>:<provider>`. `api use`/`api unuse`/`api restore` write ahead-of-time backups (newest 10), generate env export files (`env.sh`/`env.ps1`) that resolve the key from the vault at source time, and append `api.provider_activated`/`api.provider_deactivated`/`api.config_restored` audit events with variable names only. `api health` validates configuration, vault-key presence, and URL shape locally, with an optional TCP network probe. Injection is zero by default and never puts a key on disk, in logs, or in MCP responses.
+
+## Capability registry
+
+The `providers`, `skills`, and `plugins` tables form the project-scoped capability registry. `api sync-providers` upserts `.vibebus/api.json` providers into the bus; `skill register` stores a SKILL.md with version, supported agents, and dependency declarations; `skill install --agent <cli>` copies it into the matching agent's skill directory; `plugin list`/`register` describe adapter packages. The registry is declarative: registration is a queryable, auditable fact, and the same provider or skill can be reused across any supported coding agent without duplicating secrets or files.
+
 ## Release supply chain
 
 Rust 1.97.1 and Cargo.lock define the native build inputs. A repository-owned PowerShell path packages Windows, validates the manifest/MCP/Hook/Skill contract, and uses pinned WiX 4.0.6 to produce a per-user x64 MSI. The macOS path builds a native host-architecture Mach-O, applies an ad-hoc local signature, stages a macOS MCP payload, validates it, and emits portable/plugin archives plus checksums and a manifest. Developer ID signing, hardened runtime, notarization, and downloaded-artifact Gatekeeper acceptance remain explicit production gates.
@@ -193,7 +208,7 @@ Pull-request CI has read-only repository permission and produces explicitly unsi
 
 Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z` tag must match Cargo and plugin versions. SignTool signs and verifies the binary before staging and the MSI after construction using SHA-256 and an RFC 3161 timestamp. Checksums are calculated only after signing. A job-scoped `GITHUB_TOKEN` with `contents: write` publishes assets; signing material remains only in repository or protected-environment Secrets.
 
-## Deliberate non-goals for 0.10
+## Deliberate non-goals
 
 - sharing entire chat transcripts;
 - injecting messages into an already-running model generation;

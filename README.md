@@ -20,7 +20,7 @@ macOS:
 
 ```sh
 ./scripts/package-plugin-macos.sh
-codex plugin marketplace add "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+codex plugin marketplace add "$PWD/dist/staging/VibeBus-0.11.0-macos-arm64"
 codex plugin add vibebus@vibebus-local
 ```
 
@@ -42,7 +42,7 @@ GitHub Releases are the only official distribution channel. A stable release is 
 - minor releases add backwards-compatible capabilities;
 - major releases may introduce incompatible changes and include migration guidance.
 
-The first `v0.10.0` stable workflow is source-only. GitHub automatically provides the tagged Source code ZIP and tarball; the workflow uploads exactly `SHA256SUMS.txt`, a normalized CycloneDX SBOM, `supply-chain-evidence.json`, and `source-release-manifest.json`. The checksum file covers the other three uploaded evidence files. There are no MSI, portable ZIP, Codex plugin ZIP, signed executable, or installer assets in this first release. macOS, Windows, and Linux remain source and CI-supported paths until a later, separately reviewed binary-distribution contract is adopted. Release candidates are not currently published: tags such as `vX.Y.Z-rc.N` fail closed rather than being treated as stable releases.
+Stable releases are currently source-only. GitHub automatically provides the tagged Source code ZIP and tarball; the workflow uploads exactly `SHA256SUMS.txt`, a normalized CycloneDX SBOM, `supply-chain-evidence.json`, and `source-release-manifest.json`. The checksum file covers the other three uploaded evidence files. There are no MSI, portable ZIP, Codex plugin ZIP, signed executable, or installer assets in this first release. macOS, Windows, and Linux remain source and CI-supported paths until a later, separately reviewed binary-distribution contract is adopted. Release candidates are not currently published: tags such as `vX.Y.Z-rc.N` fail closed rather than being treated as stable releases.
 
 To verify a downloaded stable release, download the GitHub-generated source archive and the four uploaded evidence files from the same GitHub Release. Check that the manifest's tag and source revision identify the source archive, then verify `SHA256SUMS.txt` against its three listed evidence files. This source-only release has no installation, signature, upgrade, or binary rollback claim.
 
@@ -81,6 +81,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations, [SECURITY.
 
 - [Architecture](docs/architecture.md)
 - [CLI and MCP protocol](docs/protocol.md)
+- [Multi-tool adapters](docs/multi-tool-adapters.md)
+- [Design research and decisions](docs/design-research.md)
+- [Backup, export, and restore](docs/backup-restore.md)
 - [Release engineering](docs/release.md)
 - [macOS development](docs/macos.md)
 - [Container development](docs/container.md)

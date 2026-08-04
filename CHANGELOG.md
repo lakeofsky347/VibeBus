@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-- Revised the first `v0.10.0` GitHub Release to a source-only contract: GitHub provides the tagged source archives automatically, and the workflow uploads only checksums, normalized SBOM, supply-chain evidence, and a source-release manifest. Windows signing, installers, binary ZIPs, and self-built source ZIPs are deferred to a separate future distribution contract.
+- No unreleased changes yet.
+
+## 0.11.0 - 2026-08-04
+
+- Revised the first GitHub Release to a source-only contract: GitHub provides the tagged source archives automatically, and the workflow uploads only checksums, normalized SBOM, supply-chain evidence, and a source-release manifest. Windows signing, installers, binary ZIPs, and self-built source ZIPs are deferred to a separate future distribution contract.
 - Established the public open-source release contract: GitHub Releases are the official distribution channel, stable SemVer tags must resolve to commits reachable from `main`, and prerelease publishing remains disabled until it has its own verified workflow.
 - Added source archives, release-evidence manifest fields, public contribution and conduct guidance, Issue/PR templates, Dependabot updates, download verification instructions, and explicit first-install, upgrade, and rollback rules.
 - Added native macOS Security.framework Keychain storage for Agent and Operator credentials, including redacted registration/rotation, vault fallback, status, explicit deletion, and an isolated real-Keychain acceptance fixture.
@@ -11,6 +15,12 @@
 - Added a CLI-only `maintenance compact --backup <new-path>` operation with exact real-terminal confirmation, vault-backed Operator authentication, fail-fast exclusive SQLite locking, and zero-active-state enforcement.
 - Required a new verified backup plus conservative free-space validation before `VACUUM`, restored and checkpointed WAL afterward, and returned bounded before/after hashes, page counts, reclaimed bytes, and integrity evidence.
 - Added `compaction_started` and `compaction_completed` audit events plus disposable-project coverage for success, active-state refusal, busy-database refusal, and redirected-input no-mutation behavior. No compaction tool was added to MCP.
+- Added multi-tool adapter packages for Claude Code, Cursor, OpenCode, and Antigravity with a shared tool-agnostic `vibebus-coordination` Skill and a universal lifecycle-Hook protocol.
+- Added an Agent spawn bridge (`vibebus agent spawn|reply|kill|status` and MCP tools) that derives external agent CLIs as tracked sessions with task/thread linkage and fact-bus result capture.
+- Added API provider injection: project-scoped `.vibebus/api.json` provider metadata with OS-vault keys, `api provider add|list|use|unuse|restore|health`, env export files, `api run`, write-ahead backups, conflict detection, and audit events.
+- Added the capability registry: `providers`, `skills`, and `plugins` tables with `skill register|list|install`, `plugin list`, and `api sync-providers` for cross-agent capability reuse.
+- Extended the database schema to version 13 for the capability registry and spawn coordination state.
+- Expanded CLI, MCP, spawn, injection, registry, migration, and cross-tool acceptance coverage.
 
 ## 0.10.0 - 2026-07-18
 

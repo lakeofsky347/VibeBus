@@ -1,7 +1,8 @@
 # VibeBus 跨 Agent 协作架构设计
 
-> 状态：设计提案 · 基于 codex-plugin-cc、pal-mcp-server、agent-link-mcp 三个开源项目的架构模式提炼
+> 状态：设计提案（部分已落地）· 基于 codex-plugin-cc、pal-mcp-server、agent-link-mcp 三个开源项目的架构模式提炼
 > 目标：在 VibeBus 现有「本地事实总线」之上，增加单一 Agent 多任务栏、跨 Agent 协作、统一 TUI 三项能力
+> 落地进度：生成层（Agent Spawn Bridge，第 4.3 节）已在 0.11.0 实现；TUI（ratatui）与任务栏编排仍为未来阶段
 
 ## 1. 设计目标与参考模式提炼
 
