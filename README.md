@@ -2,29 +2,57 @@
 
 ![VibeBus logo](plugins/vibebus/assets/vibebus-logo-light.png)
 
-VibeBus is a local, structured fact bus for independent coding-agent tasks. Tasks keep their own conversations and worktrees while sharing only explicit messages, acknowledgements, task state, decisions, path reservations, artifacts, and bounded test or Git facts through a project-scoped SQLite database.
+VibeBus is a local, structured **fact bus** for independent coding-agent tasks. Tasks keep their own conversations and worktrees while sharing only explicit facts — messages, acknowledgements, task state, decisions, path reservations, artifacts, and bounded Git or test results — through a project-scoped SQLite database.
 
-VibeBus provides a Rust CLI, stdio MCP server, lifecycle Hooks, and per-tool adapter packages for Codex, Claude Code, Cursor, OpenCode, and Antigravity. It runs natively on Windows and macOS; Linux is supported through the `amd64` container workflow. See [Multi-tool adapters](docs/multi-tool-adapters.md) for how each agent is wired in.
+No daemon, no cloud, no transcript sharing. One small Rust binary, one database per project, and 58 MCP tools your agents can call directly.
 
-## Install and run from source
+## Why VibeBus
 
-Windows:
+Coding agents are powerful but isolated: each Codex, Claude Code, Cursor, OpenCode, or Antigravity task owns its own context, and coordinating them means either copying entire conversations (context pollution, privacy loss) or inventing ad-hoc file formats (no atomicity, no audit trail).
+
+VibeBus sits between them as the **durable source of coordination truth**:
+
+- **Atomic task claims** — exactly one agent can win a competing task.
+- **Directed inboxes with ACK/close** — facts go only to named recipients, with receipts.
+- **Path reservations** — agents declare which files they will touch, and overlap conflicts.
+- **Replay-safe event subscriptions** — at-least-once delivery with idempotent ACK.
+- **Operator-approved destructive maintenance** — retention and compaction require a human at a real terminal.
+
+## Features
+
+- **Rust CLI + stdio MCP server** (`vibebus mcp`, 58 `vibebus_*` tools) — one binary, one domain model.
+- **Per-tool adapters** for Codex, Claude Code, Cursor, OpenCode, and Antigravity — same bus, same skill, per-agent wiring. See [Multi-tool adapters](docs/multi-tool-adapters.md).
+- **OS-vault credentials** — Windows Credential Manager and macOS Keychain; SQLite stores digests only.
+- **Strict responsibility policy** — `.vibebus/responsibility.json` maps roles to validated project-relative paths, with task-scoped expiring overrides.
+- **Immutable facts** — confirmed decisions, Git commit facts, and test-result facts replay exactly and conflict on drift.
+- **Agent spawn bridge** — derive `codex`/`claude`/`gemini`/custom CLIs as tracked sessions with bidirectional reply.
+- **API provider injection** — project-scoped provider metadata in `.vibebus/api.json`, keys in the OS vault, injected into spawned agents. Zero by default.
+- **Capability registry** — `providers`, `skills`, and `plugins` tables for cross-agent capability reuse.
+- **Bounded context sync** — deterministic, budgeted, paginated projections per task scope.
+- **Lifecycle Hooks** — SessionStart / PostToolUse / Stop capture bounded Git/test facts automatically on Windows and macOS.
+- **Native Windows, macOS, and Linux** — Windows and macOS natively; Linux through the `amd64` container workflow.
+
+## Quick start
+
+### 1. Install
+
+From a release: download the source archive and verify it per [docs/release.md](docs/release.md), then build with Rust 1.97.1. Or install the Codex plugin from this repository:
 
 ```powershell
+# Windows
 ./scripts/package-plugin.ps1
 codex plugin marketplace add .
 codex plugin add vibebus@vibebus-local
 ```
 
-macOS:
-
 ```sh
+# macOS (Apple Silicon)
 ./scripts/package-plugin-macos.sh
 codex plugin marketplace add "$PWD/dist/staging/VibeBus-0.11.0-macos-arm64"
 codex plugin add vibebus@vibebus-local
 ```
 
-After installing or changing Hooks, start a new Codex task and review the Hook changes. Initialize a project deliberately, then register an Agent with an explicit responsibility role:
+### 2. Initialize a project
 
 ```sh
 vibebus init --root /path/to/project --name "My Project"
@@ -32,7 +60,66 @@ vibebus register --root /path/to/project --name implementation --role implementa
 vibebus credential status --root /path/to/project --agent implementation
 ```
 
-Before editing, claim a ready task, inspect the responsibility policy, reserve only the exact project-relative paths, and obtain a task-scoped expiring override for paths outside the role. Process required messages as read → ACK → close and use replay-safe subscription peek/ACK for event delivery.
+`register` returns a bearer token and a single-use recovery key in plaintext **once**. With `--store-credentials` they go into your OS vault and the response is redacted (`secretsRedacted=true`).
+
+### 3. Coordinate tasks
+
+Each agent task loads the `vibebus-coordination` Skill and then:
+
+1. `vibebus_status` / `vibebus_handoff_snapshot` — inspect project state and any pending handoff.
+2. `vibebus_task_claim` a ready task; treat a claim conflict as proof another task won.
+3. `vibebus_reserve` the exact project-relative paths before editing.
+4. `vibebus_inbox` → act → `vibebus_ack` → `vibebus_close` for required messages.
+5. `vibebus_context_sync` for the deterministic task-scoped projection.
+6. `vibebus_handoff_send` with summary, decisions, and artifact references when handing off.
+
+## Core concepts
+
+| Concept | Meaning |
+| --- | --- |
+| **Agent** | A named identity with bearer/recovery credentials, scoped to one project. |
+| **Task** | An atomic unit of work: `pending → ready → claimed → working → ... → completed/abandoned`. |
+| **Message** | A directed structured fact to named recipients, with read/ACK/close receipts. |
+| **Reservation** | TTL-backed intent on a project-relative path; overlap between different agents conflicts. |
+| **Artifact** | A published file reference with SHA-256, type, summary, and JSON metadata. |
+| **Decision** | An immutable confirmed fact with a stable semantic key. |
+| **Subscription** | An agent-owned event cursor with replay-safe peek/ACK delivery. |
+| **Handoff** | A high-priority, ACK-required transfer with summary, decisions, artifacts, and next actions. |
+| **Operator** | A separate human-only capability for retention approval and offline compaction. |
+
+## CLI and MCP surface
+
+One binary, two interfaces with identical domain models. CLI responses are JSON; MCP tools return formatted JSON as text content. The full capability tables (identity, messages, tasks, threads, reservations, artifacts, decisions, facts, context, events, subscriptions, retention, compaction, handoffs, spawn, API injection, capability registry) are in [docs/protocol.md](docs/protocol.md).
+
+```sh
+vibebus init | register | agents | agent recover | credential status
+vibebus send | inbox | read | ack | close
+vibebus task create|claim|update|complete|show|list
+vibebus thread bind|unbind|list
+vibebus reserve add|renew|release|list
+vibebus artifact publish|list
+vibebus decision confirm | context sync
+vibebus fact git-commit | fact test-result
+vibebus event list | subscription create|list|poll|peek|ack
+vibebus retention plan|apply|status
+vibebus maintenance compact --backup <path>
+vibebus handoff send|snapshot|propose
+vibebus agent spawn | api provider|use|unuse|restore|health|run|key
+vibebus skill register|list|install | plugin list
+vibebus status | doctor | backup | mcp
+```
+
+MCP tools require the absolute project root as `root` on every call when launched from a plugin. See [docs/protocol.md](docs/protocol.md) for the MCP tool names.
+
+## Repository layout
+
+```text
+src/              Rust CLI + MCP server (store, mcp, spawn, inject, hooks, vault, policy, ...)
+plugins/          Per-tool adapter packages (vibebus/Codex, claude-code, cursor, opencode, antigravity)
+scripts/          Packaging, validation, and acceptance scripts (PowerShell + shell + Python)
+docs/             Architecture, protocol, release, platform, and operating documentation
+tests/            Integration test suites (CLI workflows, core workflows, MCP protocol, vault)
+```
 
 ## Releases
 
@@ -76,6 +163,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations, [SECURITY.
 - The Operator lifecycle and destructive maintenance require a real interactive terminal; those actions are intentionally unavailable through MCP.
 - VibeBus records durable facts but does not wake, interrupt, merge, or otherwise control native Codex tasks.
 - Replay-safe subscriptions are at-least-once deliveries. Consumers must make side effects idempotent.
+- API provider keys live only in the OS vault; `api.json`, logs, and MCP responses carry variable names and presence, never key values.
 
 ## Documentation
 

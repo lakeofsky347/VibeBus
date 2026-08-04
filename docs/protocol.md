@@ -38,7 +38,7 @@ API providers let the plugin inject a Base URL, API key, and optional model into
 | --- | --- | --- |
 | Add provider (+ store key in vault) | `api provider add --name X --base-url URL --format anthropic\|openai-chat\|openai-responses\|gemini [--model M] [--key K]` | — |
 | List providers | `api provider list` | `vibebus_api_provider_list` |
-| Activate provider | `api use --name X [--force]` | `vibebus_api_use` |
+| Activate provider | `api use --name X [--force] [--write-config]` | `vibebus_api_use` |
 | Deactivate | `api unuse` | `vibebus_api_unuse` |
 | Restore backup | `api restore --n N` (1 = newest, kept 10) | — |
 | Local health check | `api health --name X` | `vibebus_api_health` |
@@ -55,6 +55,7 @@ Injection semantics:
 - **Key never on disk**: `api.json`, CLI responses, and logs report variable *names* and key *presence*, never the key value. The env export files substitute the key as `$(vibebus api key get --name X)` (PowerShell: `(& vibebus api key get --name X)[0]`) so the secret is resolved from the vault at source time.
 - **Conflict guard**: `api use` fails with `conflict` if the process environment already sets one of the injected vars to a different value; `--force` overrides.
 - **Write-ahead backups**: every `use`/`unuse` snapshots the config under `.vibebus/api/backups/` (newest 10); `restore --n 1` reverts to the previous state. `unuse` keeps the key in the vault and removes the env export files; `restore` rewrites them to match the restored active provider.
+- **Opt-in config-file injection**: `api use --write-config` additionally deep-merges the injected env into Claude Code's project-level `.claude/settings.json` (backing up the original under `.vibebus/api/config-backups/`); `unuse` reverts it. Off by default so VibeBus never edits user-global configuration unless asked.
 - **Base URL normalization**: trailing slashes are stripped and only `http(s)` is accepted, avoiding the `//` path-join failure seen with manual configuration.
 - **Local health + optional network probe**: `api health` validates config + vault key presence + URL shape without network traffic; `--check-network` additionally opens a TCP connection to the Base URL host (std `TcpStream`, 5s connect timeout, no HTTP client dependency).
 - **Audit trail**: `api use`/`api unuse`/`api restore` append `api.provider_activated` / `api.provider_deactivated` / `api.config_restored` events to the bus (payload carries variable names only). MCP tools do the same through the shared handler.
@@ -78,9 +79,9 @@ Profiles come from built-in defaults (`codex`, `claude`, `gemini`, `demo`) overl
 | Capability | CLI | MCP |
 | --- | --- | --- |
 | Register or update a skill from SKILL.md | `skill register --id <id> --name <name> --file <path> [--agents a,b] [--deps d1,d2]` | — |
-| List registered skills | `skill list` | — |
-| Install a skill for an agent CLI | `skill install --id <id> --agent <cli>` | — |
-| List registered plugins | `plugin list` | — |
+| List registered skills | `skill list` | `vibebus_skill_list` |
+| Install a skill for an agent CLI | `skill install --id <id> --agent <cli>` | `vibebus_skill_install` |
+| List registered plugins | `plugin list` | `vibebus_plugin_list` |
 | Sync providers from `api.json` into the bus | `api sync-providers` | — |
 
 The registry (`providers`, `skills`, `plugins`) is project-scoped and declarative: `skill register` stores id/version/name/agents-supported/dependencies and content; `skill install` copies the SKILL.md into the target agent's skill directory (for example `.claude/skills/`); `api sync-providers` upserts `.vibebus/api.json` providers. Registrations are queryable facts, so one provider or skill definition is reusable across every supported coding agent without duplicating secrets.

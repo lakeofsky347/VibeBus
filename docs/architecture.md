@@ -127,6 +127,10 @@ The serialized secret pair includes a format version and token generation. On Wi
 38. Stop generates a bounded proposal only. Sending a handoff remains an explicit authenticated action.
 39. Offline compaction is CLI-only, starts before normal `Bus::open`, requires `compact:<project-id>` plus the vault-backed Operator secret, and refuses non-terminal tasks, active bindings, active reservations, a busy SQLite boundary, an existing backup path, an unverified backup, or insufficient database-volume free space.
 40. Compaction creates and verifies a consistent backup before `VACUUM`, retains an exclusive lock while switching WAL to DELETE, restores and checkpoints WAL afterward, verifies integrity/foreign keys/schema, and appends bounded start/completion audit events without exposing an Operator secret.
+41. A spawn session is bounded and stateless in the bridge: the child runs under a 1,800-second default timeout, its output is summarized (at most 4,000 characters) and classified by `[RESULT]` / `[QUESTION]` / `[ERROR]` markers, and every durable outcome is written back to the bus as a task, thread binding, and message.
+42. API provider injection is zero by default: with no provider configured, spawn environment is byte-identical to baseline; provider env never overrides an explicit profile env; and `CI=1` is always appended last. Provider metadata may appear on disk, but the API key value never does — it lives only in the OS vault and is resolved at process launch.
+43. API activation is conflict-checked and write-ahead: `api use` refuses to overwrite a conflicting system-environment variable without `--force`, snapshots the prior configuration before mutation (newest 10 backups), and records `api.provider_activated` / `api.provider_deactivated` / `api.config_restored` audit events whose payloads carry variable names only.
+44. The capability registry is project-scoped and declarative: `providers`, `skills`, and `plugins` are unique per project, registration is a queryable fact, and `skill install` writes only into the target agent CLI's skill directory without modifying user-global configuration.
 
 ## Recovery and retry boundaries
 
@@ -198,7 +202,7 @@ Project-scoped API providers let the plugin inject a Base URL, API key, and opti
 
 ## Capability registry
 
-The `providers`, `skills`, and `plugins` tables form the project-scoped capability registry. `api sync-providers` upserts `.vibebus/api.json` providers into the bus; `skill register` stores a SKILL.md with version, supported agents, and dependency declarations; `skill install --agent <cli>` copies it into the matching agent's skill directory; `plugin list`/`register` describe adapter packages. The registry is declarative: registration is a queryable, auditable fact, and the same provider or skill can be reused across any supported coding agent without duplicating secrets or files.
+The `providers`, `skills`, and `plugins` tables form the project-scoped capability registry. `api sync-providers` upserts `.vibebus/api.json` providers into the bus; `skill register` stores a SKILL.md with version, supported agents, and dependency declarations; `skill install --agent <cli>` copies it into the matching agent's skill directory; `plugin list` describes registered adapter packages. The registry is declarative: registration is a queryable, auditable fact, and the same provider or skill can be reused across any supported coding agent without duplicating secrets or files.
 
 ## Release supply chain
 
@@ -222,4 +226,6 @@ Production release automation is tag-gated and fail-closed. An existing `vX.Y.Z`
 - hardware-backed or remote multi-party operator approval; the current gate is a local human-presence and accidental-automation boundary;
 - automatic creation of release tags or unsigned production releases;
 - installer custom actions that silently mutate Codex plugin configuration;
-- bit-for-bit reproducible MSI/ZIP output or private-repository attestations on an ineligible GitHub plan.
+- bit-for-bit reproducible MSI/ZIP output or private-repository attestations on an ineligible GitHub plan;
+- writing API keys or recovery secrets into repository files, logs, or generated env exports (injection resolves keys from the vault at launch only);
+- editing user-global agent configuration (`.claude/settings.json`, `~/.codex/...`) without an explicit opt-in such as `--write-config`.
