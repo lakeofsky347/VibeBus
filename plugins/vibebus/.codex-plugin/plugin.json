@@ -1,6 +1,6 @@
 {
   "name": "vibebus",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Project-scoped coordination for independent coding-agent tasks (Codex adapter).",
   "author": {
     "name": "VibeBus Contributors",
