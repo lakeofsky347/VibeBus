@@ -1248,7 +1248,7 @@ fn doctor_reports_healthy_database_and_backup_is_consistent() {
     assert_eq!(doctor.integrity, "ok");
     assert_eq!(doctor.journal_mode.to_ascii_lowercase(), "wal");
     assert!(doctor.foreign_keys_enabled);
-    assert_eq!(doctor.schema_version, 11);
+    assert_eq!(doctor.schema_version, 13);
 
     let destination = harness.data.path().join("backups").join("snapshot.db");
     let backup = bus.backup_to(&destination).unwrap();
@@ -1303,7 +1303,7 @@ fn offline_compaction_is_backup_first_verified_and_reclaims_disposable_space() {
     assert_eq!(report.journal_mode.to_ascii_lowercase(), "wal");
     assert_eq!(report.integrity, "ok");
     assert_eq!(report.foreign_key_violations, 0);
-    assert_eq!(report.schema_version, 11);
+    assert_eq!(report.schema_version, 13);
     assert_eq!(report.operator_generation, 1);
     assert_eq!(report.backup.path, backup_path.to_string_lossy());
     assert_eq!(report.backup.sha256.len(), 64);
@@ -1586,7 +1586,7 @@ fn legacy_agent_schema_is_migrated_without_recreating_the_database() {
             .unwrap();
         assert!(exists, "migration must create {table}");
     }
-    assert_eq!(bus.doctor().unwrap().schema_version, 11);
+    assert_eq!(bus.doctor().unwrap().schema_version, 13);
 }
 
 #[test]
@@ -2500,4 +2500,77 @@ fn structured_handoff_is_retry_safe_acknowledged_and_visible_in_snapshot() {
         .handoff_snapshot("handoff-receiver", &receiver.token, 0)
         .unwrap();
     assert!(after_ack.unread_messages.is_empty());
+}
+
+#[test]
+fn audit_events_record_api_lifecycle_without_agent_identity() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+
+    // API lifecycle events are appended without an agent identity (audit log).
+    let seq1 = bus
+        .record_audit_event(
+            "api.provider_activated",
+            "api_provider",
+            "voltapi",
+            serde_json::json!({
+                "provider": "voltapi",
+                "injectedVars": ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
+            }),
+        )
+        .expect("record activation");
+    assert!(seq1 > 0);
+
+    let seq2 = bus
+        .record_audit_event(
+            "api.provider_deactivated",
+            "api_provider",
+            "voltapi",
+            serde_json::json!({"provider": "voltapi"}),
+        )
+        .expect("record deactivation");
+    assert!(seq2 > seq1);
+
+    // The events are visible through the standard list_events query filtered
+    // by type; payload never contains a key value.
+    let events = bus
+        .list_events(0, 10, &["api.provider_activated".to_string()])
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "api.provider_activated");
+    let payload = events[0].payload.as_object().expect("payload object");
+    assert!(payload.contains_key("injectedVars"));
+    assert!(!serde_json::to_string(payload).unwrap().contains("sk-"));
+}
+
+#[test]
+fn audit_event_type_validation_rejects_garbage() {
+    let harness = Harness::new();
+    let mut bus = harness.bus();
+    // Invalid event types (spaces, >64 chars) are rejected like subscriptions.
+    assert!(bus
+        .record_audit_event(
+            "has space",
+            "api_provider",
+            "x",
+            serde_json::json!({}),
+        )
+        .is_err());
+    assert!(bus
+        .record_audit_event(
+            &"x".repeat(65),
+            "api_provider",
+            "x",
+            serde_json::json!({}),
+        )
+        .is_err());
+    // But dots are allowed (namespace-style types).
+    assert!(bus
+        .record_audit_event(
+            "api.config_restored",
+            "api_config",
+            "api.json",
+            serde_json::json!({}),
+        )
+        .is_ok());
 }
