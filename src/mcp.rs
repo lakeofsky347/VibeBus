@@ -9,11 +9,11 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Bus, BusError, CredentialVault, ResolvedSecret, RetentionPolicy, SecretSource,
-    ApiCredentialVault, recovery_delivery, recovery_key_delivery, registration_delivery,
-    resolve_agent_recovery_key, resolve_agent_token, system_api_credential_vault,
+    ApiCredentialVault, Bus, BusError, CredentialVault, ResolvedSecret, RetentionPolicy,
+    SecretSource, recovery_delivery, recovery_key_delivery, registration_delivery,
+    resolve_agent_recovery_key, resolve_agent_token,
     spawn::{AgentProfiles, SessionRegistry},
-    system_credential_vault,
+    system_api_credential_vault, system_credential_vault,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1701,7 +1701,10 @@ impl VibeBusMcp {
             .map(|name| {
                 (
                     name.clone(),
-                    self.api_vault.load_api(&project_id, name).unwrap_or(None).is_some(),
+                    self.api_vault
+                        .load_api(&project_id, name)
+                        .unwrap_or(None)
+                        .is_some(),
                 )
             })
             .collect::<std::collections::HashMap<_, _>>();
@@ -1824,8 +1827,9 @@ impl VibeBusMcp {
         let root = self.root_path(request.root.as_deref());
         let project_id = self.project_id(request.root.as_deref())?;
         let config = crate::ApiConfig::load(&root).map_err(bus_error)?;
-        let mut health = crate::health_check(&config, self.api_vault.as_ref(), &project_id, &request.name)
-            .map_err(bus_error)?;
+        let mut health =
+            crate::health_check(&config, self.api_vault.as_ref(), &project_id, &request.name)
+                .map_err(bus_error)?;
         if request.check_network.unwrap_or(false) {
             let provider = config.providers.get(&request.name).ok_or_else(|| {
                 bus_error(BusError::Validation(format!(
@@ -1874,9 +1878,7 @@ impl VibeBusMcp {
         }))
     }
 
-    #[tool(
-        description = "List plugins registered in the project capability registry"
-    )]
+    #[tool(description = "List plugins registered in the project capability registry")]
     async fn vibebus_plugin_list(
         &self,
         Parameters(request): Parameters<PluginListRequest>,

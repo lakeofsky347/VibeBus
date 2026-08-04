@@ -2737,13 +2737,21 @@ impl Bus {
     /// Sync API providers from `.vibebus/api.json` into the `providers` table
     /// (upsert semantics). Call after `api.json` mutations so the bus always
     /// reflects the on-disk config. The API key is never stored here.
-    pub fn sync_providers_from_api_json(&mut self, _root: &Path, config: &crate::ApiConfig) -> Result<()> {
+    pub fn sync_providers_from_api_json(
+        &mut self,
+        _root: &Path,
+        config: &crate::ApiConfig,
+    ) -> Result<()> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         for (name, provider) in &config.providers {
             let env_json = serde_json::to_string(&provider.env_template).unwrap_or_default();
             let model = provider.model.clone().unwrap_or_default();
-            let active = if config.active.as_deref() == Some(name.as_str()) { 1i64 } else { 0i64 };
+            let active = if config.active.as_deref() == Some(name.as_str()) {
+                1i64
+            } else {
+                0i64
+            };
             tx.execute(
                 "INSERT INTO providers
                  (id, project_id, base_url, api_format, model, env_template_json, active, created_at)
@@ -5889,9 +5897,21 @@ fn now_ms() -> i64 {
 /// - antigravity → skills/<id>/SKILL.md
 fn skill_install_path(root: &Path, agent: &str, skill_id: &str) -> PathBuf {
     match agent {
-        "codex" | "grokbuild" => root.join(".codex").join("skills").join(skill_id).join("SKILL.md"),
-        "claude" => root.join(".claude").join("skills").join(skill_id).join("SKILL.md"),
-        "cursor" => root.join(".cursor").join("skills").join(skill_id).join("SKILL.md"),
+        "codex" | "grokbuild" => root
+            .join(".codex")
+            .join("skills")
+            .join(skill_id)
+            .join("SKILL.md"),
+        "claude" => root
+            .join(".claude")
+            .join("skills")
+            .join(skill_id)
+            .join("SKILL.md"),
+        "cursor" => root
+            .join(".cursor")
+            .join("skills")
+            .join(skill_id)
+            .join("SKILL.md"),
         "opencode" | "antigravity" => root.join("skills").join(skill_id).join("SKILL.md"),
         _ => root.join("skills").join(skill_id).join("SKILL.md"),
     }

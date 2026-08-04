@@ -137,7 +137,10 @@ impl ApiProvider {
     /// the key never appears in the on-disk config.
     pub fn standard_env(&self) -> HashMap<String, String> {
         let mut vars = HashMap::new();
-        vars.insert(self.api_format.base_url_var().to_string(), self.base_url.clone());
+        vars.insert(
+            self.api_format.base_url_var().to_string(),
+            self.base_url.clone(),
+        );
         if let Some(model) = &self.model
             && let Some(var) = self.api_format.model_var()
         {
@@ -174,10 +177,7 @@ impl ApiConfig {
             Err(error) => return Err(error.into()),
         };
         let config: ApiConfig = serde_json::from_str(&text).map_err(|error| {
-            BusError::Validation(format!(
-                "invalid API config at {}: {error}",
-                path.display()
-            ))
+            BusError::Validation(format!("invalid API config at {}: {error}", path.display()))
         })?;
         if config.version > API_CONFIG_VERSION {
             return Err(BusError::Validation(format!(
@@ -242,7 +242,12 @@ pub fn resolve_api_env(
             if config.providers.is_empty() {
                 "(none)".to_string()
             } else {
-                config.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                config
+                    .providers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         ))
     })?;
@@ -604,8 +609,6 @@ fn revert_backup(root: &Path, target: &Path, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-
-
 /// Local (offline) health check for a provider: config present, Base URL
 /// normalized, API key resolvable from the vault. Does not make network
 /// requests (the phase-2 connectivity check is a separate concern).
@@ -621,14 +624,23 @@ pub fn health_check(
             if config.providers.is_empty() {
                 "(none)".to_string()
             } else {
-                config.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                config
+                    .providers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         ))
     })?;
     let base_url_ok = ApiProvider::normalize_base_url(&provider_config.base_url).is_ok();
     let key_stored = vault.load_api(project_id, provider)?.is_some();
     let active = config.active.as_deref() == Some(provider);
-    let expected_vars = provider_config.standard_env().keys().cloned().collect::<Vec<_>>();
+    let expected_vars = provider_config
+        .standard_env()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     Ok(serde_json::json!({
         "provider": provider,
         "ok": base_url_ok && key_stored,
@@ -658,15 +670,20 @@ pub fn check_provider_network(base_url: &str) -> Result<std::time::Duration> {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
             (host.to_string(), port.parse::<u16>().unwrap_or(80))
         }
-        _ => (rest.to_string(), if normalized.starts_with("https://") { 443 } else { 80 }),
+        _ => (
+            rest.to_string(),
+            if normalized.starts_with("https://") {
+                443
+            } else {
+                80
+            },
+        ),
     };
     let address = format!("{host}:{port}");
     let started = std::time::Instant::now();
     let stream = std::net::TcpStream::connect_timeout(
         &std::net::ToSocketAddrs::to_socket_addrs(address.as_str())
-            .map_err(|error| {
-                BusError::Validation(format!("cannot resolve '{address}': {error}"))
-            })?
+            .map_err(|error| BusError::Validation(format!("cannot resolve '{address}': {error}")))?
             .next()
             .ok_or_else(|| BusError::Validation(format!("no address for '{address}'")))?,
         std::time::Duration::from_secs(5),
@@ -706,7 +723,11 @@ mod tests {
     #[test]
     fn normalize_base_url_rejects_non_http() {
         let error = ApiProvider::normalize_base_url("voltapi.com").unwrap_err();
-        assert!(error.to_string().contains("must start with http:// or https://"));
+        assert!(
+            error
+                .to_string()
+                .contains("must start with http:// or https://")
+        );
     }
 
     #[test]
@@ -722,7 +743,10 @@ mod tests {
     fn standard_env_derives_protocol_vars_and_model() {
         let provider = sample_provider();
         let env = provider.standard_env();
-        assert_eq!(env.get("ANTHROPIC_BASE_URL").unwrap(), "https://voltapi.com");
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap(),
+            "https://voltapi.com"
+        );
         assert_eq!(env.get("ANTHROPIC_MODEL").unwrap(), "claude-sonnet-4-6");
         // The key is NOT part of the standard env (resolved separately).
         assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
@@ -742,10 +766,7 @@ mod tests {
         let loaded = ApiConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.active.as_deref(), Some("voltapi"));
         assert_eq!(loaded.providers.len(), 1);
-        assert_eq!(
-            loaded.providers["voltapi"].base_url,
-            "https://voltapi.com"
-        );
+        assert_eq!(loaded.providers["voltapi"].base_url, "https://voltapi.com");
         // The on-disk file must never contain a key.
         let text = std::fs::read_to_string(dir.path().join(".vibebus/api/api.json")).unwrap();
         assert!(!text.contains("AUTH_TOKEN"));
@@ -768,9 +789,12 @@ mod tests {
         config.active = Some("voltapi".into());
         let vault = MemoryCredentialVault::default();
 
-        let error = resolve_api_env(&config, &vault, "prj_test", None)
-            .unwrap_err();
-        assert!(error.to_string().contains("not stored in the OS credential vault"));
+        let error = resolve_api_env(&config, &vault, "prj_test", None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not stored in the OS credential vault")
+        );
     }
 
     #[test]
@@ -800,8 +824,7 @@ mod tests {
     fn resolve_api_env_unknown_provider_is_validation_error() {
         let config = ApiConfig::default();
         let vault = MemoryCredentialVault::default();
-        let error = resolve_api_env(&config, &vault, "prj_test", Some("nope"))
-            .unwrap_err();
+        let error = resolve_api_env(&config, &vault, "prj_test", Some("nope")).unwrap_err();
         assert!(error.to_string().contains("unknown api provider 'nope'"));
     }
 
@@ -809,16 +832,24 @@ mod tests {
     fn resolve_api_env_no_active_provider_is_none() {
         let config = ApiConfig::default();
         let vault = MemoryCredentialVault::default();
-        assert!(resolve_api_env(&config, &vault, "prj_test", None)
-            .unwrap()
-            .is_none());
+        assert!(
+            resolve_api_env(&config, &vault, "prj_test", None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn detect_env_conflicts_flags_different_values_only() {
         let mut vars = HashMap::new();
-        vars.insert("ANTHROPIC_BASE_URL".to_string(), "https://voltapi.com".to_string());
-        vars.insert("ANTHROPIC_MODEL".to_string(), "claude-sonnet-4-6".to_string());
+        vars.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://voltapi.com".to_string(),
+        );
+        vars.insert(
+            "ANTHROPIC_MODEL".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        );
         // Only run if these are not already set in the test environment.
         let conflicts = detect_env_conflicts(&vars);
         for conflict in &conflicts {
@@ -908,7 +939,9 @@ mod tests {
         // The key is a command substitution resolving the vault at source
         // time — never a literal secret in the export files.
         assert!(sh.contains("export ANTHROPIC_AUTH_TOKEN=$( vibebus api key get --name voltapi)"));
-        assert!(ps1.contains("$env:ANTHROPIC_AUTH_TOKEN = (& vibebus api key get --name voltapi)[0]"));
+        assert!(
+            ps1.contains("$env:ANTHROPIC_AUTH_TOKEN = (& vibebus api key get --name voltapi)[0]")
+        );
         assert!(!sh.contains("sk-"));
         assert!(!ps1.contains("sk-"));
     }
@@ -943,7 +976,11 @@ mod tests {
     #[test]
     fn check_provider_network_rejects_invalid_url() {
         let error = check_provider_network("not-a-url").unwrap_err();
-        assert!(error.to_string().contains("must start with http:// or https://"));
+        assert!(
+            error
+                .to_string()
+                .contains("must start with http:// or https://")
+        );
     }
 
     #[test]
@@ -987,9 +1024,10 @@ mod tests {
         let backup = write_claude_config(dir.path(), &vars, "voltapi").unwrap();
         assert!(backup.exists());
 
-        let written: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(claude_dir.join("settings.json")).unwrap())
-                .unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(written["env"]["ANTHROPIC_BASE_URL"], "https://voltapi.com");
         assert_eq!(written["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-secret");
         assert_eq!(written["env"]["EXISTING"], "keep-me");
@@ -998,9 +1036,10 @@ mod tests {
 
         // Revert restores the original file.
         revert_claude_config(dir.path()).unwrap();
-        let restored: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(claude_dir.join("settings.json")).unwrap())
-                .unwrap();
+        let restored: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(restored["env"]["EXISTING"], "keep-me");
         assert!(restored["env"]["ANTHROPIC_BASE_URL"].is_null());
     }

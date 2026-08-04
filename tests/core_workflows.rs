@@ -2548,29 +2548,22 @@ fn audit_event_type_validation_rejects_garbage() {
     let harness = Harness::new();
     let mut bus = harness.bus();
     // Invalid event types (spaces, >64 chars) are rejected like subscriptions.
-    assert!(bus
-        .record_audit_event(
-            "has space",
-            "api_provider",
-            "x",
-            serde_json::json!({}),
-        )
-        .is_err());
-    assert!(bus
-        .record_audit_event(
-            &"x".repeat(65),
-            "api_provider",
-            "x",
-            serde_json::json!({}),
-        )
-        .is_err());
+    assert!(
+        bus.record_audit_event("has space", "api_provider", "x", serde_json::json!({}),)
+            .is_err()
+    );
+    assert!(
+        bus.record_audit_event(&"x".repeat(65), "api_provider", "x", serde_json::json!({}),)
+            .is_err()
+    );
     // But dots are allowed (namespace-style types).
-    assert!(bus
-        .record_audit_event(
+    assert!(
+        bus.record_audit_event(
             "api.config_restored",
             "api_config",
             "api.json",
             serde_json::json!({}),
         )
-        .is_ok());
+        .is_ok()
+    );
 }

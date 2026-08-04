@@ -942,15 +942,11 @@ async fn handle_agent_spawn(
     let api_vault = vibebus::system_api_credential_vault();
     let api_config = vibebus::ApiConfig::load(root)?;
     let api_name = api.or(profile.api.as_deref());
-    let api_env = match vibebus::resolve_api_env(
-        &api_config,
-        api_vault.as_ref(),
-        &project_id,
-        api_name,
-    )? {
-        Some(resolved) => Some(resolved.vars),
-        None => None,
-    };
+    let api_env =
+        match vibebus::resolve_api_env(&api_config, api_vault.as_ref(), &project_id, api_name)? {
+            Some(resolved) => Some(resolved.vars),
+            None => None,
+        };
     let outcome = spawn_once(&profile, task, role, timeout_secs, api_env.as_ref()).await?;
     // Link the spawn to a durable VibeBus task + message (same logic as the
     // MCP tool). One-shot CLI cannot reply, so a Question state still leaves
@@ -1167,7 +1163,13 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         },
         Command::Api { command } => {
             let api_vault = vibebus::system_api_credential_vault();
-            handle_api_command(&mut bus, &cli.root, &project_id, api_vault.as_ref(), command)?
+            handle_api_command(
+                &mut bus,
+                &cli.root,
+                &project_id,
+                api_vault.as_ref(),
+                command,
+            )?
         }
         Command::Send(args) => {
             let token = resolve_token(vault.as_ref(), &project_id, &args.from, args.token)?;
@@ -1602,7 +1604,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     "installedAt": path.to_string_lossy(),
                 })
             }
-            SkillCommand::Register { id, name, version, file, agents, deps } => {
+            SkillCommand::Register {
+                id,
+                name,
+                version,
+                file,
+                agents,
+                deps,
+            } => {
                 let content = std::fs::read_to_string(&file)?;
                 let record = vibebus::SkillRecord {
                     id: id.clone(),
@@ -1663,13 +1672,14 @@ fn handle_api_command(
 
     match command {
         ApiCommand::Provider {
-            command: ApiProviderCommand::Add {
-                name,
-                base_url,
-                format,
-                model,
-                key,
-            },
+            command:
+                ApiProviderCommand::Add {
+                    name,
+                    base_url,
+                    format,
+                    model,
+                    key,
+                },
         } => {
             // Keys are stored in the OS vault; never accept them from a
             // non-interactive stdin without an explicit --key.
@@ -1743,7 +1753,11 @@ fn handle_api_command(
                 }).collect::<std::collections::HashMap<_, _>>(),
             }))
         }
-        ApiCommand::Use { name, force, write_config } => {
+        ApiCommand::Use {
+            name,
+            force,
+            write_config,
+        } => {
             let mut config = ApiConfig::load(root)?;
             if !config.providers.contains_key(&name) {
                 return Err(BusError::Validation(format!(
@@ -1751,14 +1765,20 @@ fn handle_api_command(
                     if config.providers.is_empty() {
                         "(none)".to_string()
                     } else {
-                        config.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                        config
+                            .providers
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
                 )));
             }
             // Resolve the full injection env to (a) require the key and (b)
             // detect system-env conflicts against the real variable set.
-            let resolved = vibebus::resolve_api_env(&config, api_vault, project_id, Some(&name))?
-                .ok_or_else(|| BusError::Validation("provider did not resolve".into()))?;
+            let resolved =
+                vibebus::resolve_api_env(&config, api_vault, project_id, Some(&name))?
+                    .ok_or_else(|| BusError::Validation("provider did not resolve".into()))?;
             let conflicts = detect_env_conflicts(&resolved.vars);
             if !conflicts.is_empty() && !force {
                 let detail = conflicts
@@ -1798,11 +1818,7 @@ fn handle_api_command(
             // Channel 4 (opt-in): write into project-level Claude Code config.
             let mut config_backup: Option<PathBuf> = None;
             if write_config {
-                config_backup = Some(vibebus::write_claude_config(
-                    root,
-                    &resolved.vars,
-                    &name,
-                )?);
+                config_backup = Some(vibebus::write_claude_config(root, &resolved.vars, &name)?);
             }
             Ok(json!({
                 "active": name,
@@ -1872,7 +1888,10 @@ fn handle_api_command(
                 "remainingBackups": list_backups(root)?,
             }))
         }
-        ApiCommand::Health { name, check_network } => {
+        ApiCommand::Health {
+            name,
+            check_network,
+        } => {
             let mut health = health_check(&ApiConfig::load(root)?, api_vault, project_id, &name)?;
             if check_network {
                 let config = ApiConfig::load(root)?;
@@ -1890,8 +1909,7 @@ fn handle_api_command(
         ApiCommand::Run { command } => {
             let Some(first) = command.first() else {
                 return Err(BusError::Validation(
-                    "api run requires an agent CLI command (e.g. `-- codex exec`)"
-                        .into(),
+                    "api run requires an agent CLI command (e.g. `-- codex exec`)".into(),
                 ));
             };
             let config = ApiConfig::load(root)?;
@@ -1950,13 +1968,11 @@ fn handle_api_command(
         ApiCommand::Key {
             command: ApiKeyCommand::Get { name },
         } => {
-            let key = api_vault
-                .load_api(project_id, &name)?
-                .ok_or_else(|| {
-                    BusError::CredentialVault(format!(
-                        "api key for provider '{name}' is not stored in the OS credential vault"
-                    ))
-                })?;
+            let key = api_vault.load_api(project_id, &name)?.ok_or_else(|| {
+                BusError::CredentialVault(format!(
+                    "api key for provider '{name}' is not stored in the OS credential vault"
+                ))
+            })?;
             // stdout only; never wrap in the JSON envelope so `source env.sh`
             // command substitution receives exactly the key bytes.
             println!("{key}");

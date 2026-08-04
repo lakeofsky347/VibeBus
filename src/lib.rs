@@ -14,8 +14,8 @@ pub use hooks::{AgentHook, run_agent_hook};
 pub use inject::{
     ApiConfig, ApiFormat, ApiProvider, EnvConflict, ResolvedApiEnv, active_provider_name,
     backup_config, check_provider_network, detect_env_conflicts, health_check, list_backups,
-    remove_env_export, resolve_api_env, restore_config, revert_claude_config,
-    write_claude_config, write_env_export,
+    remove_env_export, resolve_api_env, restore_config, revert_claude_config, write_claude_config,
+    write_env_export,
 };
 pub use models::*;
 pub use policy::{ResponsibilityPolicy, normalize_policy_pattern, normalize_project_path};

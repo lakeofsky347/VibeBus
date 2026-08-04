@@ -899,9 +899,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.state, SpawnState::Result);
-        assert!(outcome.message.contains("base=https://voltapi.com"), "missing base in {:?}", outcome.message);
-        assert!(outcome.message.contains("key=sk-secret"), "missing key in {:?}", outcome.message);
-        assert!(outcome.message.contains("model=claude-sonnet-4-6"), "missing model in {:?}", outcome.message);
+        assert!(
+            outcome.message.contains("base=https://voltapi.com"),
+            "missing base in {:?}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("key=sk-secret"),
+            "missing key in {:?}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("model=claude-sonnet-4-6"),
+            "missing model in {:?}",
+            outcome.message
+        );
     }
 
     #[tokio::test]
@@ -924,25 +936,41 @@ mod tests {
         // A parent environment may already define these vars on a dev machine;
         // assert the *injection* added nothing by checking the child sees the
         // same value the parent would inherit (unset here in tests).
-        assert!(outcome.message.contains("base=unset") || outcome.message.contains("base="), "unexpected: {:?}", outcome.message);
-        assert!(!outcome.message.contains("key=sk-"), "unexpected: {:?}", outcome.message);
+        assert!(
+            outcome.message.contains("base=unset") || outcome.message.contains("base="),
+            "unexpected: {:?}",
+            outcome.message
+        );
+        assert!(
+            !outcome.message.contains("key=sk-"),
+            "unexpected: {:?}",
+            outcome.message
+        );
     }
 
     #[tokio::test]
     async fn spawn_once_profile_env_overrides_injected_api_env() {
         // Explicit profile.env must win over injected API env for the same var.
         let mut profile = env_echo_profile();
-        profile
-            .env
-            .insert("ANTHROPIC_BASE_URL".into(), "https://explicit.example.com".into());
+        profile.env.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            "https://explicit.example.com".into(),
+        );
         let mut api_env = HashMap::new();
-        api_env.insert("ANTHROPIC_BASE_URL".into(), "https://injected.example.com".into());
+        api_env.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            "https://injected.example.com".into(),
+        );
         api_env.insert("ANTHROPIC_AUTH_TOKEN".into(), "sk-secret".into());
         let outcome = spawn_once(&profile, "any task", None, Some(5), Some(&api_env))
             .await
             .unwrap();
         assert_eq!(outcome.state, SpawnState::Result);
-        assert!(outcome.message.contains("base=https://explicit.example.com"));
+        assert!(
+            outcome
+                .message
+                .contains("base=https://explicit.example.com")
+        );
         assert!(outcome.message.contains("key=sk-secret"));
     }
 
