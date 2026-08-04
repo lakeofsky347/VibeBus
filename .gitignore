@@ -16,3 +16,4 @@
 *.pfx
 *.p12
 *.key
+.workbuddy/
