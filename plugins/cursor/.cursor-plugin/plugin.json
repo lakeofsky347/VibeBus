@@ -1,0 +1,14 @@
+{
+  "$schema": "https://cursor.com/schemas/v1/plugin.json",
+  "name": "vibebus",
+  "version": "0.10.0",
+  "description": "Project-scoped coordination for independent Cursor agent tasks via a local SQLite fact bus.",
+  "author": {
+    "name": "VibeBus Contributors",
+    "url": "https://github.com/lakeofsky347/VibeBus"
+  },
+  "homepage": "https://github.com/lakeofsky347/VibeBus",
+  "repository": "https://github.com/lakeofsky347/VibeBus",
+  "license": "MIT",
+  "keywords": ["cursor", "coordination", "tasks", "sqlite", "mcp"]
+}

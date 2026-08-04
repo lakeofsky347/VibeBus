@@ -6,18 +6,18 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use vibebus::{
-    Bus, BusError, CodexHook, CredentialVault, Result, RetentionPolicy, SecretSource,
-    StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
+    AgentHook, AgentProfiles, Bus, BusError, CredentialVault, Result, RetentionPolicy,
+    SecretSource, StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
     operator_credential_delivery, recovery_delivery, recovery_key_delivery, registration_delivery,
-    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret, run_codex_hook,
-    system_credential_vault,
+    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret, run_agent_hook,
+    spawn_once, system_credential_vault,
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "vibebus",
     version,
-    about = "Local coordination bus for independent Codex tasks"
+    about = "Local coordination bus for independent coding-agent tasks"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
@@ -324,6 +324,26 @@ enum AgentCommand {
         token: Option<String>,
         #[arg(long)]
         store_credentials: bool,
+    },
+    /// Spawn an external agent CLI as a collaborator, link it to a VibeBus task,
+    /// and print the outcome.
+    Spawn {
+        /// Agent CLI profile name (codex, claude, gemini, demo, or a custom one).
+        #[arg(long)]
+        profile: String,
+        /// Authenticated VibeBus agent that owns the delegation task.
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -660,11 +680,11 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Command::Hook { command } = &cli.command {
         let hook = match command {
-            HookCommand::SessionStart => CodexHook::SessionStart,
-            HookCommand::PostToolUse => CodexHook::PostToolUse,
-            HookCommand::Stop => CodexHook::Stop,
+            HookCommand::SessionStart => AgentHook::SessionStart,
+            HookCommand::PostToolUse => AgentHook::PostToolUse,
+            HookCommand::Stop => AgentHook::Stop,
         };
-        return match run_codex_hook(hook) {
+        return match run_agent_hook(hook) {
             Ok(Some(value)) => {
                 print_json(&value);
                 ExitCode::SUCCESS
@@ -681,6 +701,49 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("VibeBus MCP server failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Command::Agent {
+        command:
+            AgentCommand::Spawn {
+                profile,
+                agent,
+                token,
+                task,
+                role,
+                task_id,
+                timeout_secs,
+            },
+    } = &cli.command
+    {
+        return match handle_agent_spawn(
+            &cli.root,
+            profile,
+            agent,
+            token.as_deref(),
+            task,
+            role.as_deref(),
+            task_id.as_deref(),
+            *timeout_secs,
+        )
+        .await
+        {
+            Ok(value) => {
+                print_json(&value);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "error": error.to_string(),
+                        "kind": error_kind(&error)
+                    }))
+                    .expect("serialize CLI error")
+                );
                 ExitCode::FAILURE
             }
         };
@@ -704,6 +767,55 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_agent_spawn(
+    root: &std::path::Path,
+    profile: &str,
+    agent: &str,
+    token: Option<&str>,
+    task: &str,
+    role: Option<&str>,
+    task_id: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> Result<serde_json::Value> {
+    let profiles = AgentProfiles::load(root);
+    let profile = profiles.resolve(profile).cloned().ok_or_else(|| {
+        BusError::Validation(format!(
+            "unknown agent profile '{}'; available: {}",
+            profile,
+            profiles
+                .list()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    let outcome = spawn_once(&profile, task, role, timeout_secs).await?;
+    // Link the spawn to a durable VibeBus task + message (same logic as the
+    // MCP tool). One-shot CLI cannot reply, so a Question state still leaves
+    // the task claimed for the host to handle.
+    let mut bus = Bus::open(root, None)?;
+    let project_id = bus.project().project_id.clone();
+    let vault = system_credential_vault();
+    let resolved = resolve_agent_token(vault.as_ref(), &project_id, agent, token, None)?;
+    let link = vibebus::spawn::link_spawn_outcome(
+        &mut bus,
+        agent,
+        &resolved.value,
+        &outcome,
+        task_id,
+        task,
+        role,
+        &profile.command,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "result": outcome,
+        "link": link,
+    }))
 }
 
 fn run(cli: Cli) -> Result<serde_json::Value> {
@@ -792,6 +904,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     store_credentials,
                 )
             }
+            AgentCommand::Spawn { .. } => unreachable!("agent spawn is handled in main"),
         },
         Command::Credential { command } => match command {
             CredentialCommand::Status { agent } => {

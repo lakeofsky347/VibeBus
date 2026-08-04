@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Bus, BusError, CredentialVault, ResolvedSecret, RetentionPolicy, SecretSource,
     recovery_delivery, recovery_key_delivery, registration_delivery, resolve_agent_recovery_key,
-    resolve_agent_token, system_credential_vault,
+    resolve_agent_token,
+    spawn::{AgentProfiles, SessionRegistry},
+    system_credential_vault,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -474,11 +476,63 @@ pub struct BackupRequest {
     pub output: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSpawnRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    /// Profile name from .vibebus/agents.json (codex, claude, gemini, or a custom one).
+    pub profile: String,
+    /// Authenticated VibeBus agent that owns the spawned delegation task.
+    pub agent: String,
+    pub token: Option<String>,
+    /// Optional role injected into the protocol prompt (planner, reviewer, executor, ...).
+    pub role: Option<String>,
+    /// The task description to send to the spawned agent CLI.
+    pub task: String,
+    /// Optional existing task id to bind the spawn to; a new task is created when omitted.
+    pub task_id: Option<String>,
+    /// Timeout in seconds (1..=86400); defaults to 1800.
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReplyRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    /// The spawn session id returned by vibebus_agent_spawn.
+    pub session_id: String,
+    /// The reply text to send to the waiting sub-agent.
+    pub message: String,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentKillRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub agent: String,
+    pub token: Option<String>,
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatusRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct VibeBusMcp {
     default_root: PathBuf,
     data_home: Option<PathBuf>,
     vault: Arc<dyn CredentialVault>,
+    spawn_registry: Arc<SessionRegistry>,
 }
 
 impl VibeBusMcp {
@@ -487,6 +541,7 @@ impl VibeBusMcp {
             default_root,
             data_home,
             vault: system_credential_vault(),
+            spawn_registry: SessionRegistry::new(),
         }
     }
 
@@ -499,6 +554,7 @@ impl VibeBusMcp {
             default_root,
             data_home,
             vault,
+            spawn_registry: SessionRegistry::new(),
         }
     }
 
@@ -1426,6 +1482,112 @@ impl VibeBusMcp {
             &bus.backup_to(std::path::Path::new(&request.output))
                 .map_err(bus_error)?,
         )
+    }
+
+    #[tool(
+        description = "Spawn an external agent CLI (codex/claude/gemini/...) as a tracked collaborator. Creates a VibeBus task, binds the spawn session, runs the agent, and on a terminal outcome records a self-message and completes the task. On a clarification question the session stays alive for vibebus_agent_reply"
+    )]
+    async fn vibebus_agent_spawn(
+        &self,
+        Parameters(request): Parameters<AgentSpawnRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = request
+            .root
+            .clone()
+            .unwrap_or_else(|| self.default_root.to_string_lossy().into_owned());
+        let profiles = AgentProfiles::load(std::path::Path::new(&root));
+        let profile = profiles.resolve(&request.profile).cloned().ok_or_else(|| {
+            bus_error(BusError::Validation(format!(
+                "unknown agent profile '{}'; available: {}",
+                request.profile,
+                profiles
+                    .list()
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )))
+        })?;
+        let outcome = self
+            .spawn_registry
+            .spawn(
+                &profile,
+                &request.task,
+                request.role.as_deref(),
+                request.timeout_secs,
+            )
+            .await
+            .map_err(bus_error)?;
+        // P1.5 durable fact linkage: create + claim + bind a task to the spawn
+        // session, and on a terminal outcome record the result and complete.
+        let mut bus = self.open(request.root.as_deref())?;
+        let token = self
+            .token(&bus, &request.agent, request.token.as_deref())?
+            .value;
+        let link = crate::spawn::link_spawn_outcome(
+            &mut bus,
+            &request.agent,
+            &token,
+            &outcome,
+            request.task_id.as_deref(),
+            &request.task,
+            request.role.as_deref(),
+            &profile.command,
+        )
+        .map_err(bus_error)?;
+        json_text(&serde_json::json!({
+            "outcome": outcome,
+            "taskId": link.task_id,
+            "threadId": link.thread_id,
+            "taskVersion": link.task_version,
+            "completed": link.completed,
+        }))
+    }
+
+    #[tool(
+        description = "Reply to a spawned agent session that returned a clarification question, then read its next result/question/error"
+    )]
+    async fn vibebus_agent_reply(
+        &self,
+        Parameters(request): Parameters<AgentReplyRequest>,
+    ) -> Result<String, ErrorData> {
+        let outcome = self
+            .spawn_registry
+            .reply(&request.session_id, &request.message, request.timeout_secs)
+            .await
+            .map_err(bus_error)?;
+        json_text(&outcome)
+    }
+
+    #[tool(description = "Kill a spawned agent session and mark it closed")]
+    async fn vibebus_agent_kill(
+        &self,
+        Parameters(request): Parameters<AgentKillRequest>,
+    ) -> Result<String, ErrorData> {
+        let outcome = self
+            .spawn_registry
+            .kill(&request.session_id)
+            .await
+            .map_err(bus_error)?;
+        json_text(&outcome)
+    }
+
+    #[tool(
+        description = "List spawned agent sessions recorded in this MCP server and the available agent profiles"
+    )]
+    async fn vibebus_agent_status(
+        &self,
+        Parameters(request): Parameters<AgentStatusRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = request
+            .root
+            .clone()
+            .unwrap_or_else(|| self.default_root.to_string_lossy().into_owned());
+        let profiles = AgentProfiles::load(std::path::Path::new(&root));
+        json_text(&serde_json::json!({
+            "sessions": self.spawn_registry.status(),
+            "profiles": profiles.list(),
+        }))
     }
 }
 

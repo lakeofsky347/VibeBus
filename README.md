@@ -2,9 +2,9 @@
 
 ![VibeBus logo](plugins/vibebus/assets/vibebus-logo-light.png)
 
-VibeBus is a local, structured fact bus for independent Codex tasks. Tasks keep their own conversations and worktrees while sharing only explicit messages, acknowledgements, task state, decisions, path reservations, artifacts, and bounded test or Git facts through a project-scoped SQLite database.
+VibeBus is a local, structured fact bus for independent coding-agent tasks. Tasks keep their own conversations and worktrees while sharing only explicit messages, acknowledgements, task state, decisions, path reservations, artifacts, and bounded test or Git facts through a project-scoped SQLite database.
 
-VibeBus provides a Rust CLI, stdio MCP server, Codex plugin, and lifecycle Hooks. It runs natively on Windows and macOS; Linux is supported through the `amd64` container workflow.
+VibeBus provides a Rust CLI, stdio MCP server, lifecycle Hooks, and per-tool adapter packages for Codex, Claude Code, Cursor, OpenCode, and Antigravity. It runs natively on Windows and macOS; Linux is supported through the `amd64` container workflow. See [Multi-tool adapters](docs/multi-tool-adapters.md) for how each agent is wired in.
 
 ## Install and run from source
 
