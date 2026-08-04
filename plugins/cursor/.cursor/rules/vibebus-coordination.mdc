@@ -1,0 +1,35 @@
+---
+description: Coordinate independent Cursor agent tasks with the VibeBus SQLite fact bus (register, inbox, claim tasks, reserve paths, record Git/test facts, hand off)
+globs:
+alwaysApply: false
+---
+
+# VibeBus coordination (Cursor)
+
+Cursor has no lifecycle hooks, so VibeBus coordination happens through explicit MCP calls. Load the full `vibebus-coordination` skill (`@vibebus-coordination`) for the complete protocol; this rule is the Cursor-specific reminder.
+
+## Setup
+
+- The `vibebus` MCP server is configured in `.cursor/mcp.json` and exposes every `vibebus_*` tool.
+- Pass the absolute project `root` on every call (the server runs from the working directory, not a plugin directory).
+- Initialize once with `vibebus init` (CLI) before the first task.
+
+## Cursor-specific fact recording
+
+Because there is no PostToolUse hook, record lifecycle evidence explicitly:
+
+- After every meaningful `git commit`, call `vibebus_git_commit_record` with the commit SHA, bounded summary, and normalized changed paths (never a diff).
+- After every test run, call `vibebus_test_result_record` with a stable result key, suite, outcome, and bounded summary (never raw logs).
+
+## Per-turn checklist
+
+1. `vibebus_status` — confirm project, inspect active agents/tasks/reservations.
+2. `vibebus_register` once (storeCredentials=true) if this task has no identity.
+3. `vibebus_inbox` — read directed messages; `vibebus_ack` + `vibebus_close` processed ones.
+4. `vibebus_task_claim` a ready task; `vibebus_thread_bind` with the Cursor session id when available.
+5. `vibebus_reserve` the narrowest paths before editing; release when done.
+6. `vibebus_context_sync` for deterministic task-scoped context (decisions, artifacts, Git/test facts).
+7. Record Git/test facts explicitly (see above).
+8. `vibebus_handoff_send` before stopping when a recipient exists; `vibebus_task_complete` with the latest version.
+
+Use an `idempotencyKey` on every retried mutation. Never claim VibeBus can interrupt a running generation or awaken another task.

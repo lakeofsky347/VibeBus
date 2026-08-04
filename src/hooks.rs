@@ -15,8 +15,15 @@ use crate::{
     Bus, BusError, Result, discover_project, resolve_agent_token, system_credential_vault,
 };
 
+/// Lifecycle hooks shared by Codex, Claude Code, and Antigravity.
+///
+/// The hook input/output schema (stdin JSON with `session_id`, `cwd`,
+/// `hook_event_name`, `tool_name`, `tool_input`, `tool_response`; stdout
+/// `hookSpecificOutput`) is a common protocol across these agents. Cursor and
+/// OpenCode do not provide lifecycle hooks; they rely on explicit MCP calls
+/// documented in the coordination skill instead.
 #[derive(Debug, Clone, Copy)]
-pub enum CodexHook {
+pub enum AgentHook {
     SessionStart,
     PostToolUse,
     Stop,
@@ -47,16 +54,16 @@ struct ActiveBinding {
     agent: String,
 }
 
-pub fn run_codex_hook(hook: CodexHook) -> Result<Option<Value>> {
+pub fn run_agent_hook(hook: AgentHook) -> Result<Option<Value>> {
     let input = read_hook_input()?;
     match hook {
-        CodexHook::SessionStart => session_start(&input),
-        CodexHook::PostToolUse => Ok(post_tool_use(&input).unwrap_or_else(|error| {
+        AgentHook::SessionStart => session_start(&input),
+        AgentHook::PostToolUse => Ok(post_tool_use(&input).unwrap_or_else(|error| {
             Some(hook_message(&format!(
                 "VibeBus lifecycle fact capture failed: {error}. The completed tool side effects were not changed."
             )))
         })),
-        CodexHook::Stop => Ok(stop(&input).unwrap_or_else(|error| {
+        AgentHook::Stop => Ok(stop(&input).unwrap_or_else(|error| {
             Some(hook_message(&format!(
                 "VibeBus handoff proposal generation failed: {error}. No handoff was sent."
             )))
@@ -82,7 +89,7 @@ fn session_start(input: &HookInput) -> Result<Option<Value>> {
     };
     let root = root.to_string_lossy();
     let context = format!(
-        "VibeBus project '{}' is active at '{}'. For every VibeBus MCP call, pass root='{}'. Register this independent task once with storeCredentials=true, verify credential status, then use vault-backed handoff snapshots or inbox checks at turn boundaries without copying secrets into the task. If vault storage fails, retain the returned token and recovery key only in private credential context. Atomically claim tasks before work, bind a claimed task to the real Codex task ID when available, inspect the responsibility policy, reserve precise task-scoped project-relative paths before editing, obtain an authenticated expiring override for cross-domain paths, close processed messages, use idempotency keys for retried writes, inspect retention status before history replay, and prefer replay-safe subscription peek/ack over legacy consume-on-poll. PostToolUse may record bounded Git/test facts for the active binding; Stop only prepares a reviewable proposal and never sends a handoff automatically. VibeBus is a durable fact bus; it does not interrupt a model that is already generating.",
+        "VibeBus project '{}' is active at '{}'. For every VibeBus MCP call, pass root='{}'. Register this independent task once with storeCredentials=true, verify credential status, then use vault-backed handoff snapshots or inbox checks at turn boundaries without copying secrets into the task. If vault storage fails, retain the returned token and recovery key only in private credential context. Atomically claim tasks before work, bind a claimed task to the real agent task/session identifier when available, inspect the responsibility policy, reserve precise task-scoped project-relative paths before editing, obtain an authenticated expiring override for cross-domain paths, close processed messages, use idempotency keys for retried writes, inspect retention status before history replay, and prefer replay-safe subscription peek/ack over legacy consume-on-poll. PostToolUse may record bounded Git/test facts for the active binding; Stop only prepares a reviewable proposal and never sends a handoff automatically. VibeBus is a durable fact bus; it does not interrupt a model that is already generating.",
         project.name, root, root
     );
     Ok(Some(json!({
@@ -283,20 +290,42 @@ fn resolve_binding(root: &Path, session_id: &str) -> Result<Option<ActiveBinding
         .list_task_thread_bindings(None, false)?
         .into_iter()
         .filter(|binding| {
-            binding.unbound_at.is_none()
-                && (binding.thread_id == session_id
-                    || binding.thread_id == format!("codex:{session_id}"))
+            binding.unbound_at.is_none() && thread_id_matches(&binding.thread_id, session_id)
         });
     let first = matches.next();
     if matches.next().is_some() {
         return Err(BusError::Validation(
-            "multiple active VibeBus task bindings match this Codex task".into(),
+            "multiple active VibeBus task bindings match this agent task".into(),
         ));
     }
     Ok(first.map(|binding| ActiveBinding {
         task_id: binding.task_id,
         agent: binding.agent,
     }))
+}
+
+/// Known coding-agent tools whose session identifiers may be stored as a
+/// `{tool}:{session_id}` thread binding. The raw `session_id` (no prefix) is
+/// always accepted too, so prefix-less bindings remain portable.
+const AGENT_TOOL_PREFIXES: &[&str] = &[
+    "codex",
+    "claude",
+    "cursor",
+    "opencode",
+    "antigravity",
+    "gemini",
+];
+
+fn thread_id_matches(thread_id: &str, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    if thread_id == session_id {
+        return true;
+    }
+    AGENT_TOOL_PREFIXES
+        .iter()
+        .any(|prefix| thread_id == format!("{prefix}:{session_id}"))
 }
 
 fn hook_token(bus: &Bus, agent: &str) -> Result<String> {
@@ -549,7 +578,7 @@ fn hook_message(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{hook_exit_code, is_git_commit_command, test_suite};
+    use super::{hook_exit_code, is_git_commit_command, test_suite, thread_id_matches};
     use serde_json::json;
 
     #[test]
@@ -574,5 +603,25 @@ mod tests {
             hook_exit_code(&json!("process exited with code: -2")),
             Some(-2)
         );
+    }
+
+    #[test]
+    fn matches_thread_ids_across_agent_tools() {
+        // Raw session id (prefix-less, portable) always matches.
+        assert!(thread_id_matches("abc-123", "abc-123"));
+        // Backwards-compatible Codex prefix.
+        assert!(thread_id_matches("codex:abc-123", "abc-123"));
+        // Other supported coding-agent prefixes.
+        assert!(thread_id_matches("claude:abc-123", "abc-123"));
+        assert!(thread_id_matches("cursor:abc-123", "abc-123"));
+        assert!(thread_id_matches("opencode:abc-123", "abc-123"));
+        assert!(thread_id_matches("antigravity:abc-123", "abc-123"));
+        assert!(thread_id_matches("gemini:abc-123", "abc-123"));
+        // Unknown prefix does not match.
+        assert!(!thread_id_matches("unknown:abc-123", "abc-123"));
+        // Different session id never matches.
+        assert!(!thread_id_matches("codex:abc-123", "xyz-789"));
+        // Empty session id never matches.
+        assert!(!thread_id_matches("codex:", ""));
     }
 }

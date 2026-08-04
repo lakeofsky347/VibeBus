@@ -64,6 +64,40 @@ impl StoredOperatorCredential {
     }
 }
 
+/// A stored API provider credential (the API key itself). Unlike agent tokens,
+/// API keys are opaque bearer secrets resolved at injection time: the key lives
+/// only in the OS credential vault and never in `.vibebus/api.json` or logs.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredApiCredential {
+    pub format_version: u32,
+    pub api_key: String,
+}
+
+impl StoredApiCredential {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            format_version: CREDENTIAL_FORMAT_VERSION,
+            api_key,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format_version != CREDENTIAL_FORMAT_VERSION {
+            return Err(BusError::CredentialVault(format!(
+                "unsupported stored API credential format version {}",
+                self.format_version
+            )));
+        }
+        if self.api_key.is_empty() {
+            return Err(BusError::CredentialVault(
+                "stored API key must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl StoredAgentCredentials {
     pub fn new(token: String, recovery_key: String, token_generation: i64) -> Self {
         Self {
@@ -116,7 +150,8 @@ pub struct VaultOperatorStatus {
     pub generation: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SecretSource {
     Argument,
     Environment,
@@ -208,6 +243,29 @@ pub trait CredentialVault: Send + Sync {
     }
 }
 
+/// Storage backend for API provider credentials (API keys). Kept as a separate
+/// trait from `CredentialVault` so the existing agent/operator credential flow
+/// stays untouched while API keys get the same OS-vault guarantee: the key is
+/// stored in the OS credential store and never written to `.vibebus/api.json`
+/// or logs. Implementations share the underlying platform blob helpers with
+/// `CredentialVault` (macOS Keychain / Windows Credential Manager).
+pub trait ApiCredentialVault: Send + Sync {
+    /// Backend display name, e.g. `macos-keychain`.
+    fn api_backend(&self) -> &'static str;
+
+    /// Whether the underlying OS vault supports storing API keys on this platform.
+    fn api_supported(&self) -> bool;
+
+    /// Store an API key for a project-scoped provider.
+    fn store_api(&self, project_id: &str, provider: &str, api_key: &str) -> Result<()>;
+
+    /// Load the stored API key for a provider, if present.
+    fn load_api(&self, project_id: &str, provider: &str) -> Result<Option<String>>;
+
+    /// Delete the stored API key for a provider; returns whether anything was removed.
+    fn delete_api(&self, project_id: &str, provider: &str) -> Result<bool>;
+}
+
 pub fn credential_target(project_id: &str, agent: &str) -> Result<String> {
     let valid_project = !project_id.is_empty()
         && project_id.len() <= 128
@@ -241,6 +299,29 @@ pub fn operator_credential_target(project_id: &str) -> Result<String> {
         ));
     }
     Ok(format!("VibeBusOperator:{project_id}"))
+}
+
+/// Target name for an API provider credential in the OS vault. The provider
+/// identifier follows the same bounded-ASCII rules as agent names so the same
+/// target lives in a distinct namespace from agent/operator credentials.
+pub fn api_credential_target(project_id: &str, provider: &str) -> Result<String> {
+    let valid_project = !project_id.is_empty()
+        && project_id.len() <= 128
+        && project_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    let valid_provider = !provider.is_empty()
+        && provider.len() <= 64
+        && provider
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    if !valid_project || !valid_provider {
+        return Err(BusError::Validation(
+            "API credential project and provider identifiers must use bounded ASCII letters, digits, '-' or '_'"
+                .into(),
+        ));
+    }
+    Ok(format!("VibeBusApi:{project_id}:{provider}"))
 }
 
 pub fn resolve_operator_secret(vault: &dyn CredentialVault, project_id: &str) -> Result<String> {
@@ -490,6 +571,52 @@ pub fn operator_credential_delivery(
 pub struct MemoryCredentialVault {
     entries: Mutex<HashMap<String, StoredAgentCredentials>>,
     operator_entries: Mutex<HashMap<String, StoredOperatorCredential>>,
+    api_entries: Mutex<HashMap<String, StoredApiCredential>>,
+}
+
+impl ApiCredentialVault for MemoryCredentialVault {
+    fn api_backend(&self) -> &'static str {
+        "memory-test-vault"
+    }
+
+    fn api_supported(&self) -> bool {
+        true
+    }
+
+    fn store_api(&self, project_id: &str, provider: &str, api_key: &str) -> Result<()> {
+        let credential = StoredApiCredential::new(api_key.to_string());
+        credential.validate()?;
+        let target = api_credential_target(project_id, provider)?;
+        self.api_entries
+            .lock()
+            .map_err(|_| BusError::CredentialVault("memory vault lock poisoned".into()))?
+            .insert(target, credential);
+        Ok(())
+    }
+
+    fn load_api(&self, project_id: &str, provider: &str) -> Result<Option<String>> {
+        let target = api_credential_target(project_id, provider)?;
+        let value = self
+            .api_entries
+            .lock()
+            .map_err(|_| BusError::CredentialVault("memory vault lock poisoned".into()))?
+            .get(&target)
+            .cloned();
+        if let Some(credential) = &value {
+            credential.validate()?;
+        }
+        Ok(value.map(|credential| credential.api_key))
+    }
+
+    fn delete_api(&self, project_id: &str, provider: &str) -> Result<bool> {
+        let target = api_credential_target(project_id, provider)?;
+        Ok(self
+            .api_entries
+            .lock()
+            .map_err(|_| BusError::CredentialVault("memory vault lock poisoned".into()))?
+            .remove(&target)
+            .is_some())
+    }
 }
 
 impl CredentialVault for MemoryCredentialVault {
@@ -583,6 +710,12 @@ pub fn system_credential_vault() -> Arc<dyn CredentialVault> {
     Arc::new(PlatformCredentialVault)
 }
 
+/// System `ApiCredentialVault` view over the same platform backend used for
+/// agent/operator credentials (macOS Keychain / Windows Credential Manager).
+pub fn system_api_credential_vault() -> Arc<dyn ApiCredentialVault> {
+    Arc::new(PlatformCredentialVault)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PlatformCredentialVault;
 
@@ -602,90 +735,19 @@ impl CredentialVault for PlatformCredentialVault {
         agent: &str,
         credentials: &StoredAgentCredentials,
     ) -> Result<()> {
-        use std::os::windows::ffi::OsStrExt;
-
-        use windows_sys::Win32::Foundation::GetLastError;
-        use windows_sys::Win32::Security::Credentials::{
-            CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
-        };
-
         credentials.validate()?;
         let target = credential_target(project_id, agent)?;
-        let mut target_wide = std::ffi::OsStr::new(&target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
         let mut blob = serde_json::to_vec(credentials)?;
-        if blob.len() > MAX_CREDENTIAL_BLOB_BYTES {
-            blob.fill(0);
-            return Err(BusError::CredentialVault(format!(
-                "serialized credential is larger than {MAX_CREDENTIAL_BLOB_BYTES} bytes"
-            )));
-        }
-
-        let credential = CREDENTIALW {
-            Type: CRED_TYPE_GENERIC,
-            TargetName: target_wide.as_mut_ptr(),
-            CredentialBlobSize: blob.len() as u32,
-            CredentialBlob: blob.as_mut_ptr(),
-            Persist: CRED_PERSIST_LOCAL_MACHINE,
-            ..Default::default()
-        };
-        let written = unsafe { CredWriteW(&credential, 0) };
-        let error = if written == 0 {
-            Some(unsafe { GetLastError() })
-        } else {
-            None
-        };
+        let result = win32_write_credential_blob(&target, &mut blob);
         blob.fill(0);
-        if let Some(code) = error {
-            return Err(win32_error("CredWriteW", code));
-        }
-        Ok(())
+        result
     }
 
     fn load(&self, project_id: &str, agent: &str) -> Result<Option<StoredAgentCredentials>> {
-        use std::{os::windows::ffi::OsStrExt, ptr::null_mut, slice};
-
-        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
-        use windows_sys::Win32::Security::Credentials::{
-            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
-        };
-
         let target = credential_target(project_id, agent)?;
-        let target_wide = std::ffi::OsStr::new(&target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let mut credential: *mut CREDENTIALW = null_mut();
-        let read =
-            unsafe { CredReadW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
-        if read == 0 {
-            let code = unsafe { GetLastError() };
-            if code == ERROR_NOT_FOUND {
-                return Ok(None);
-            }
-            return Err(win32_error("CredReadW", code));
-        }
-
-        struct CredentialBuffer(*mut CREDENTIALW);
-        impl Drop for CredentialBuffer {
-            fn drop(&mut self) {
-                unsafe { CredFree(self.0.cast()) };
-            }
-        }
-        let buffer = CredentialBuffer(credential);
-        let raw = unsafe { &*buffer.0 };
-        let blob_len = raw.CredentialBlobSize as usize;
-        if blob_len > MAX_CREDENTIAL_BLOB_BYTES || (blob_len > 0 && raw.CredentialBlob.is_null()) {
-            return Err(BusError::CredentialVault(
-                "Windows returned an invalid credential blob".into(),
-            ));
-        }
-        let mut blob = unsafe { slice::from_raw_parts(raw.CredentialBlob, blob_len).to_vec() };
-        if blob_len > 0 {
-            unsafe { std::ptr::write_bytes(raw.CredentialBlob, 0, blob_len) };
-        }
+        let Some(mut blob) = win32_read_credential_blob(&target)? else {
+            return Ok(None);
+        };
         let parsed = serde_json::from_slice::<StoredAgentCredentials>(&blob);
         blob.fill(0);
         let credentials = parsed.map_err(|error| {
@@ -696,25 +758,8 @@ impl CredentialVault for PlatformCredentialVault {
     }
 
     fn delete(&self, project_id: &str, agent: &str) -> Result<bool> {
-        use std::os::windows::ffi::OsStrExt;
-
-        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
-        use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
-
         let target = credential_target(project_id, agent)?;
-        let target_wide = std::ffi::OsStr::new(&target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let deleted = unsafe { CredDeleteW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0) };
-        if deleted != 0 {
-            return Ok(true);
-        }
-        let code = unsafe { GetLastError() };
-        if code == ERROR_NOT_FOUND {
-            return Ok(false);
-        }
-        Err(win32_error("CredDeleteW", code))
+        win32_delete_credential_blob(&target)
     }
 
     fn store_operator(
@@ -722,90 +767,19 @@ impl CredentialVault for PlatformCredentialVault {
         project_id: &str,
         credential: &StoredOperatorCredential,
     ) -> Result<()> {
-        use std::os::windows::ffi::OsStrExt;
-
-        use windows_sys::Win32::Foundation::GetLastError;
-        use windows_sys::Win32::Security::Credentials::{
-            CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
-        };
-
         credential.validate()?;
         let target = operator_credential_target(project_id)?;
-        let mut target_wide = std::ffi::OsStr::new(&target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
         let mut blob = serde_json::to_vec(credential)?;
-        if blob.len() > MAX_CREDENTIAL_BLOB_BYTES {
-            blob.fill(0);
-            return Err(BusError::CredentialVault(format!(
-                "serialized operator credential is larger than {MAX_CREDENTIAL_BLOB_BYTES} bytes"
-            )));
-        }
-        let raw = CREDENTIALW {
-            Type: CRED_TYPE_GENERIC,
-            TargetName: target_wide.as_mut_ptr(),
-            CredentialBlobSize: blob.len() as u32,
-            CredentialBlob: blob.as_mut_ptr(),
-            Persist: CRED_PERSIST_LOCAL_MACHINE,
-            ..Default::default()
-        };
-        let written = unsafe { CredWriteW(&raw, 0) };
-        let error = if written == 0 {
-            Some(unsafe { GetLastError() })
-        } else {
-            None
-        };
+        let result = win32_write_credential_blob(&target, &mut blob);
         blob.fill(0);
-        if let Some(code) = error {
-            return Err(win32_error("CredWriteW", code));
-        }
-        Ok(())
+        result
     }
 
     fn load_operator(&self, project_id: &str) -> Result<Option<StoredOperatorCredential>> {
-        use std::{os::windows::ffi::OsStrExt, ptr::null_mut, slice};
-
-        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
-        use windows_sys::Win32::Security::Credentials::{
-            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
-        };
-
         let target = operator_credential_target(project_id)?;
-        let target_wide = std::ffi::OsStr::new(&target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let mut raw: *mut CREDENTIALW = null_mut();
-        let read = unsafe { CredReadW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut raw) };
-        if read == 0 {
-            let code = unsafe { GetLastError() };
-            if code == ERROR_NOT_FOUND {
-                return Ok(None);
-            }
-            return Err(win32_error("CredReadW", code));
-        }
-        struct CredentialBuffer(*mut CREDENTIALW);
-        impl Drop for CredentialBuffer {
-            fn drop(&mut self) {
-                unsafe { CredFree(self.0.cast()) };
-            }
-        }
-        let buffer = CredentialBuffer(raw);
-        let credential = unsafe { &*buffer.0 };
-        let blob_len = credential.CredentialBlobSize as usize;
-        if blob_len > MAX_CREDENTIAL_BLOB_BYTES
-            || (blob_len > 0 && credential.CredentialBlob.is_null())
-        {
-            return Err(BusError::CredentialVault(
-                "Windows returned an invalid operator credential blob".into(),
-            ));
-        }
-        let mut blob =
-            unsafe { slice::from_raw_parts(credential.CredentialBlob, blob_len).to_vec() };
-        if blob_len > 0 {
-            unsafe { std::ptr::write_bytes(credential.CredentialBlob, 0, blob_len) };
-        }
+        let Some(mut blob) = win32_read_credential_blob(&target)? else {
+            return Ok(None);
+        };
         let parsed = serde_json::from_slice::<StoredOperatorCredential>(&blob);
         blob.fill(0);
         let credential = parsed.map_err(|error| {
@@ -818,25 +792,8 @@ impl CredentialVault for PlatformCredentialVault {
     }
 
     fn delete_operator(&self, project_id: &str) -> Result<bool> {
-        use std::os::windows::ffi::OsStrExt;
-
-        use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
-        use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
-
         let target = operator_credential_target(project_id)?;
-        let target_wide = std::ffi::OsStr::new(&target)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let deleted = unsafe { CredDeleteW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0) };
-        if deleted != 0 {
-            return Ok(true);
-        }
-        let code = unsafe { GetLastError() };
-        if code == ERROR_NOT_FOUND {
-            return Ok(false);
-        }
-        Err(win32_error("CredDeleteW", code))
+        win32_delete_credential_blob(&target)
     }
 }
 
@@ -846,6 +803,150 @@ fn win32_error(operation: &str, code: u32) -> BusError {
         "{operation} failed with Windows error {code}: {}",
         std::io::Error::from_raw_os_error(code as i32)
     ))
+}
+
+#[cfg(windows)]
+impl ApiCredentialVault for PlatformCredentialVault {
+    fn api_backend(&self) -> &'static str {
+        "windows-credential-manager"
+    }
+
+    fn api_supported(&self) -> bool {
+        true
+    }
+
+    fn store_api(&self, project_id: &str, provider: &str, api_key: &str) -> Result<()> {
+        let credential = StoredApiCredential::new(api_key.to_string());
+        credential.validate()?;
+        let target = api_credential_target(project_id, provider)?;
+        let mut blob = serde_json::to_vec(&credential)?;
+        let result = win32_write_credential_blob(&target, &mut blob);
+        blob.fill(0);
+        result
+    }
+
+    fn load_api(&self, project_id: &str, provider: &str) -> Result<Option<String>> {
+        let target = api_credential_target(project_id, provider)?;
+        let Some(mut blob) = win32_read_credential_blob(&target)? else {
+            return Ok(None);
+        };
+        let parsed = serde_json::from_slice::<StoredApiCredential>(&blob);
+        blob.fill(0);
+        let credential = parsed.map_err(|error| {
+            BusError::CredentialVault(format!("stored API credential is not valid JSON: {error}"))
+        })?;
+        credential.validate()?;
+        Ok(Some(credential.api_key))
+    }
+
+    fn delete_api(&self, project_id: &str, provider: &str) -> Result<bool> {
+        let target = api_credential_target(project_id, provider)?;
+        win32_delete_credential_blob(&target)
+    }
+}
+
+#[cfg(windows)]
+fn win32_write_credential_blob(target: &str, blob: &mut Vec<u8>) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
+    };
+
+    if blob.len() > MAX_CREDENTIAL_BLOB_BYTES {
+        return Err(BusError::CredentialVault(format!(
+            "serialized credential is larger than {MAX_CREDENTIAL_BLOB_BYTES} bytes"
+        )));
+    }
+    let mut target_wide = std::ffi::OsStr::new(target)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let credential = CREDENTIALW {
+        Type: CRED_TYPE_GENERIC,
+        TargetName: target_wide.as_mut_ptr(),
+        CredentialBlobSize: blob.len() as u32,
+        CredentialBlob: blob.as_mut_ptr(),
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        ..Default::default()
+    };
+    let written = unsafe { CredWriteW(&credential, 0) };
+    let error = if written == 0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
+    if let Some(code) = error {
+        return Err(win32_error("CredWriteW", code));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn win32_read_credential_blob(target: &str) -> Result<Option<Vec<u8>>> {
+    use std::{os::windows::ffi::OsStrExt, ptr::null_mut, slice};
+
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+
+    let target_wide = std::ffi::OsStr::new(target)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut credential: *mut CREDENTIALW = null_mut();
+    let read = unsafe { CredReadW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+    if read == 0 {
+        let code = unsafe { GetLastError() };
+        if code == ERROR_NOT_FOUND {
+            return Ok(None);
+        }
+        return Err(win32_error("CredReadW", code));
+    }
+
+    struct CredentialBuffer(*mut CREDENTIALW);
+    impl Drop for CredentialBuffer {
+        fn drop(&mut self) {
+            unsafe { CredFree(self.0.cast()) };
+        }
+    }
+    let buffer = CredentialBuffer(credential);
+    let raw = unsafe { &*buffer.0 };
+    let blob_len = raw.CredentialBlobSize as usize;
+    if blob_len > MAX_CREDENTIAL_BLOB_BYTES || (blob_len > 0 && raw.CredentialBlob.is_null()) {
+        return Err(BusError::CredentialVault(
+            "Windows returned an invalid credential blob".into(),
+        ));
+    }
+    let blob = unsafe { slice::from_raw_parts(raw.CredentialBlob, blob_len).to_vec() };
+    if blob_len > 0 {
+        unsafe { std::ptr::write_bytes(raw.CredentialBlob, 0, blob_len) };
+    }
+    Ok(Some(blob))
+}
+
+#[cfg(windows)]
+fn win32_delete_credential_blob(target: &str) -> Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+    use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
+
+    let target_wide = std::ffi::OsStr::new(target)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let deleted = unsafe { CredDeleteW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0) };
+    if deleted != 0 {
+        return Ok(true);
+    }
+    let code = unsafe { GetLastError() };
+    if code == ERROR_NOT_FOUND {
+        return Ok(false);
+    }
+    Err(win32_error("CredDeleteW", code))
 }
 
 #[cfg(target_os = "macos")]
@@ -901,6 +1002,36 @@ impl CredentialVault for PlatformCredentialVault {
 
     fn delete_operator(&self, project_id: &str) -> Result<bool> {
         macos_delete(&operator_credential_target(project_id)?)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ApiCredentialVault for PlatformCredentialVault {
+    fn api_backend(&self) -> &'static str {
+        "macos-keychain"
+    }
+
+    fn api_supported(&self) -> bool {
+        true
+    }
+
+    fn store_api(&self, project_id: &str, provider: &str, api_key: &str) -> Result<()> {
+        let credential = StoredApiCredential::new(api_key.to_string());
+        credential.validate()?;
+        macos_store(api_credential_target(project_id, provider)?, &credential)
+    }
+
+    fn load_api(&self, project_id: &str, provider: &str) -> Result<Option<String>> {
+        let credential: Option<StoredApiCredential> =
+            macos_load(&api_credential_target(project_id, provider)?)?;
+        if let Some(credential) = &credential {
+            credential.validate()?;
+        }
+        Ok(credential.map(|credential| credential.api_key))
+    }
+
+    fn delete_api(&self, project_id: &str, provider: &str) -> Result<bool> {
+        macos_delete(&api_credential_target(project_id, provider)?)
     }
 }
 
@@ -998,6 +1129,31 @@ fn macos_keychain_error(operation: &str, code: i32) -> BusError {
     BusError::CredentialVault(format!(
         "{operation} failed with macOS Security status {code}"
     ))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+impl ApiCredentialVault for PlatformCredentialVault {
+    fn api_backend(&self) -> &'static str {
+        "unsupported-platform"
+    }
+
+    fn api_supported(&self) -> bool {
+        false
+    }
+
+    fn store_api(&self, _project_id: &str, _provider: &str, _api_key: &str) -> Result<()> {
+        Err(BusError::CredentialVault(
+            "the system credential vault is currently supported only on Windows and macOS".into(),
+        ))
+    }
+
+    fn load_api(&self, _project_id: &str, _provider: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn delete_api(&self, _project_id: &str, _provider: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

@@ -6,18 +6,18 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use vibebus::{
-    Bus, BusError, CodexHook, CredentialVault, Result, RetentionPolicy, SecretSource,
-    StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
+    AgentHook, AgentProfiles, Bus, BusError, CredentialVault, Result, RetentionPolicy,
+    SecretSource, StoredOperatorCredential, discover_project, initialize_project, mcp::run_mcp,
     operator_credential_delivery, recovery_delivery, recovery_key_delivery, registration_delivery,
-    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret, run_codex_hook,
-    system_credential_vault,
+    resolve_agent_recovery_key, resolve_agent_token, resolve_operator_secret, run_agent_hook,
+    spawn_once, system_credential_vault,
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "vibebus",
     version,
-    about = "Local coordination bus for independent Codex tasks"
+    about = "Local coordination bus for independent coding-agent tasks"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
@@ -56,6 +56,10 @@ enum Command {
     Operator {
         #[command(subcommand)]
         command: OperatorCommand,
+    },
+    Api {
+        #[command(subcommand)]
+        command: ApiCommand,
     },
     Send(SendArgs),
     Inbox(AgentAuthArgs),
@@ -126,6 +130,45 @@ enum Command {
         command: HookCommand,
     },
     Mcp,
+    #[command(subcommand)]
+    Skill(SkillCommand),
+    #[command(subcommand)]
+    Plugin(PluginCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// List registered skills (id, version, agents_supported).
+    List,
+    /// Install a registered skill into an agent CLI's local skill directory.
+    Install {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        agent: String,
+    },
+    /// Register or update a skill from a SKILL.md file.
+    Register {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "1.0.0")]
+        version: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        agents: Vec<String>,
+        /// Prerequisite skill ids installed first (comma-separated).
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        deps: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    /// List registered plugins.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -325,6 +368,31 @@ enum AgentCommand {
         #[arg(long)]
         store_credentials: bool,
     },
+    /// Spawn an external agent CLI as a collaborator, link it to a VibeBus task,
+    /// and print the outcome.
+    Spawn {
+        /// Agent CLI profile name (codex, claude, gemini, demo, or a custom one).
+        #[arg(long)]
+        profile: String,
+        /// Authenticated VibeBus agent that owns the delegation task.
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// API provider (from `.vibebus/api.json`) whose env is injected into
+        /// the spawned child. Defaults to the profile's `api` binding, then to
+        /// the active provider.
+        #[arg(long)]
+        api: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -354,6 +422,95 @@ enum OperatorCommand {
         #[command(flatten)]
         policy: RetentionPolicyArgs,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApiCommand {
+    /// Manage API providers (config lives in `.vibebus/api.json`, keys in the
+    /// OS credential vault).
+    Provider {
+        #[command(subcommand)]
+        command: ApiProviderCommand,
+    },
+    /// Activate a provider so its env is injected into spawned agents.
+    Use {
+        /// Provider name to activate.
+        #[arg(long)]
+        name: String,
+        /// Override system-environment conflicts (injection wins).
+        #[arg(long)]
+        force: bool,
+        /// Also write the injected env into Claude Code's project-level
+        /// config (`.claude/settings.json`), backing up the original first.
+        #[arg(long)]
+        write_config: bool,
+    },
+    /// Deactivate the active provider (keys stay in the vault).
+    Unuse,
+    /// Restore a previous config from a write-ahead backup.
+    Restore {
+        /// Backup index, 1 = newest.
+        #[arg(long, default_value_t = 1)]
+        n: usize,
+    },
+    /// Sync providers from `.vibebus/api.json` into the bus registry (phase 3).
+    SyncProviders,
+    /// Local health check for a provider (config + key presence; no network).
+    Health {
+        #[arg(long)]
+        name: String,
+        /// Also probe TCP reachability of the Base URL host (default off).
+        #[arg(long)]
+        check_network: bool,
+    },
+    /// Launch an agent CLI with the active provider's env injected. The key is
+    /// resolved from the OS vault at launch; nothing is written to disk.
+    /// Example: `vibebus api run -- codex exec "task"`.
+    Run {
+        /// Agent CLI command and its arguments, everything after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Resolve a provider's API key from the vault to stdout. Used by the
+    /// generated env export files (`source .vibebus/api/env.sh`); the key is
+    /// never persisted by VibeBus itself.
+    Key {
+        #[command(subcommand)]
+        command: ApiKeyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApiKeyCommand {
+    /// Print the stored API key for a provider (stdout only).
+    Get {
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApiProviderCommand {
+    /// Add a provider; the API key goes to the OS credential vault only.
+    Add {
+        /// Provider name (ASCII letters/digits/`-`/`_`).
+        #[arg(long)]
+        name: String,
+        /// Base URL without a trailing slash (e.g. https://voltapi.com).
+        #[arg(long)]
+        base_url: String,
+        /// API format: anthropic | openai-chat | openai-responses | gemini.
+        #[arg(long)]
+        format: String,
+        /// Optional default model injected via the protocol's model env var.
+        #[arg(long)]
+        model: Option<String>,
+        /// API key. When omitted, prompts interactively (safe default).
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// List configured providers (names/formats/base URLs; never keys).
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -660,11 +817,11 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Command::Hook { command } = &cli.command {
         let hook = match command {
-            HookCommand::SessionStart => CodexHook::SessionStart,
-            HookCommand::PostToolUse => CodexHook::PostToolUse,
-            HookCommand::Stop => CodexHook::Stop,
+            HookCommand::SessionStart => AgentHook::SessionStart,
+            HookCommand::PostToolUse => AgentHook::PostToolUse,
+            HookCommand::Stop => AgentHook::Stop,
         };
-        return match run_codex_hook(hook) {
+        return match run_agent_hook(hook) {
             Ok(Some(value)) => {
                 print_json(&value);
                 ExitCode::SUCCESS
@@ -681,6 +838,51 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("VibeBus MCP server failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Command::Agent {
+        command:
+            AgentCommand::Spawn {
+                profile,
+                agent,
+                token,
+                task,
+                role,
+                task_id,
+                timeout_secs,
+                api,
+            },
+    } = &cli.command
+    {
+        return match handle_agent_spawn(
+            &cli.root,
+            profile,
+            agent,
+            token.as_deref(),
+            task,
+            role.as_deref(),
+            task_id.as_deref(),
+            *timeout_secs,
+            api.as_deref(),
+        )
+        .await
+        {
+            Ok(value) => {
+                print_json(&value);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "error": error.to_string(),
+                        "kind": error_kind(&error)
+                    }))
+                    .expect("serialize CLI error")
+                );
                 ExitCode::FAILURE
             }
         };
@@ -704,6 +906,72 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_agent_spawn(
+    root: &std::path::Path,
+    profile: &str,
+    agent: &str,
+    token: Option<&str>,
+    task: &str,
+    role: Option<&str>,
+    task_id: Option<&str>,
+    timeout_secs: Option<u64>,
+    api: Option<&str>,
+) -> Result<serde_json::Value> {
+    let profiles = AgentProfiles::load(root);
+    let profile = profiles.resolve(profile).cloned().ok_or_else(|| {
+        BusError::Validation(format!(
+            "unknown agent profile '{}'; available: {}",
+            profile,
+            profiles
+                .list()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    // Resolve the injection env before spawning so a missing key fails the
+    // call instead of silently running without it. Precedence: explicit --api
+    // > profile.api binding > active provider (resolve_api_env falls back to
+    // the config's active provider when `api` is None).
+    let mut bus = Bus::open(root, None)?;
+    let project_id = bus.project().project_id.clone();
+    let api_vault = vibebus::system_api_credential_vault();
+    let api_config = vibebus::ApiConfig::load(root)?;
+    let api_name = api.or(profile.api.as_deref());
+    let api_env =
+        match vibebus::resolve_api_env(&api_config, api_vault.as_ref(), &project_id, api_name)? {
+            Some(resolved) => Some(resolved.vars),
+            None => None,
+        };
+    let outcome = spawn_once(&profile, task, role, timeout_secs, api_env.as_ref()).await?;
+    // Link the spawn to a durable VibeBus task + message (same logic as the
+    // MCP tool). One-shot CLI cannot reply, so a Question state still leaves
+    // the task claimed for the host to handle.
+    let vault = system_credential_vault();
+    let resolved = resolve_agent_token(vault.as_ref(), &project_id, agent, token, None)?;
+    let link = vibebus::spawn::link_spawn_outcome(
+        &mut bus,
+        agent,
+        &resolved.value,
+        &outcome,
+        task_id,
+        task,
+        role,
+        &profile.command,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "result": outcome,
+        "link": link,
+        "api": api_env.map(|env| serde_json::json!({
+            "provider": profile.api.or(api.map(str::to_owned)).unwrap_or_else(|| api_config.active.clone().unwrap_or_default()),
+            "injectedVars": env.keys().collect::<Vec<_>>(),
+        })),
+    }))
 }
 
 fn run(cli: Cli) -> Result<serde_json::Value> {
@@ -792,6 +1060,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                     store_credentials,
                 )
             }
+            AgentCommand::Spawn { .. } => unreachable!("agent spawn is handled in main"),
         },
         Command::Credential { command } => match command {
             CredentialCommand::Status { agent } => {
@@ -892,6 +1161,16 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 json!(bus.approve_retention(&secret, &policy, &plan, ttl)?)
             }
         },
+        Command::Api { command } => {
+            let api_vault = vibebus::system_api_credential_vault();
+            handle_api_command(
+                &mut bus,
+                &cli.root,
+                &project_id,
+                api_vault.as_ref(),
+                command,
+            )?
+        }
         Command::Send(args) => {
             let token = resolve_token(vault.as_ref(), &project_id, &args.from, args.token)?;
             json!(bus.send_message_idempotent(
@@ -1315,6 +1594,43 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
                 json!(bus.handoff_proposal(&agent, &token, &task, item_limit)?)
             }
         },
+        Command::Skill(command) => match command {
+            SkillCommand::List => json!(bus.list_skills()?),
+            SkillCommand::Install { id, agent } => {
+                let path = bus.install_skill(&id, &agent, &cli.root)?;
+                json!({
+                    "skill": id,
+                    "agent": agent,
+                    "installedAt": path.to_string_lossy(),
+                })
+            }
+            SkillCommand::Register {
+                id,
+                name,
+                version,
+                file,
+                agents,
+                deps,
+            } => {
+                let content = std::fs::read_to_string(&file)?;
+                let record = vibebus::SkillRecord {
+                    id: id.clone(),
+                    project_id: project_id.clone(),
+                    version,
+                    name,
+                    description: None,
+                    agents_supported: agents,
+                    deps,
+                    content,
+                    created_at: 0,
+                };
+                bus.register_skill(&record)?;
+                json!({"registered": id, "file": file.to_string_lossy()})
+            }
+        },
+        Command::Plugin(command) => match command {
+            PluginCommand::List => json!(bus.list_plugins()?),
+        },
         Command::Status => json!({
             "project": bus.project(),
             "projectRoot": bus.project_root().to_string_lossy(),
@@ -1325,7 +1641,10 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             "retention": bus.retention_state()?,
             "operator": bus.operator_status()?,
             "reservations": bus.list_active_reservations()?,
-            "artifacts": bus.list_artifacts(None)?
+            "artifacts": bus.list_artifacts(None)?,
+            "providers": bus.list_providers()?,
+            "skills": bus.list_skills()?,
+            "plugins": bus.list_plugins()?,
         }),
         Command::Doctor => json!(bus.doctor()?),
         Command::Backup { output } => json!(bus.backup_to(&output)?),
@@ -1334,6 +1653,332 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
         Command::Mcp => unreachable!(),
     };
     Ok(json!({"ok": true, "result": result}))
+}
+
+/// Dispatch `vibebus api` subcommands. `project_id` is the already-resolved
+/// project identifier used to key API credentials in the OS vault. Key values
+/// never appear in the returned JSON (only presence/status is reported).
+fn handle_api_command(
+    bus: &mut vibebus::Bus,
+    root: &std::path::Path,
+    project_id: &str,
+    api_vault: &dyn vibebus::ApiCredentialVault,
+    command: ApiCommand,
+) -> Result<serde_json::Value> {
+    use vibebus::{
+        ApiConfig, ApiFormat, ApiProvider, backup_config, detect_env_conflicts, health_check,
+        list_backups, restore_config,
+    };
+
+    match command {
+        ApiCommand::Provider {
+            command:
+                ApiProviderCommand::Add {
+                    name,
+                    base_url,
+                    format,
+                    model,
+                    key,
+                },
+        } => {
+            // Keys are stored in the OS vault; never accept them from a
+            // non-interactive stdin without an explicit --key.
+            let api_format = ApiFormat::parse(&format)?;
+            let normalized = ApiProvider::normalize_base_url(&base_url)?;
+            let mut config = ApiConfig::load(root)?;
+            if config.providers.contains_key(&name) {
+                return Err(BusError::Conflict(format!(
+                    "api provider '{name}' already exists; delete and re-add to replace it"
+                )));
+            }
+            let provider = ApiProvider {
+                name: name.clone(),
+                base_url: normalized,
+                api_format,
+                model,
+                env_template: std::collections::HashMap::new(),
+            };
+            // Prompt for the key interactively unless an explicit one is given.
+            let key = match key {
+                Some(key) => key,
+                None => {
+                    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        rpassword::prompt_password(format!(
+                            "API key for provider '{name}' (stored in the OS credential vault): "
+                        ))?
+                    } else {
+                        return Err(BusError::Validation(
+                            "no --key provided and stdin is not a terminal; pass the key explicitly".into(),
+                        ));
+                    }
+                }
+            };
+            if key.trim().is_empty() {
+                return Err(BusError::Validation("API key cannot be empty".into()));
+            }
+            api_vault.store_api(project_id, &name, key.trim())?;
+            config.providers.insert(name.clone(), provider);
+            config.save(root)?;
+            Ok(json!({
+                "added": name,
+                "baseUrl": config.providers[&name].base_url,
+                "format": config.providers[&name].api_format.as_str(),
+                "model": config.providers[&name].model,
+                "keyStored": true,
+                "vaultBackend": api_vault.api_backend(),
+            }))
+        }
+        ApiCommand::Provider {
+            command: ApiProviderCommand::List,
+        } => {
+            let config = ApiConfig::load(root)?;
+            let providers = config
+                .providers
+                .values()
+                .map(|provider| {
+                    serde_json::json!({
+                        "name": provider.name,
+                        "baseUrl": provider.base_url,
+                        "format": provider.api_format.as_str(),
+                        "model": provider.model,
+                        "active": config.active.as_deref() == Some(&provider.name),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "active": config.active,
+                "providers": providers,
+                "keyStored": config.providers.keys().map(|name| {
+                    (name.clone(), api_vault.load_api(project_id, name).unwrap_or(None).is_some())
+                }).collect::<std::collections::HashMap<_, _>>(),
+            }))
+        }
+        ApiCommand::Use {
+            name,
+            force,
+            write_config,
+        } => {
+            let mut config = ApiConfig::load(root)?;
+            if !config.providers.contains_key(&name) {
+                return Err(BusError::Validation(format!(
+                    "unknown api provider '{name}'; configured providers: {}",
+                    if config.providers.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        config
+                            .providers
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                )));
+            }
+            // Resolve the full injection env to (a) require the key and (b)
+            // detect system-env conflicts against the real variable set.
+            let resolved =
+                vibebus::resolve_api_env(&config, api_vault, project_id, Some(&name))?
+                    .ok_or_else(|| BusError::Validation("provider did not resolve".into()))?;
+            let conflicts = detect_env_conflicts(&resolved.vars);
+            if !conflicts.is_empty() && !force {
+                let detail = conflicts
+                    .iter()
+                    .map(|conflict| {
+                        format!(
+                            "{} (currently set to '{}')",
+                            conflict.var,
+                            conflict.current.clone().unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(BusError::Conflict(format!(
+                    "system environment conflicts with injected vars: {detail}. Pass --force to override"
+                )));
+            }
+            // Write-ahead backup before mutating the active provider.
+            let backup = backup_config(root)?;
+            config.active = Some(name.clone());
+            config.save(root)?;
+            // Regenerate the env export files for TUI launchers (key is a
+            // vault-resolving command substitution, never a literal).
+            vibebus::write_env_export(root, &config, true)?;
+            // Audit: record activation with variable *names* only — never keys.
+            let injected_names = resolved.vars.keys().cloned().collect::<Vec<_>>();
+            bus.record_audit_event(
+                "api.provider_activated",
+                "api_provider",
+                &name,
+                json!({
+                    "provider": name,
+                    "injectedVars": injected_names,
+                    "backup": backup.file_name().map(|n| n.to_string_lossy()),
+                }),
+            )?;
+            // Channel 4 (opt-in): write into project-level Claude Code config.
+            let mut config_backup: Option<PathBuf> = None;
+            if write_config {
+                config_backup = Some(vibebus::write_claude_config(root, &resolved.vars, &name)?);
+            }
+            Ok(json!({
+                "active": name,
+                "injectedVars": resolved.vars.keys().cloned().collect::<Vec<_>>(),
+                "backup": backup.file_name().map(|n| n.to_string_lossy()),
+                "envExport": ["env.sh", "env.ps1"],
+                "configFile": config_backup.as_ref().map(|p| p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                "force": force,
+            }))
+        }
+        ApiCommand::Unuse => {
+            let mut config = ApiConfig::load(root)?;
+            let previous = config.active.clone();
+            // Revert the channel-4 config file if it was written.
+            vibebus::revert_claude_config(root)?;
+            let backup = backup_config(root)?;
+            config.active = None;
+            config.save(root)?;
+            // Remove the export files so a stale launcher cannot inject a
+            // provider that is no longer active.
+            vibebus::remove_env_export(root)?;
+            if let Some(previous) = &previous {
+                bus.record_audit_event(
+                    "api.provider_deactivated",
+                    "api_provider",
+                    previous,
+                    json!({
+                        "provider": previous,
+                        "backup": backup.file_name().map(|n| n.to_string_lossy()),
+                    }),
+                )?;
+            }
+            Ok(json!({
+                "active": Option::<String>::None,
+                "previousActive": previous,
+                "backup": backup.file_name().map(|n| n.to_string_lossy()),
+            }))
+        }
+        ApiCommand::Restore { n } => {
+            let restored = restore_config(root, n)?;
+            let names = restored.providers.keys().cloned().collect::<Vec<_>>();
+            // Keep the export files in sync with the restored active provider.
+            let key_stored = restored
+                .active
+                .as_deref()
+                .map(|name| {
+                    api_vault
+                        .load_api(project_id, name)
+                        .unwrap_or(None)
+                        .is_some()
+                })
+                .unwrap_or(false);
+            vibebus::write_env_export(root, &restored, key_stored)?;
+            bus.record_audit_event(
+                "api.config_restored",
+                "api_config",
+                "api.json",
+                json!({
+                    "backupIndex": n,
+                    "providers": names,
+                    "active": restored.active,
+                }),
+            )?;
+            Ok(json!({
+                "restored": names,
+                "active": restored.active,
+                "remainingBackups": list_backups(root)?,
+            }))
+        }
+        ApiCommand::Health {
+            name,
+            check_network,
+        } => {
+            let mut health = health_check(&ApiConfig::load(root)?, api_vault, project_id, &name)?;
+            if check_network {
+                let config = ApiConfig::load(root)?;
+                let provider = config.providers.get(&name).ok_or_else(|| {
+                    BusError::Validation(format!("unknown api provider '{name}'"))
+                })?;
+                let reachable = vibebus::check_provider_network(&provider.base_url);
+                health["networkReachable"] = json!(reachable.is_ok());
+                if let Err(error) = reachable {
+                    health["networkError"] = json!(error.to_string());
+                }
+            }
+            Ok(health)
+        }
+        ApiCommand::Run { command } => {
+            let Some(first) = command.first() else {
+                return Err(BusError::Validation(
+                    "api run requires an agent CLI command (e.g. `-- codex exec`)".into(),
+                ));
+            };
+            let config = ApiConfig::load(root)?;
+            let resolved = vibebus::resolve_api_env(&config, api_vault, project_id, None)?
+                .ok_or_else(|| {
+                    BusError::Validation(
+                        "no active api provider; run `vibebus api use --name <provider>` first"
+                            .into(),
+                    )
+                })?;
+            // Detect conflicts in the current shell too; unlike `use` we do not
+            // refuse here because the caller explicitly asked to launch, but we
+            // surface them in a warning on stderr.
+            let conflicts = detect_env_conflicts(&resolved.vars);
+            for conflict in &conflicts {
+                eprintln!(
+                    "warning: system env '{}' would override the injected value; unset it or the provider may not be used",
+                    conflict.var
+                );
+            }
+            // Replace this process with the target CLI under the injected env.
+            // The key is resolved now (from the vault) and only lives in this
+            // process's environment for the child's lifetime.
+            let mut cmd = std::process::Command::new(first);
+            cmd.args(&command[1..]);
+            for (key, value) in &resolved.vars {
+                cmd.env(key, value);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // `exec` only returns on failure; on success the process image
+                // is replaced, so this is the tail expression of the arm.
+                Err(cmd.exec().into())
+            }
+            #[cfg(not(unix))]
+            {
+                let status = cmd.status()?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        ApiCommand::SyncProviders => {
+            let config = ApiConfig::load(root)?;
+            bus.sync_providers_from_api_json(root, &config)?;
+            let records = bus.list_providers()?;
+            Ok(json!({
+                "synced": records.len(),
+                "providers": records.iter().map(|r| json!({
+                    "id": r.id,
+                    "baseUrl": r.base_url,
+                    "apiFormat": r.api_format,
+                    "active": r.active,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        ApiCommand::Key {
+            command: ApiKeyCommand::Get { name },
+        } => {
+            let key = api_vault.load_api(project_id, &name)?.ok_or_else(|| {
+                BusError::CredentialVault(format!(
+                    "api key for provider '{name}' is not stored in the OS credential vault"
+                ))
+            })?;
+            // stdout only; never wrap in the JSON envelope so `source env.sh`
+            // command substitution receives exactly the key bytes.
+            println!("{key}");
+            std::process::exit(0);
+        }
+    }
 }
 
 fn resolve_cli_secret(

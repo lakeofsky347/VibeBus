@@ -1,0 +1,40 @@
+{
+  "description": "Discover VibeBus projects and capture bounded task lifecycle facts for Antigravity.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vibebus hook session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vibebus hook post-tool-use",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PLUGIN_DATA=\"${AGENTS_PROJECT_DIR:-$PWD}/.vibebus/hook-data\" vibebus hook stop",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

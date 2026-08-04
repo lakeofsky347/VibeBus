@@ -32,7 +32,7 @@ use crate::policy::{
 };
 use crate::project::{database_path, discover_project};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 13;
 const DAY_MS: i64 = 86_400_000;
 const MIN_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 60;
 const MAX_OPERATOR_APPROVAL_TTL_SECONDS: i64 = 3_600;
@@ -2705,6 +2705,347 @@ impl Bus {
         )
     }
 
+    /// Append a project-scoped audit event. Unlike mutation methods this is
+    /// intentionally lightweight: it takes no Agent identity (audit trail is a
+    /// local operational log, not an authenticated domain fact) and never
+    /// accepts secret material — the caller must pass only variable *names* and
+    /// status flags in `payload`. Used by the API-injection CLI/MCP paths to
+    /// record provider activation/deactivation/restore.
+    pub fn record_audit_event(
+        &mut self,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<i64> {
+        validate_event_query(0, 1, std::slice::from_ref(&event_type.to_string()))?;
+        let tx = self.conn.transaction()?;
+        append_event(
+            &tx,
+            &self.project.project_id,
+            None,
+            event_type,
+            entity_type,
+            entity_id,
+            payload,
+        )?;
+        let sequence = latest_event_sequence(&tx, &self.project.project_id)?;
+        tx.commit()?;
+        Ok(sequence)
+    }
+
+    /// Sync API providers from `.vibebus/api.json` into the `providers` table
+    /// (upsert semantics). Call after `api.json` mutations so the bus always
+    /// reflects the on-disk config. The API key is never stored here.
+    pub fn sync_providers_from_api_json(
+        &mut self,
+        _root: &Path,
+        config: &crate::ApiConfig,
+    ) -> Result<()> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        for (name, provider) in &config.providers {
+            let env_json = serde_json::to_string(&provider.env_template).unwrap_or_default();
+            let model = provider.model.clone().unwrap_or_default();
+            let active = if config.active.as_deref() == Some(name.as_str()) {
+                1i64
+            } else {
+                0i64
+            };
+            tx.execute(
+                "INSERT INTO providers
+                 (id, project_id, base_url, api_format, model, env_template_json, active, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(project_id, id) DO UPDATE SET
+                 base_url = excluded.base_url, api_format = excluded.api_format,
+                 model = excluded.model, env_template_json = excluded.env_template_json,
+                 active = excluded.active",
+                params![
+                    name,
+                    self.project.project_id,
+                    provider.base_url,
+                    provider.api_format.as_str(),
+                    if model.is_empty() { None::<String> } else { Some(model) },
+                    env_json,
+                    active,
+                    now,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// List registered API providers from the bus (phase-3 source of truth,
+    /// synced from api.json).
+    pub fn list_providers(&self) -> Result<Vec<crate::ProviderRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, project_id, base_url, api_format, model, env_template_json, active, created_at
+             FROM providers WHERE project_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![self.project.project_id], |row| {
+            let model: Option<String> = row.get(3)?;
+            Ok(crate::ProviderRecord {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                base_url: row.get(2)?,
+                api_format: row.get(3)?,
+                model,
+                env_template_json: row.get(5)?,
+                active: row.get::<_, i64>(6)? != 0,
+                created_at: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Register (or update) a Skill in the bus so agents can discover and
+    /// install it. The content is stored as-is (typically SKILL.md body).
+    pub fn register_skill(&mut self, record: &crate::SkillRecord) -> Result<()> {
+        let now = now_ms();
+        let supported = serde_json::to_string(&record.agents_supported).unwrap_or_default();
+        let deps = serde_json::to_string(&record.deps).unwrap_or_default();
+        self.conn.execute(
+            "INSERT INTO skills
+             (id, project_id, version, name, description, agents_supported_json, deps_json, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(project_id, id) DO UPDATE SET
+             version = excluded.version, name = excluded.name,
+             description = excluded.description,
+             agents_supported_json = excluded.agents_supported_json,
+             deps_json = excluded.deps_json,
+             content = excluded.content",
+            params![
+                record.id,
+                self.project.project_id,
+                record.version,
+                record.name,
+                record.description.as_deref().unwrap_or(""),
+                supported,
+                deps,
+                record.content,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Install a registered Skill into an agent CLI's local skill directory,
+    /// resolving and installing all declared dependencies first (topological
+    /// order with cycle detection). Each step backs up the existing file,
+    /// writes the new content, and records an audit event. Conflicts (existing
+    /// file with different content) are recorded to the decisions table and
+    /// do NOT prevent installation.
+    pub fn install_skill(&mut self, skill_id: &str, agent: &str, root: &Path) -> Result<PathBuf> {
+        let mut installed = std::collections::HashSet::new();
+        self.install_skill_deps(
+            skill_id,
+            agent,
+            root,
+            &mut installed,
+            &mut std::collections::HashSet::new(),
+        )?;
+        let record = self.load_skill(skill_id)?;
+        Ok(skill_install_path(root, agent, &record.id))
+    }
+
+    /// Load a single skill with its deps from the bus.
+    fn load_skill(&self, skill_id: &str) -> Result<crate::SkillRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, version, name, content, deps_json FROM skills WHERE project_id = ?1 AND id = ?2",
+                params![self.project.project_id, skill_id],
+                |row| {
+                    let deps: String = row.get(4)?;
+                    Ok(crate::SkillRecord {
+                        id: row.get(0)?,
+                        project_id: self.project.project_id.clone(),
+                        version: row.get(1)?,
+                        name: row.get(2)?,
+                        description: None,
+                        agents_supported: vec![],
+                        deps: serde_json::from_str(&deps).unwrap_or_default(),
+                        content: row.get(3)?,
+                        created_at: 0,
+                    })
+                },
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => BusError::Validation(format!(
+                    "skill '{skill_id}' is not registered in this project"
+                )),
+                other => BusError::Database(other),
+            })
+    }
+
+    /// Recursive dependency resolver for `install_skill`. Installs `skill_id`
+    /// and all its transitive deps in topological order with cycle detection.
+    fn install_skill_deps(
+        &mut self,
+        skill_id: &str,
+        agent: &str,
+        root: &Path,
+        installed: &mut std::collections::HashSet<String>,
+        stack: &mut std::collections::HashSet<String>,
+    ) -> Result<()> {
+        if installed.contains(skill_id) {
+            return Ok(());
+        }
+        if !stack.insert(skill_id.to_string()) {
+            return Err(BusError::Validation(format!(
+                "circular dependency detected while installing skill '{skill_id}'"
+            )));
+        }
+        let record = self.load_skill(skill_id)?;
+        // Install dependencies first (pre-order).
+        for dep in record.deps.clone() {
+            self.install_skill_deps(&dep, agent, root, installed, stack)?;
+        }
+        stack.remove(skill_id);
+        // Install the skill itself: backup → write → audit.
+        let target = skill_install_path(root, agent, &record.id);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Back up existing file before overwriting.
+        if target.exists() {
+            let existing = fs::read_to_string(&target).unwrap_or_default();
+            if existing != record.content {
+                let backup_path = self.skill_backup_path(root, agent, &record.id)?;
+                fs::copy(&target, &backup_path)?;
+                // Record conflict decision (non-blocking).
+                let _ = self.record_conflict(
+                    &record.id,
+                    agent,
+                    "skill_version_conflict",
+                    serde_json::json!({
+                        "skill": record.id,
+                        "agent": agent,
+                        "backup": backup_path.to_string_lossy(),
+                    }),
+                );
+            }
+        }
+        fs::write(&target, &record.content)?;
+        self.record_audit_event(
+            "skill_installed",
+            "skill",
+            &record.id,
+            serde_json::json!({
+                "skill": record.id,
+                "version": record.version,
+                "agent": agent,
+                "path": target.to_string_lossy(),
+            }),
+        )?;
+        installed.insert(skill_id.to_string());
+        Ok(())
+    }
+
+    /// Generate a backup path for a skill file before it is overwritten.
+    fn skill_backup_path(&self, root: &Path, agent: &str, skill_id: &str) -> Result<PathBuf> {
+        let dir = root.join(".vibebus").join("api").join("config-backups");
+        fs::create_dir_all(&dir)?;
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+        Ok(dir.join(format!("skill-{skill_id}-{agent}-{ts}.md")))
+    }
+
+    /// Record a non-fatal conflict to the decisions table.
+    fn record_conflict(
+        &self,
+        _entity_id: &str,
+        agent: &str,
+        decision_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO decisions
+             (id, project_id, task_id, agent_id, decision_type, payload_json, confirmed_by, confirmed_at)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, ?6)",
+            params![
+                format!("dec_{}", uuid::Uuid::new_v4().simple()),
+                self.project.project_id,
+                agent,
+                decision_type,
+                serde_json::to_string(&payload)?,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all registered skills in this project.
+    pub fn list_skills(&self) -> Result<Vec<crate::SkillRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, project_id, version, name, description, agents_supported_json, deps_json, created_at
+             FROM skills WHERE project_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![self.project.project_id], |row| {
+            let supported: String = row.get(5)?;
+            let deps: String = row.get(6)?;
+            Ok(crate::SkillRecord {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                version: row.get(2)?,
+                name: row.get(3)?,
+                description: row.get(4)?,
+                agents_supported: serde_json::from_str(&supported).unwrap_or_default(),
+                deps: serde_json::from_str(&deps).unwrap_or_default(),
+                content: String::new(), // full content excluded from listing
+                created_at: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// List all registered plugins in this project.
+    pub fn list_plugins(&self) -> Result<Vec<crate::PluginRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, project_id, version, mcp_servers_json, hooks_json, skills_json, created_at
+             FROM plugins WHERE project_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![self.project.project_id], |row| {
+            let skills: String = row.get(5)?;
+            Ok(crate::PluginRecord {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                version: row.get(2)?,
+                mcp_servers_json: row.get(3)?,
+                hooks_json: row.get(4)?,
+                skills: serde_json::from_str(&skills).unwrap_or_default(),
+                created_at: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Register (or update) a Plugin.
+    pub fn register_plugin(&mut self, record: &crate::PluginRecord) -> Result<()> {
+        let now = now_ms();
+        let skills = serde_json::to_string(&record.skills).unwrap_or_default();
+        self.conn.execute(
+            "INSERT INTO plugins
+             (id, project_id, version, mcp_servers_json, hooks_json, skills_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(project_id, id) DO UPDATE SET
+             version = excluded.version,
+             mcp_servers_json = excluded.mcp_servers_json,
+             hooks_json = excluded.hooks_json,
+             skills_json = excluded.skills_json",
+            params![
+                record.id,
+                self.project.project_id,
+                record.version,
+                record.mcp_servers_json,
+                record.hooks_json,
+                skills,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn create_subscription(
         &mut self,
         agent: &str,
@@ -4255,7 +4596,44 @@ impl Bus {
              CREATE INDEX IF NOT EXISTS idx_retention_runs_applied
                 ON retention_runs(project_id, applied_at);
              CREATE INDEX IF NOT EXISTS idx_retention_approvals_active
-                ON retention_approvals(project_id, plan_id, consumed_at, expires_at);",
+                ON retention_approvals(project_id, plan_id, consumed_at, expires_at);
+             -- -------- capability registry (phase 3) --------
+             CREATE TABLE IF NOT EXISTS providers (
+                id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                api_format TEXT NOT NULL,
+                model TEXT,
+                env_template_json TEXT NOT NULL DEFAULT '{}',
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(project_id, id),
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+             );
+             CREATE TABLE IF NOT EXISTS skills (
+                id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                agents_supported_json TEXT NOT NULL DEFAULT '[]',
+                deps_json TEXT NOT NULL DEFAULT '[]',
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(project_id, id),
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+             );
+             CREATE TABLE IF NOT EXISTS plugins (
+                id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+                hooks_json TEXT NOT NULL DEFAULT '{}',
+                skills_json TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(project_id, id),
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+             );",
         )?;
         ensure_column(&self.conn, "agents", "recovery_hash", "TEXT")?;
         ensure_column(
@@ -4294,6 +4672,7 @@ impl Bus {
         )?;
         ensure_column(&self.conn, "subscriptions", "last_acked_at", "INTEGER")?;
         ensure_column(&self.conn, "retention_runs", "operator_approval_id", "TEXT")?;
+        ensure_column(&self.conn, "skills", "deps_json", "TEXT")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![SCHEMA_VERSION, now_ms()],
@@ -5506,6 +5885,35 @@ fn exclusive_compaction_error(error: rusqlite::Error) -> BusError {
 
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+/// Resolve the target path for installing a skill into a given agent CLI's
+/// local skill directory. Each agent has its own convention:
+/// - codex → `.codex/skills/<id>/SKILL.md`
+/// - claude → `.claude/skills/<id>/SKILL.md`
+/// - cursor → `.cursor/skills/<id>/SKILL.md`
+/// - opencode → skills/<id>/SKILL.md (project root, like existing)
+/// - antigravity → skills/<id>/SKILL.md
+fn skill_install_path(root: &Path, agent: &str, skill_id: &str) -> PathBuf {
+    match agent {
+        "codex" | "grokbuild" => root
+            .join(".codex")
+            .join("skills")
+            .join(skill_id)
+            .join("SKILL.md"),
+        "claude" => root
+            .join(".claude")
+            .join("skills")
+            .join(skill_id)
+            .join("SKILL.md"),
+        "cursor" => root
+            .join(".cursor")
+            .join("skills")
+            .join(skill_id)
+            .join("SKILL.md"),
+        "opencode" | "antigravity" => root.join("skills").join(skill_id).join("SKILL.md"),
+        _ => root.join("skills").join(skill_id).join("SKILL.md"),
+    }
 }
 
 fn validate_task_transition(current: &str, next: &str) -> Result<()> {
