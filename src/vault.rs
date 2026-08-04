@@ -920,7 +920,7 @@ fn win32_read_credential_blob(target: &str) -> Result<Option<Vec<u8>>> {
             "Windows returned an invalid credential blob".into(),
         ));
     }
-    let mut blob = unsafe { slice::from_raw_parts(raw.CredentialBlob, blob_len).to_vec() };
+    let blob = unsafe { slice::from_raw_parts(raw.CredentialBlob, blob_len).to_vec() };
     if blob_len > 0 {
         unsafe { std::ptr::write_bytes(raw.CredentialBlob, 0, blob_len) };
     }
