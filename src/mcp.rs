@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Bus, BusError, CredentialVault, ResolvedSecret, RetentionPolicy, SecretSource,
-    recovery_delivery, recovery_key_delivery, registration_delivery, resolve_agent_recovery_key,
-    resolve_agent_token,
+    ApiCredentialVault, recovery_delivery, recovery_key_delivery, registration_delivery,
+    resolve_agent_recovery_key, resolve_agent_token, system_api_credential_vault,
     spawn::{AgentProfiles, SessionRegistry},
     system_credential_vault,
 };
@@ -527,11 +527,73 @@ pub struct AgentStatusRequest {
     pub root: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiProviderListRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUseRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub name: String,
+    #[schemars(
+        description = "Override system-environment conflicts so the injected provider wins"
+    )]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUnuseRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiHealthRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    pub name: String,
+    #[schemars(description = "Also probe TCP reachability of the Base URL host")]
+    pub check_network: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillListRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInstallRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+    #[schemars(description = "Registered skill id")]
+    pub id: String,
+    #[schemars(description = "Target agent CLI: codex | claude | cursor | opencode | antigravity")]
+    pub agent: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginListRequest {
+    #[schemars(description = "Absolute path inside the VibeBus project")]
+    pub root: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct VibeBusMcp {
     default_root: PathBuf,
     data_home: Option<PathBuf>,
     vault: Arc<dyn CredentialVault>,
+    api_vault: Arc<dyn ApiCredentialVault>,
     spawn_registry: Arc<SessionRegistry>,
 }
 
@@ -541,6 +603,7 @@ impl VibeBusMcp {
             default_root,
             data_home,
             vault: system_credential_vault(),
+            api_vault: system_api_credential_vault(),
             spawn_registry: SessionRegistry::new(),
         }
     }
@@ -554,6 +617,7 @@ impl VibeBusMcp {
             default_root,
             data_home,
             vault,
+            api_vault: system_api_credential_vault(),
             spawn_registry: SessionRegistry::new(),
         }
     }
@@ -563,6 +627,18 @@ impl VibeBusMcp {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_root.clone());
         Bus::open(&root, self.data_home.as_deref()).map_err(bus_error)
+    }
+
+    /// Resolve the absolute project root from a tool request (or the default).
+    fn root_path(&self, root: Option<&str>) -> PathBuf {
+        root.map(PathBuf::from)
+            .unwrap_or_else(|| self.default_root.clone())
+    }
+
+    /// Resolve the project id for vault keying without holding a Bus open.
+    fn project_id(&self, root: Option<&str>) -> Result<String, ErrorData> {
+        let bus = self.open(root)?;
+        Ok(bus.project().project_id.clone())
     }
 
     fn token(
@@ -602,7 +678,10 @@ impl VibeBusMcp {
             "retention": bus.retention_state().map_err(bus_error)?,
             "operator": bus.operator_status().map_err(bus_error)?,
             "reservations": bus.list_active_reservations().map_err(bus_error)?,
-            "artifacts": bus.list_artifacts(None).map_err(bus_error)?
+            "artifacts": bus.list_artifacts(None).map_err(bus_error)?,
+            "providers": bus.list_providers().map_err(bus_error)?,
+            "skills": bus.list_skills().map_err(bus_error)?,
+            "plugins": bus.list_plugins().map_err(bus_error)?,
         }))
     }
 
@@ -1515,6 +1594,9 @@ impl VibeBusMcp {
                 &request.task,
                 request.role.as_deref(),
                 request.timeout_secs,
+                // Phase-1 CLI-only injection: the MCP tool keeps zero injection
+                // until the phase-2 `vibebus_api_*` tools land.
+                None,
             )
             .await
             .map_err(bus_error)?;
@@ -1587,6 +1669,221 @@ impl VibeBusMcp {
         json_text(&serde_json::json!({
             "sessions": self.spawn_registry.status(),
             "profiles": profiles.list(),
+        }))
+    }
+
+    #[tool(
+        description = "List API providers configured in .vibebus/api.json plus whether each key is stored in the OS vault"
+    )]
+    async fn vibebus_api_provider_list(
+        &self,
+        Parameters(request): Parameters<ApiProviderListRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = self.root_path(request.root.as_deref());
+        let config = crate::ApiConfig::load(&root).map_err(bus_error)?;
+        let project_id = self.project_id(request.root.as_deref())?;
+        let providers = config
+            .providers
+            .values()
+            .map(|provider| {
+                serde_json::json!({
+                    "name": provider.name,
+                    "baseUrl": provider.base_url,
+                    "format": provider.api_format.as_str(),
+                    "model": provider.model,
+                    "active": config.active.as_deref() == Some(&provider.name),
+                })
+            })
+            .collect::<Vec<_>>();
+        let key_stored = config
+            .providers
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    self.api_vault.load_api(&project_id, name).unwrap_or(None).is_some(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        json_text(&serde_json::json!({
+            "active": config.active,
+            "providers": providers,
+            "keyStored": key_stored,
+        }))
+    }
+
+    #[tool(
+        description = "Activate an API provider so its env is injected into spawned agents; writes a write-ahead backup and the TUI env export files, and records an audit event"
+    )]
+    async fn vibebus_api_use(
+        &self,
+        Parameters(request): Parameters<ApiUseRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = self.root_path(request.root.as_deref());
+        let mut bus = self.open(request.root.as_deref())?;
+        let project_id = bus.project().project_id.clone();
+        let mut config = crate::ApiConfig::load(&root).map_err(bus_error)?;
+        if !config.providers.contains_key(&request.name) {
+            return Err(bus_error(BusError::Validation(format!(
+                "unknown api provider '{}'",
+                request.name
+            ))));
+        }
+        let resolved = crate::resolve_api_env(
+            &config,
+            self.api_vault.as_ref(),
+            &project_id,
+            Some(&request.name),
+        )
+        .map_err(bus_error)?
+        .ok_or_else(|| bus_error(BusError::Validation("provider did not resolve".into())))?;
+        let conflicts = crate::detect_env_conflicts(&resolved.vars);
+        let force = request.force.unwrap_or(false);
+        if !conflicts.is_empty() && !force {
+            let detail = conflicts
+                .iter()
+                .map(|conflict| {
+                    format!(
+                        "{} (currently set to '{}')",
+                        conflict.var,
+                        conflict.current.clone().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(bus_error(BusError::Conflict(format!(
+                "system environment conflicts with injected vars: {detail}. Pass force=true to override"
+            ))));
+        }
+        let backup = crate::backup_config(&root).map_err(bus_error)?;
+        config.active = Some(request.name.clone());
+        config.save(&root).map_err(bus_error)?;
+        crate::write_env_export(&root, &config, true).map_err(bus_error)?;
+        let injected = resolved.vars.keys().cloned().collect::<Vec<_>>();
+        bus.record_audit_event(
+            "api.provider_activated",
+            "api_provider",
+            &request.name,
+            serde_json::json!({
+                "provider": request.name,
+                "injectedVars": injected,
+                "backup": backup.file_name().map(|n| n.to_string_lossy()),
+            }),
+        )
+        .map_err(bus_error)?;
+        json_text(&serde_json::json!({
+            "active": request.name,
+            "injectedVars": injected,
+            "backup": backup.file_name().map(|n| n.to_string_lossy()),
+            "envExport": ["env.sh", "env.ps1"],
+            "force": force,
+        }))
+    }
+
+    #[tool(
+        description = "Deactivate the active API provider (keys stay in the vault); removes the env export files and records an audit event"
+    )]
+    async fn vibebus_api_unuse(
+        &self,
+        Parameters(request): Parameters<ApiUnuseRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = self.root_path(request.root.as_deref());
+        let mut bus = self.open(request.root.as_deref())?;
+        let mut config = crate::ApiConfig::load(&root).map_err(bus_error)?;
+        let previous = config.active.clone();
+        let backup = crate::backup_config(&root).map_err(bus_error)?;
+        config.active = None;
+        config.save(&root).map_err(bus_error)?;
+        crate::remove_env_export(&root).map_err(bus_error)?;
+        if let Some(previous) = &previous {
+            bus.record_audit_event(
+                "api.provider_deactivated",
+                "api_provider",
+                previous,
+                serde_json::json!({
+                    "provider": previous,
+                    "backup": backup.file_name().map(|n| n.to_string_lossy()),
+                }),
+            )
+            .map_err(bus_error)?;
+        }
+        json_text(&serde_json::json!({
+            "active": Option::<String>::None,
+            "previousActive": previous,
+            "backup": backup.file_name().map(|n| n.to_string_lossy()),
+        }))
+    }
+
+    #[tool(
+        description = "Local health check for an API provider: config present, Base URL normalized, API key in the vault; optionally probes TCP reachability"
+    )]
+    async fn vibebus_api_health(
+        &self,
+        Parameters(request): Parameters<ApiHealthRequest>,
+    ) -> Result<String, ErrorData> {
+        let root = self.root_path(request.root.as_deref());
+        let project_id = self.project_id(request.root.as_deref())?;
+        let config = crate::ApiConfig::load(&root).map_err(bus_error)?;
+        let mut health = crate::health_check(&config, self.api_vault.as_ref(), &project_id, &request.name)
+            .map_err(bus_error)?;
+        if request.check_network.unwrap_or(false) {
+            let provider = config.providers.get(&request.name).ok_or_else(|| {
+                bus_error(BusError::Validation(format!(
+                    "unknown api provider '{}'",
+                    request.name
+                )))
+            })?;
+            let reachable = crate::check_provider_network(&provider.base_url);
+            health["networkReachable"] = serde_json::json!(reachable.is_ok());
+            if let Err(error) = reachable {
+                health["networkError"] = serde_json::json!(error.to_string());
+            }
+        }
+        json_text(&health)
+    }
+
+    #[tool(
+        description = "List skills registered in the project capability registry (id, version, agents_supported)"
+    )]
+    async fn vibebus_skill_list(
+        &self,
+        Parameters(request): Parameters<SkillListRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        json_text(&serde_json::json!({
+            "skills": bus.list_skills().map_err(bus_error)?,
+        }))
+    }
+
+    #[tool(
+        description = "Install a registered skill into a target agent CLI's local skill directory (codex/claude/cursor/opencode/antigravity)"
+    )]
+    async fn vibebus_skill_install(
+        &self,
+        Parameters(request): Parameters<SkillInstallRequest>,
+    ) -> Result<String, ErrorData> {
+        let mut bus = self.open(request.root.as_deref())?;
+        let root = self.root_path(request.root.as_deref());
+        let path = bus
+            .install_skill(&request.id, &request.agent, &root)
+            .map_err(bus_error)?;
+        json_text(&serde_json::json!({
+            "skill": request.id,
+            "agent": request.agent,
+            "installedAt": path.to_string_lossy(),
+        }))
+    }
+
+    #[tool(
+        description = "List plugins registered in the project capability registry"
+    )]
+    async fn vibebus_plugin_list(
+        &self,
+        Parameters(request): Parameters<PluginListRequest>,
+    ) -> Result<String, ErrorData> {
+        let bus = self.open(request.root.as_deref())?;
+        json_text(&serde_json::json!({
+            "plugins": bus.list_plugins().map_err(bus_error)?,
         }))
     }
 }

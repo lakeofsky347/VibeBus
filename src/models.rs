@@ -480,3 +480,52 @@ pub struct HandoffSnapshot {
     pub latest_event_sequence: i64,
     pub retention_state: RetentionStateView,
 }
+
+// ---------------------------------------------------------------------------
+// Capability registry (phase 3): providers, skills, plugins
+// ---------------------------------------------------------------------------
+
+/// A registered API provider (mirrors `.vibebus/api.json` in the bus for
+/// cross-agent discovery). The API key is never stored here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRecord {
+    pub id: String,
+    pub project_id: String,
+    pub base_url: String,
+    pub api_format: String,
+    pub model: Option<String>,
+    pub env_template_json: String,
+    pub active: bool,
+    pub created_at: i64,
+}
+
+/// A registered Skill (coordination SKILL.md content). One registration
+/// serves all supported agent CLIs; `agents_supported` declares which ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRecord {
+    pub id: String,
+    pub project_id: String,
+    pub version: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub agents_supported: Vec<String>,
+    #[serde(default)]
+    pub deps: Vec<String>,
+    pub content: String,
+    pub created_at: i64,
+}
+
+/// A registered Plugin (adapter pack metadata).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRecord {
+    pub id: String,
+    pub project_id: String,
+    pub version: String,
+    pub mcp_servers_json: String,
+    pub hooks_json: String,
+    pub skills: Vec<String>,
+    pub created_at: i64,
+}

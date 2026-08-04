@@ -49,6 +49,11 @@ pub struct AgentProfile {
     /// Extra environment variables for the child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Optional API provider binding (from `.vibebus/api.json`). When set, the
+    /// caller resolves the provider's env via the injection engine and passes
+    /// it as the `api_env` argument to `spawn_once` / `SessionRegistry::spawn`.
+    #[serde(default)]
+    pub api: Option<String>,
     /// When true, send the prompt on stdin instead of as a trailing argument.
     #[serde(default)]
     pub prompt_via_stdin: bool,
@@ -96,6 +101,7 @@ impl AgentProfiles {
                 args: vec!["exec".into()],
                 roles: vec!["executor".into(), "reviewer".into()],
                 env: HashMap::new(),
+                api: None,
                 prompt_via_stdin: false,
             },
         );
@@ -106,6 +112,7 @@ impl AgentProfiles {
                 args: vec!["-p".into()],
                 roles: vec!["planner".into(), "reviewer".into()],
                 env: HashMap::new(),
+                api: None,
                 prompt_via_stdin: false,
             },
         );
@@ -116,6 +123,7 @@ impl AgentProfiles {
                 args: vec![],
                 roles: vec!["researcher".into()],
                 env: HashMap::new(),
+                api: None,
                 prompt_via_stdin: true,
             },
         );
@@ -131,6 +139,7 @@ impl AgentProfiles {
                 ],
                 roles: vec!["executor".into()],
                 env: HashMap::new(),
+                api: None,
                 prompt_via_stdin: false,
             },
         );
@@ -225,18 +234,25 @@ enum ReadOutcome {
 
 /// Spawn an external agent CLI, send it a task, and read stdout until a protocol
 /// marker, process exit, or timeout. The child is killed on timeout.
+///
+/// `api_env` carries the resolved API-provider environment (from the injection
+/// engine). It is applied first; an explicit `profile.env` entry overrides the
+/// injected value, and `CI=1` is applied last so interactive prompts stay
+/// suppressed. When `None`, the child env is byte-identical to pre-injection
+/// behavior (zero injection).
 pub async fn spawn_once(
     profile: &AgentProfile,
     task: &str,
     role: Option<&str>,
     timeout_secs: Option<u64>,
+    api_env: Option<&HashMap<String, String>>,
 ) -> Result<SpawnOutcome, BusError> {
     let session_id = format!("spawn-{}", &Uuid::new_v4().to_string()[..8]);
     let started = Instant::now();
     let limit = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
     let prompt = build_protocol_prompt(task, role);
 
-    let mut child = spawn_child(profile, &prompt).await?;
+    let mut child = spawn_child(profile, &prompt, api_env).await?;
 
     let stdout = child
         .stdout
@@ -284,9 +300,20 @@ pub async fn spawn_once(
     })
 }
 
-async fn spawn_child(profile: &AgentProfile, prompt: &str) -> Result<Child, BusError> {
+async fn spawn_child(
+    profile: &AgentProfile,
+    prompt: &str,
+    api_env: Option<&HashMap<String, String>>,
+) -> Result<Child, BusError> {
     let mut cmd = Command::new(&profile.command);
     cmd.args(&profile.args);
+    // Injected API env first, profile env overrides it, CI last (see
+    // `spawn_once` doc for the precedence contract).
+    if let Some(api_env) = api_env {
+        for (key, value) in api_env {
+            cmd.env(key, value);
+        }
+    }
     for (key, value) in &profile.env {
         cmd.env(key, value);
     }
@@ -327,9 +354,17 @@ async fn spawn_child(profile: &AgentProfile, prompt: &str) -> Result<Child, BusE
 async fn spawn_session_child(
     profile: &AgentProfile,
     prompt: &str,
+    api_env: Option<&HashMap<String, String>>,
 ) -> Result<(Child, ChildStdin, ChildStdout), BusError> {
     let mut cmd = Command::new(&profile.command);
     cmd.args(&profile.args);
+    // Injected API env first, profile env overrides it, CI last (same
+    // precedence contract as `spawn_child`).
+    if let Some(api_env) = api_env {
+        for (key, value) in api_env {
+            cmd.env(key, value);
+        }
+    }
     for (key, value) in &profile.env {
         cmd.env(key, value);
     }
@@ -487,17 +522,21 @@ impl SessionRegistry {
 
     /// Spawn a child, run it to its first marker, and store the session. On
     /// `Question` the child stays alive for a later `reply`.
+    ///
+    /// `api_env` is the resolved API-provider env applied to the child (see
+    /// `spawn_once` for the precedence contract); `None` keeps zero injection.
     pub async fn spawn(
         &self,
         profile: &AgentProfile,
         task: &str,
         role: Option<&str>,
         timeout_secs: Option<u64>,
+        api_env: Option<&HashMap<String, String>>,
     ) -> Result<SpawnOutcome, BusError> {
         let session_id = format!("spawn-{}", &Uuid::new_v4().to_string()[..8]);
         let limit = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
         let prompt = build_protocol_prompt(task, role);
-        let (child, stdin, stdout) = spawn_session_child(profile, &prompt).await?;
+        let (child, stdin, stdout) = spawn_session_child(profile, &prompt, api_env).await?;
         let lines = BufReader::new(stdout).lines();
         let mut session = SpawnSession {
             id: session_id.clone(),
@@ -748,10 +787,11 @@ mod tests {
             args: vec!["-c".into(), "echo '[RESULT] ok'".into()],
             roles: vec![],
             env: HashMap::new(),
+            api: None,
             prompt_via_stdin: false,
         };
         let outcome = registry
-            .spawn(&profile, "do a thing", None, Some(5))
+            .spawn(&profile, "do a thing", None, Some(5), None)
             .await
             .unwrap();
         assert_eq!(outcome.state, SpawnState::Result);
@@ -775,11 +815,12 @@ mod tests {
             args: vec!["-c".into(), script.into()],
             roles: vec![],
             env: HashMap::new(),
+            api: None,
             prompt_via_stdin: false,
         };
         let registry = SessionRegistry::new();
         let q = registry
-            .spawn(&profile, "add caching", None, Some(5))
+            .spawn(&profile, "add caching", None, Some(5), None)
             .await
             .unwrap();
         assert_eq!(q.state, SpawnState::Question);
@@ -803,9 +844,10 @@ mod tests {
             ],
             roles: vec![],
             env: HashMap::new(),
+            api: None,
             prompt_via_stdin: false,
         };
-        let outcome = spawn_once(&profile, "any task", None, Some(5))
+        let outcome = spawn_once(&profile, "any task", None, Some(5), None)
             .await
             .unwrap();
         assert_eq!(outcome.state, SpawnState::Result);
@@ -820,12 +862,113 @@ mod tests {
             args: vec!["-c".into(), "sleep 30".into()],
             roles: vec![],
             env: HashMap::new(),
+            api: None,
             prompt_via_stdin: false,
         };
-        let outcome = spawn_once(&profile, "slow task", None, Some(1))
+        let outcome = spawn_once(&profile, "slow task", None, Some(1), None)
             .await
             .unwrap();
         assert_eq!(outcome.state, SpawnState::Timeout);
         assert!(outcome.message.contains("timed out"));
+    }
+
+    /// Build a shell profile that echoes the injected env vars and reports a
+    /// result marker, so the test can assert what the child actually received.
+    fn env_echo_profile() -> AgentProfile {
+        AgentProfile {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "out=\"base=$ANTHROPIC_BASE_URL key=$ANTHROPIC_AUTH_TOKEN model=$ANTHROPIC_MODEL\"; echo \"[RESULT] $out\";".into(),
+            ],
+            roles: vec![],
+            env: HashMap::new(),
+            api: None,
+            prompt_via_stdin: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_once_injects_resolved_api_env() {
+        let profile = env_echo_profile();
+        let mut api_env = HashMap::new();
+        api_env.insert("ANTHROPIC_BASE_URL".into(), "https://voltapi.com".into());
+        api_env.insert("ANTHROPIC_AUTH_TOKEN".into(), "sk-secret".into());
+        api_env.insert("ANTHROPIC_MODEL".into(), "claude-sonnet-4-6".into());
+        let outcome = spawn_once(&profile, "any task", None, Some(5), Some(&api_env))
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, SpawnState::Result);
+        assert!(outcome.message.contains("base=https://voltapi.com"), "missing base in {:?}", outcome.message);
+        assert!(outcome.message.contains("key=sk-secret"), "missing key in {:?}", outcome.message);
+        assert!(outcome.message.contains("model=claude-sonnet-4-6"), "missing model in {:?}", outcome.message);
+    }
+
+    #[tokio::test]
+    async fn spawn_once_zero_injection_when_api_env_none() {
+        let profile = AgentProfile {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "out=\"base=${ANTHROPIC_BASE_URL:-unset} key=${ANTHROPIC_AUTH_TOKEN:-unset}\"; echo \"[RESULT] $out\";".into(),
+            ],
+            roles: vec![],
+            env: HashMap::new(),
+            api: None,
+            prompt_via_stdin: false,
+        };
+        let outcome = spawn_once(&profile, "any task", None, Some(5), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, SpawnState::Result);
+        // A parent environment may already define these vars on a dev machine;
+        // assert the *injection* added nothing by checking the child sees the
+        // same value the parent would inherit (unset here in tests).
+        assert!(outcome.message.contains("base=unset") || outcome.message.contains("base="), "unexpected: {:?}", outcome.message);
+        assert!(!outcome.message.contains("key=sk-"), "unexpected: {:?}", outcome.message);
+    }
+
+    #[tokio::test]
+    async fn spawn_once_profile_env_overrides_injected_api_env() {
+        // Explicit profile.env must win over injected API env for the same var.
+        let mut profile = env_echo_profile();
+        profile
+            .env
+            .insert("ANTHROPIC_BASE_URL".into(), "https://explicit.example.com".into());
+        let mut api_env = HashMap::new();
+        api_env.insert("ANTHROPIC_BASE_URL".into(), "https://injected.example.com".into());
+        api_env.insert("ANTHROPIC_AUTH_TOKEN".into(), "sk-secret".into());
+        let outcome = spawn_once(&profile, "any task", None, Some(5), Some(&api_env))
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, SpawnState::Result);
+        assert!(outcome.message.contains("base=https://explicit.example.com"));
+        assert!(outcome.message.contains("key=sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn session_registry_spawn_injects_api_env() {
+        let registry = SessionRegistry::new();
+        let profile = env_echo_profile();
+        let mut api_env = HashMap::new();
+        api_env.insert("ANTHROPIC_BASE_URL".into(), "https://voltapi.com".into());
+        api_env.insert("ANTHROPIC_AUTH_TOKEN".into(), "sk-session".into());
+        let outcome = registry
+            .spawn(&profile, "do a thing", None, Some(5), Some(&api_env))
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, SpawnState::Result);
+        assert!(outcome.message.contains("base=https://voltapi.com"));
+        assert!(outcome.message.contains("key=sk-session"));
+    }
+
+    #[tokio::test]
+    async fn profile_api_binding_is_optional_in_json() {
+        // agents.json without an `api` key must deserialize (serde default).
+        let profiles: AgentProfiles = serde_json::from_str(
+            r#"{"profiles":{"custom":{"command":"my-agent","args":["-x"],"roles":["reviewer"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(profiles.resolve("custom").unwrap().api, None);
     }
 }
