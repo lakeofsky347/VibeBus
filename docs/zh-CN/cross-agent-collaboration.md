@@ -1,7 +1,8 @@
 # VibeBus 跨 Agent 协作架构设计
 
-> 状态：设计提案 · 基于 codex-plugin-cc、pal-mcp-server、agent-link-mcp 三个开源项目的架构模式提炼
+> 状态：设计提案（部分已落地）· 基于 codex-plugin-cc、pal-mcp-server、agent-link-mcp 三个开源项目的架构模式提炼
 > 目标：在 VibeBus 现有「本地事实总线」之上，增加单一 Agent 多任务栏、跨 Agent 协作、统一 TUI 三项能力
+> 落地进度：生成层（Agent Spawn Bridge，第 4.3 节）已在 0.11.0 实现；TUI（ratatui）与任务栏编排仍为未来阶段
 
 ## 1. 设计目标与参考模式提炼
 
@@ -23,7 +24,7 @@
 
 ### 1.3 设计原则
 
-VibeBus 已是一个成熟的**本地结构化事实总线**（SQLite WAL + 40+ MCP 工具 + 原子任务认领 + 消息/决策/制品/订阅/handoff）。本设计**不重造总线**，而是把上述三项目的的协作模式**映射到 VibeBus 已有事实原语之上**，仅新增最小必要的「生成层」与「TUI 层」。
+VibeBus 已是一个成熟的**本地结构化事实总线**（SQLite WAL + 58 个 MCP 工具 + 原子任务认领 + 消息/决策/制品/订阅/handoff）。本设计**不重造总线**，而是把上述三项目的的协作模式**映射到 VibeBus 已有事实原语之上**，仅新增最小必要的「生成层」与「TUI 层」。
 
 - **事实为源**：所有协作状态（委派、结果、进度）都是 VibeBus 持久事实，崩溃/重连可恢复。
 - **隔离优先**：子代理在独立进程/独立上下文运行，只通过事实总线交换摘要，不污染主上下文。
@@ -251,7 +252,7 @@ Host Agent (A)                          Subordinate Agent (B)
 | ② 编排层 | task_dependencies、send、handoff_send、subscription | 任务栏多面板调度逻辑、分发决策树、两击求助规则（SKILL） |
 | ① TUI | status、context_sync、inbox、events、subscription_peek | `vibebus tui`（ratatui） |
 
-**核心结论**：跨 Agent 协作的「通信机制」几乎完全复用 VibeBus 已有事实原语（message/handoff/task/subscription）；真正新增的是「生成层」（spawn 双向通道）和「TUI 层」（统一可视化）。这保证了既有不变量（#1–#40）全部成立，新能力是叠加而非替换。
+**核心结论**：跨 Agent 协作的「通信机制」几乎完全复用 VibeBus 已有事实原语（message/handoff/task/subscription）；真正新增的是「生成层」（spawn 双向通道）和「TUI 层」（统一可视化）。这保证了既有不变量（#1–#40）全部成立，生成层与注入/注册能力以新增不变量（#41–#44）表达，新能力是叠加而非替换。
 
 ## 8. 落地路线图
 

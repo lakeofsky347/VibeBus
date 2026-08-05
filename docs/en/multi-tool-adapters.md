@@ -15,7 +15,7 @@ VibeBus was originally a Codex plugin. Codex, Claude Code, Cursor, OpenCode, and
 | Plugin manifest | `.codex-plugin/plugin.json` | (none; `.claude/`) | `.cursor-plugin/plugin.json` | (none; `.opencode/`) | `plugin.json` |
 | Rules / instructions | skills | `CLAUDE.md` / `.claude/rules/` | `.cursor/rules/*.mdc` | `AGENTS.md` | `rules/` |
 
-The MCP server (`vibebus mcp`, built on `rmcp`) and the 40+ `vibebus_*` tools are identical across all adapters — only the configuration file that launches them differs.
+The MCP server (`vibebus mcp`, built on `rmcp`) and the 58 `vibebus_*` tools are identical across all adapters — only the configuration file that launches them differs.
 
 ## Adapter packages
 

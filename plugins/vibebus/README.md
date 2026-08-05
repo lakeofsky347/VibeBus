@@ -46,7 +46,7 @@ vibebus.exe credential status --root D:\path\to\repo --agent ui
 ```sh
 ./scripts/package-plugin-macos.sh
 codex plugin marketplace add \
-  "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+  "$PWD/dist/staging/VibeBus-0.11.0-macos-arm64"
 codex plugin add vibebus@vibebus-local
 ./plugins/vibebus/bin/vibebus --root "$PWD" \
   register --name mac-worker --role implementation --store-credentials
@@ -61,16 +61,16 @@ codex plugin add vibebus@vibebus-local
 镜像是非 root、命令式的 CLI/std io MCP 交付，不是 HTTP 服务：
 
 ```powershell
-./scripts/test-container.ps1 -ImageTag vibebus:0.10.0-local
+./scripts/test-container.ps1 -ImageTag vibebus:0.11.0-local
 docker run --rm `
   --mount type=bind,source=D:\path\to\repo,target=/workspace `
   --mount type=volume,source=vibebus-data,target=/data `
-  vibebus:0.10.0-local doctor --root /workspace
+  vibebus:0.11.0-local doctor --root /workspace
 ```
 
 容器内使用 `/workspace` 项目挂载和 `/data` SQLite volume，运行用户为 `10001:10001`。Linux 没有 Windows Credential Manager，不能使用 `--store-credentials`；请通过短时显式 token 或 `VIBEBUS_AGENT_TOKEN` 注入凭据，且不要把 token、恢复密钥、operator、云或签名凭据写入镜像、参数记录、仓库或报告。
 
-阿里云 ACR 的登录、推送和 digest 验证见 [容器交付](../../docs/container.md)。
+阿里云 ACR 的登录、推送和 digest 验证见 [容器交付](../../docs/en/container.md)。
 
 ## 安全模型
 
@@ -90,7 +90,7 @@ docker run --rm `
 ./scripts/build-release.ps1
 $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
 ./scripts/test-installer.ps1 -MsiPath $msi.FullName
-./scripts/test-container.ps1 -ImageTag vibebus:0.10.0-local
+./scripts/test-container.ps1 -ImageTag vibebus:0.11.0-local
 ```
 
 macOS：
@@ -102,7 +102,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 ./scripts/test-macos-keychain.sh
 ./scripts/package-plugin-macos.sh
 ./scripts/validate-plugin-macos.sh \
-  ./dist/staging/VibeBus-0.10.0-macos-arm64/plugins/vibebus
+  ./dist/staging/VibeBus-0.11.0-macos-arm64/plugins/vibebus
 ```
 
 生产 tag 发布还需要代码签名证书和密码；缺少它们时发布路径应失败关闭。普通 PR 的本地包明确是未签名验收包，不是生产发布。
@@ -110,12 +110,12 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 项目级入口：
 
 - [根 README](../../README.md)
-- [架构](../../docs/architecture.md)
-- [CLI 与 MCP 协议](../../docs/protocol.md)
-- [验收记录](../../docs/acceptance.md)
-- [发布工程](../../docs/release.md)
-- [容器交付](../../docs/container.md)
-- [macOS 开发与本地交付](../../docs/macos.md)
+- [架构](../../docs/en/architecture.md)
+- [CLI 与 MCP 协议](../../docs/en/protocol.md)
+- [备份与恢复](../../docs/en/backup-restore.md)
+- [发布工程](../../docs/en/release.md)
+- [容器交付](../../docs/en/container.md)
+- [macOS 开发与本地交付](../../docs/en/macos.md)
 - [协调 Skill](skills/vibebus-coordination/SKILL.md)
 
 ## 品牌资产
