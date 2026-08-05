@@ -1,5 +1,7 @@
 # VibeBus
 
+**English** · [简体中文](docs/zh-CN/README.md) · [Documentation hub](docs/README.md)
+
 ![VibeBus logo](plugins/vibebus/assets/vibebus-logo-light.png)
 
 VibeBus is a local, structured **fact bus** for independent coding-agent tasks. Tasks keep their own conversations and worktrees while sharing only explicit facts — messages, acknowledgements, task state, decisions, path reservations, artifacts, and bounded Git or test results — through a project-scoped SQLite database.
@@ -21,7 +23,7 @@ VibeBus sits between them as the **durable source of coordination truth**:
 ## Features
 
 - **Rust CLI + stdio MCP server** (`vibebus mcp`, 58 `vibebus_*` tools) — one binary, one domain model.
-- **Per-tool adapters** for Codex, Claude Code, Cursor, OpenCode, and Antigravity — same bus, same skill, per-agent wiring. See [Multi-tool adapters](docs/multi-tool-adapters.md).
+- **Per-tool adapters** for Codex, Claude Code, Cursor, OpenCode, and Antigravity — same bus, same skill, per-agent wiring. See [Multi-tool adapters](docs/en/multi-tool-adapters.md).
 - **OS-vault credentials** — Windows Credential Manager and macOS Keychain; SQLite stores digests only.
 - **Strict responsibility policy** — `.vibebus/responsibility.json` maps roles to validated project-relative paths, with task-scoped expiring overrides.
 - **Immutable facts** — confirmed decisions, Git commit facts, and test-result facts replay exactly and conflict on drift.
@@ -36,7 +38,7 @@ VibeBus sits between them as the **durable source of coordination truth**:
 
 ### 1. Install
 
-From a release: download the source archive and verify it per [docs/release.md](docs/release.md), then build with Rust 1.97.1. Or install the Codex plugin from this repository:
+From a release: download the source archive and verify it per [docs/en/release.md](docs/en/release.md), then build with Rust 1.97.1. Or install the Codex plugin from this repository:
 
 ```powershell
 # Windows
@@ -89,7 +91,7 @@ Each agent task loads the `vibebus-coordination` Skill and then:
 
 ## CLI and MCP surface
 
-One binary, two interfaces with identical domain models. CLI responses are JSON; MCP tools return formatted JSON as text content. The full capability tables (identity, messages, tasks, threads, reservations, artifacts, decisions, facts, context, events, subscriptions, retention, compaction, handoffs, spawn, API injection, capability registry) are in [docs/protocol.md](docs/protocol.md).
+One binary, two interfaces with identical domain models. CLI responses are JSON; MCP tools return formatted JSON as text content. The full capability tables (identity, messages, tasks, threads, reservations, artifacts, decisions, facts, context, events, subscriptions, retention, compaction, handoffs, spawn, API injection, capability registry) are in [docs/en/protocol.md](docs/en/protocol.md).
 
 ```sh
 vibebus init | register | agents | agent recover | credential status
@@ -109,7 +111,7 @@ vibebus skill register|list|install | plugin list
 vibebus status | doctor | backup | mcp
 ```
 
-MCP tools require the absolute project root as `root` on every call when launched from a plugin. See [docs/protocol.md](docs/protocol.md) for the MCP tool names.
+MCP tools require the absolute project root as `root` on every call when launched from a plugin. See [docs/en/protocol.md](docs/en/protocol.md) for the MCP tool names.
 
 ## Repository layout
 
@@ -133,7 +135,7 @@ Stable releases are currently source-only. GitHub automatically provides the tag
 
 To verify a downloaded stable release, download the GitHub-generated source archive and the four uploaded evidence files from the same GitHub Release. Check that the manifest's tag and source revision identify the source archive, then verify `SHA256SUMS.txt` against its three listed evidence files. This source-only release has no installation, signature, upgrade, or binary rollback claim.
 
-Detailed maintainer and verifier instructions are in [docs/release.md](docs/release.md).
+Detailed maintainer and verifier instructions are in [docs/en/release.md](docs/en/release.md).
 
 ## Development
 
@@ -167,14 +169,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations, [SECURITY.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
-- [CLI and MCP protocol](docs/protocol.md)
-- [Multi-tool adapters](docs/multi-tool-adapters.md)
-- [Design research and decisions](docs/design-research.md)
-- [Backup, export, and restore](docs/backup-restore.md)
-- [Release engineering](docs/release.md)
-- [macOS development](docs/macos.md)
-- [Container development](docs/container.md)
-- [Maintainer handoff](docs/HANDOFF.md)
+- [Architecture](docs/en/architecture.md)
+- [CLI and MCP protocol](docs/en/protocol.md)
+- [Multi-tool adapters](docs/en/multi-tool-adapters.md)
+- [Design research and decisions](docs/en/design-research.md)
+- [Backup, export, and restore](docs/en/backup-restore.md)
+- [Release engineering](docs/en/release.md)
+- [macOS development](docs/en/macos.md)
+- [Container development](docs/en/container.md)
+- [Maintainer handoff](docs/en/HANDOFF.md)
 
 VibeBus is released under the [MIT License](LICENSE).

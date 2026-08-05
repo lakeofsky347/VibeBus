@@ -8,7 +8,7 @@ The current release contract is source-only. GitHub automatically supplies the t
 
 ## Before changing the repository
 
-1. Read `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/release.md`, and the affected platform documentation.
+1. Read `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/en/release.md`, and the affected platform documentation.
 2. Inspect the active branch and working tree. Do not overwrite another contributor's changes.
 3. Run the smallest relevant validation first, then the full affected-platform suite before proposing a release-related merge.
 4. Never commit Agent credentials, recovery keys, signing material, local databases, backups, generated plugin binaries, or `dist/` assets.

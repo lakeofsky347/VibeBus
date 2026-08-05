@@ -70,7 +70,7 @@ docker run --rm `
 
 容器内使用 `/workspace` 项目挂载和 `/data` SQLite volume，运行用户为 `10001:10001`。Linux 没有 Windows Credential Manager，不能使用 `--store-credentials`；请通过短时显式 token 或 `VIBEBUS_AGENT_TOKEN` 注入凭据，且不要把 token、恢复密钥、operator、云或签名凭据写入镜像、参数记录、仓库或报告。
 
-阿里云 ACR 的登录、推送和 digest 验证见 [容器交付](../../docs/container.md)。
+阿里云 ACR 的登录、推送和 digest 验证见 [容器交付](../../docs/en/container.md)。
 
 ## 安全模型
 
@@ -110,12 +110,12 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 项目级入口：
 
 - [根 README](../../README.md)
-- [架构](../../docs/architecture.md)
-- [CLI 与 MCP 协议](../../docs/protocol.md)
-- [备份与恢复](../../docs/backup-restore.md)
-- [发布工程](../../docs/release.md)
-- [容器交付](../../docs/container.md)
-- [macOS 开发与本地交付](../../docs/macos.md)
+- [架构](../../docs/en/architecture.md)
+- [CLI 与 MCP 协议](../../docs/en/protocol.md)
+- [备份与恢复](../../docs/en/backup-restore.md)
+- [发布工程](../../docs/en/release.md)
+- [容器交付](../../docs/en/container.md)
+- [macOS 开发与本地交付](../../docs/en/macos.md)
 - [协调 Skill](skills/vibebus-coordination/SKILL.md)
 
 ## 品牌资产
