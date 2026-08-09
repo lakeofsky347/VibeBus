@@ -52,12 +52,12 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$' -or $Version -ne $cargoVersion) {
 $expectedStagingName = "VibeBus-$Version-windows-x64"
 $expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $outputRoot "staging") $expectedStagingName))
 
-$packageArguments = @(
-    "-CargoPath", $CargoPath,
-    "-OutputRoot", $outputRoot,
-    "-ExpectedVersion", $Version
-)
-$packageOutput = & (Join-Path $PSScriptRoot "package-plugin.ps1") @packageArguments
+$packageParameters = @{
+    CargoPath = $CargoPath
+    OutputRoot = $outputRoot
+    ExpectedVersion = $Version
+}
+$packageOutput = & (Join-Path $PSScriptRoot "package-plugin.ps1") @packageParameters
 $packageExitCode = $LASTEXITCODE
 if ($packageExitCode -ne 0) {
     throw "package-plugin.ps1 failed with exit code $packageExitCode."

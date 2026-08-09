@@ -103,6 +103,7 @@ PLATFORM_BINARY = {
     "windows": "vibebus.exe",
 }
 ARCH_ALIASES = {
+    "x64": "x64",
     "amd64": "x64",
     "x86_64": "x64",
     "arm64": "arm64",
