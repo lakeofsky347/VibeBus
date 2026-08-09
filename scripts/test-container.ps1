@@ -82,10 +82,23 @@ $sourceRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceRevision -notmatch '^[0-9a-f]{40}$') {
     throw "Git source revision could not be resolved"
 }
-$cargoText = Get-Content -Raw -LiteralPath (Join-Path $repoRoot "Cargo.toml")
-$expectedVersion = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"').Groups["version"].Value
-if ([string]::IsNullOrWhiteSpace($expectedVersion)) {
-    throw "Cargo package version could not be resolved"
+$metadataRaw = & cargo metadata --locked --no-deps --format-version 1 --manifest-path (Join-Path $repoRoot "Cargo.toml")
+if ($LASTEXITCODE -ne 0) {
+    throw "Cargo metadata could not be resolved"
+}
+$metadata = $metadataRaw | ConvertFrom-Json -ErrorAction Stop
+$rootManifest = [IO.Path]::GetFullPath((Join-Path $repoRoot "Cargo.toml"))
+$packages = @($metadata.packages | Where-Object {
+    $_.name -ceq "vibebus" -and [IO.Path]::GetFullPath([string]$_.manifest_path) -eq $rootManifest
+})
+if ($packages.Count -ne 1 -or [string]$packages[0].version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Expected exactly one semantic-versioned root VibeBus Cargo package"
+}
+$expectedVersion = [string]$packages[0].version
+$pluginManifestPath = Join-Path $repoRoot "plugins/vibebus/.codex-plugin/plugin.json"
+$pluginManifest = Get-Content -Raw -LiteralPath $pluginManifestPath | ConvertFrom-Json -ErrorAction Stop
+if ([string]$pluginManifest.version -ne $expectedVersion) {
+    throw "Cargo and Codex plugin versions must match"
 }
 if ([string]::IsNullOrWhiteSpace($ImageTag)) {
     $ImageTag = "vibebus:$expectedVersion-local"
@@ -200,9 +213,18 @@ try {
     if ($initializedResponse.result.serverInfo.name -ne "vibebus") {
         throw "container MCP initialize returned an unexpected server"
     }
+    if ($initializedResponse.result.serverInfo.version -ne $expectedVersion) {
+        throw "container MCP initialize returned an unexpected version"
+    }
     $toolCount = @($toolsResponse.result.tools).Count
     if ($toolCount -lt 40) {
         throw "container MCP tools/list returned only $toolCount tools"
+    }
+    $toolNames = @($toolsResponse.result.tools | ForEach-Object { [string]$_.name })
+    foreach ($requiredTool in @("vibebus_status", "vibebus_doctor")) {
+        if ($requiredTool -notin $toolNames) {
+            throw "container MCP tools/list is missing $requiredTool"
+        }
     }
 
     Write-Host "[container] inspecting accepted image"

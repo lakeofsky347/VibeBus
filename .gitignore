@@ -1,6 +1,7 @@
 /.tools/
 /target/
 /dist/
+__pycache__/
 *.cdx.json
 /plugins/vibebus/bin/vibebus
 /plugins/vibebus/bin/*.exe

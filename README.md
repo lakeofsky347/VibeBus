@@ -12,7 +12,9 @@ Windows:
 
 ```powershell
 ./scripts/package-plugin.ps1
-codex plugin marketplace add .
+$version = (python scripts/plugin_package.py version --repo-root . --cargo cargo).Trim()
+$staging = "$PWD/dist/staging/VibeBus-$version-windows-x64"
+codex plugin marketplace add $staging
 codex plugin add vibebus@vibebus-local
 ```
 
@@ -20,7 +22,9 @@ macOS:
 
 ```sh
 ./scripts/package-plugin-macos.sh
-codex plugin marketplace add "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+arch="$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)"
+codex plugin marketplace add "$PWD/dist/staging/VibeBus-$version-macos-$arch"
 codex plugin add vibebus@vibebus-local
 ```
 

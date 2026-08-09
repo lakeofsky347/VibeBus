@@ -123,6 +123,42 @@ jobs:
         shell: pwsh
         run: ./scripts/test-container.ps1
 
+  linux:
+    name: Linux staged plugin contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup show active-toolchain
+
+      - name: Build, validate, and negatively test Linux staged plugin
+        shell: bash
+        run: |
+          ./scripts/package-plugin-linux.sh
+          version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+          plugin="dist/staging/VibeBus-${version}-linux-x64/plugins/vibebus"
+          marketplace="dist/staging/VibeBus-${version}-linux-x64/.agents/plugins/marketplace.json"
+          ./scripts/validate-plugin-linux.sh "$plugin" "$marketplace"
+          python3 scripts/test-plugin-packaging.py "$plugin" --platform linux --arch x64
+          test ! -e plugins/vibebus/bin/vibebus
+          test ! -e plugins/vibebus/bin/vibebus.exe
+
+      - name: Upload Linux rolling staging evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vibebus-linux-${{ github.sha }}
+          path: dist/staging/VibeBus-*-linux-x64
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
   macos:
     name: macOS build, Keychain, Hooks, and package
     runs-on: macos-latest
@@ -156,7 +192,18 @@ jobs:
       - name: Build and validate macOS package
         run: |
           ./scripts/package-plugin-macos.sh
-          ./scripts/validate-plugin-macos.sh dist/staging/VibeBus-0.10.0-macos-$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)/plugins/vibebus
+          version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+          arch="$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)"
+          plugin="dist/staging/VibeBus-${version}-macos-${arch}/plugins/vibebus"
+          marketplace="dist/staging/VibeBus-${version}-macos-${arch}/.agents/plugins/marketplace.json"
+          ./scripts/validate-plugin-macos.sh "$plugin" "$marketplace"
+          python3 scripts/test-plugin-packaging.py "$plugin" \
+            --platform macos \
+            --arch "$arch" \
+            --portable-archive "dist/VibeBus-${version}-macos-${arch}.tar.gz" \
+            --plugin-archive "dist/VibeBus-Codex-plugin-${version}-macos-${arch}.zip"
+          test ! -e plugins/vibebus/bin/vibebus
+          test ! -e plugins/vibebus/bin/vibebus.exe
           cd dist
           shasum -a 256 -c SHA256SUMS-macos-*.txt
 
@@ -186,6 +233,7 @@ jobs:
         run: |
           rustup set auto-self-update disable
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup target add x86_64-pc-windows-msvc
           rustup show active-toolchain
 
       - name: Install .NET SDK
@@ -210,9 +258,28 @@ jobs:
         shell: pwsh
         run: ./scripts/build-release.ps1
 
+      - name: Validate and negatively test Windows staged plugin
+        shell: pwsh
+        run: |
+          $version = (python scripts/plugin_package.py version --repo-root . --cargo cargo).Trim()
+          $staging = "dist/staging/VibeBus-$version-windows-x64"
+          $plugin = "$staging/plugins/vibebus"
+          ./scripts/validate-plugin.ps1 -StagingRoot $staging | Out-Null
+          python scripts/test-plugin-packaging.py $plugin `
+            --platform windows `
+            --arch x64 `
+            --portable-archive "dist/VibeBus-$version-windows-x64.zip" `
+            --plugin-archive "dist/VibeBus-Codex-plugin-$version-windows-x64.zip"
+          if (Test-Path -LiteralPath "plugins/vibebus/bin/vibebus.exe") {
+            throw "Windows packaging contaminated the source plugin directory."
+          }
+
       - name: Test backup restore drill
         shell: pwsh
-        run: ./scripts/test-backup-restore.ps1 -BinaryPath ./target/release/vibebus.exe
+        run: |
+          $version = (python scripts/plugin_package.py version --repo-root . --cargo cargo).Trim()
+          ./scripts/test-backup-restore.ps1 `
+            -BinaryPath "./dist/staging/VibeBus-$version-windows-x64/plugins/vibebus/bin/vibebus.exe"
 
       - name: Validate MSI and extracted payload
         shell: pwsh
@@ -233,5 +300,7 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS.txt
             dist/release-manifest.json
+            dist/staging/VibeBus-*-windows-x64
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
