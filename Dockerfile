@@ -10,7 +10,7 @@ RUN cargo build --release --locked --bin vibebus
 
 FROM --platform=linux/amd64 debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e AS runtime
 
-ARG VIBEBUS_VERSION=0.10.0
+ARG VIBEBUS_VERSION
 ARG VIBEBUS_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.title="VibeBus" \
       org.opencontainers.image.description="Local structured fact bus for independent Codex tasks" \
@@ -18,6 +18,8 @@ LABEL org.opencontainers.image.title="VibeBus" \
       org.opencontainers.image.revision="${VIBEBUS_SOURCE_REVISION}" \
       org.opencontainers.image.source="https://github.com/lakeofsky347/VibeBus" \
       org.opencontainers.image.licenses="MIT"
+
+RUN test -n "$VIBEBUS_VERSION"
 
 RUN groupadd --gid 10001 vibebus \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin vibebus \

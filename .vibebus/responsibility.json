@@ -2,6 +2,49 @@
   "version": 1,
   "defaultAllowedPaths": [],
   "roles": {
+    "master-control": {
+      "allowedPaths": [".vibebus/**", "acceptance/**", "docs/**"]
+    },
+    "architecture": {
+      "allowedPaths": ["docs/**"]
+    },
+    "development": {
+      "allowedPaths": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "plugins/**",
+        "scripts/**",
+        "src/**",
+        "tests/**"
+      ]
+    },
+    "qa": {
+      "allowedPaths": ["acceptance/**", "docs/acceptance.md", "scripts/test-*/**", "scripts/test-*", "tests/**"]
+    },
+    "git": {
+      "allowedPaths": []
+    },
+    "ci-release": {
+      "allowedPaths": [
+        ".github/workflows/**",
+        "Dockerfile",
+        "deny.toml",
+        "docker-compose.yml",
+        "installer/**",
+        "scripts/build-release.ps1",
+        "scripts/package-plugin*",
+        "scripts/plugin_package.py",
+        "scripts/sign-windows.ps1",
+        "scripts/validate-plugin*",
+        "scripts/validate_plugin*"
+      ]
+    },
+    "documentation": {
+      "allowedPaths": ["CHANGELOG.md", "CONTRIBUTING.md", "README.md", "docs/**", "plugins/*/README.md"]
+    },
+    "security": {
+      "allowedPaths": ["SECURITY.md", "acceptance/security/**", "docs/security/**"]
+    },
     "coordination": {
       "allowedPaths": ["acceptance/**", "docs/**"]
     },

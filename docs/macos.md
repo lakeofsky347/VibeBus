@@ -1,6 +1,6 @@
 # macOS development and local delivery
 
-VibeBus 0.10 has a native macOS path for CLI, stdio MCP, macOS Keychain credentials, SessionStart/PostToolUse/Stop Hooks, and Codex plugin packaging. The accepted local host is Apple Silicon (`arm64`); the packaging script also names native Intel builds as `x64`, but Intel has not yet received the same live acceptance.
+VibeBus 0.11.1 has a native macOS path for CLI, stdio MCP, macOS Keychain credentials, SessionStart/PostToolUse/Stop Hooks, and Codex plugin packaging. The accepted local host is Apple Silicon (`arm64`); the packaging script also names native Intel builds as `x64`, but Intel has not yet received the same live acceptance.
 
 ## Prerequisites
 
@@ -25,8 +25,11 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 ./scripts/test-lifecycle-hooks.sh
 ./scripts/test-macos-keychain.sh
 ./scripts/package-plugin-macos.sh
+version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+arch="$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)"
 ./scripts/validate-plugin-macos.sh \
-  ./dist/staging/VibeBus-0.10.0-macos-arm64/plugins/vibebus
+  "./dist/staging/VibeBus-$version-macos-$arch/plugins/vibebus" \
+  "./dist/staging/VibeBus-$version-macos-$arch/.agents/plugins/marketplace.json"
 (cd dist && shasum -a 256 -c SHA256SUMS-macos-arm64.txt)
 ```
 
@@ -55,8 +58,9 @@ macOS packages are source and CI acceptance outputs, not current GitHub Release 
 Build first, then register the staged marketplace rather than the Windows-oriented source payload:
 
 ```sh
-codex plugin marketplace add \
-  "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+arch="$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)"
+codex plugin marketplace add "$PWD/dist/staging/VibeBus-$version-macos-$arch"
 codex plugin add vibebus@vibebus-local
 ```
 
@@ -67,12 +71,13 @@ Start a new Codex task after installation. Review and trust the Hook definitions
 Do not copy the Windows SQLite runtime or export Windows credentials. Keep the tracked `.vibebus/project.json`, then create fresh Mac-local state:
 
 ```sh
-./plugins/vibebus/bin/vibebus --root /path/to/project \
-  register --name mac-worker --role implementation --store-credentials
-./plugins/vibebus/bin/vibebus --root /path/to/project \
-  credential status --agent mac-worker
-./plugins/vibebus/bin/vibebus --root /path/to/project \
-  inbox --agent mac-worker
+version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+arch="$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)"
+vibebus="$PWD/dist/staging/VibeBus-$version-macos-$arch/plugins/vibebus/bin/vibebus"
+"$vibebus" register --root /path/to/project \
+  --name mac-worker --role implementation --store-credentials
+"$vibebus" credential status --root /path/to/project --agent mac-worker
+"$vibebus" inbox --root /path/to/project --agent mac-worker
 ```
 
 Successful storage reports backend `macos-keychain`, `stored=true`, and `secretsRedacted=true`. Agent entries use service `VibeBus:<project-id>:<agent>` with account `VibeBus`; Operator entries use the distinct service `VibeBusOperator:<project-id>`. SQLite stores only credential digests.

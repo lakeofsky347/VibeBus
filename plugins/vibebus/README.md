@@ -19,7 +19,10 @@ VibeBus 是独立 Codex 顶层任务之间的结构化本地总线：每个任�
 在项目根目录准备已构建的 `vibebus.exe`，或先运行仓库根目录的发布/打包脚本，然后：
 
 ```powershell
-codex plugin marketplace add .
+$version = (python scripts/plugin_package.py version --repo-root . --cargo cargo).Trim()
+$staging = "$PWD/dist/staging/VibeBus-$version-windows-x64"
+./scripts/package-plugin.ps1 -ExpectedVersion $version | Out-Null
+codex plugin marketplace add $staging
 codex plugin add vibebus@vibebus-local
 ```
 
@@ -45,13 +48,15 @@ vibebus.exe credential status --root D:\path\to\repo --agent ui
 
 ```sh
 ./scripts/package-plugin-macos.sh
-codex plugin marketplace add \
-  "$PWD/dist/staging/VibeBus-0.10.0-macos-arm64"
+version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+arch="$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)"
+staging="$PWD/dist/staging/VibeBus-$version-macos-$arch"
+codex plugin marketplace add "$staging"
 codex plugin add vibebus@vibebus-local
-./plugins/vibebus/bin/vibebus --root "$PWD" \
-  register --name mac-worker --role implementation --store-credentials
-./plugins/vibebus/bin/vibebus --root "$PWD" \
-  credential status --agent mac-worker
+"$staging/plugins/vibebus/bin/vibebus" register --root "$PWD" \
+  --name mac-worker --role implementation --store-credentials
+"$staging/plugins/vibebus/bin/vibebus" credential status --root "$PWD" \
+  --agent mac-worker
 ```
 
 启动新 Codex 任务并审查/信任 Hooks。macOS Hooks 由同一个原生二进制执行，不依赖 PowerShell、Node、jq 或 transcript。Keychain 写入成功时返回 `backend=macos-keychain` 与 `secretsRedacted=true`。
@@ -61,11 +66,12 @@ codex plugin add vibebus@vibebus-local
 镜像是非 root、命令式的 CLI/std io MCP 交付，不是 HTTP 服务：
 
 ```powershell
-./scripts/test-container.ps1 -ImageTag vibebus:0.10.0-local
+$version = (python scripts/plugin_package.py version --repo-root . --cargo cargo).Trim()
+./scripts/test-container.ps1 -ImageTag "vibebus:$version-local"
 docker run --rm `
   --mount type=bind,source=D:\path\to\repo,target=/workspace `
   --mount type=volume,source=vibebus-data,target=/data `
-  vibebus:0.10.0-local doctor --root /workspace
+  "vibebus:$version-local" doctor --root /workspace
 ```
 
 容器内使用 `/workspace` 项目挂载和 `/data` SQLite volume，运行用户为 `10001:10001`。Linux 没有 Windows Credential Manager，不能使用 `--store-credentials`；请通过短时显式 token 或 `VIBEBUS_AGENT_TOKEN` 注入凭据，且不要把 token、恢复密钥、operator、云或签名凭据写入镜像、参数记录、仓库或报告。
@@ -85,12 +91,13 @@ docker run --rm `
 从仓库根目录运行：
 
 ```powershell
-./scripts/validate-plugin.ps1 -PluginRoot ./plugins/vibebus
 ./scripts/package-plugin.ps1
+$version = (python scripts/plugin_package.py version --repo-root . --cargo cargo).Trim()
+./scripts/validate-plugin.ps1 -StagingRoot "./dist/staging/VibeBus-$version-windows-x64"
 ./scripts/build-release.ps1
 $msi = Get-ChildItem ./dist/VibeBus-*-windows-x64.msi | Select-Object -First 1
 ./scripts/test-installer.ps1 -MsiPath $msi.FullName
-./scripts/test-container.ps1 -ImageTag vibebus:0.10.0-local
+./scripts/test-container.ps1 -ImageTag "vibebus:$version-local"
 ```
 
 macOS：
@@ -101,11 +108,14 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 ./scripts/test-lifecycle-hooks.sh
 ./scripts/test-macos-keychain.sh
 ./scripts/package-plugin-macos.sh
+version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+arch="$(if [ "$(uname -m)" = arm64 ]; then echo arm64; else echo x64; fi)"
 ./scripts/validate-plugin-macos.sh \
-  ./dist/staging/VibeBus-0.10.0-macos-arm64/plugins/vibebus
+  "./dist/staging/VibeBus-$version-macos-$arch/plugins/vibebus" \
+  "./dist/staging/VibeBus-$version-macos-$arch/.agents/plugins/marketplace.json"
 ```
 
-生产 tag 发布还需要代码签名证书和密码；缺少它们时发布路径应失败关闭。普通 PR 的本地包明确是未签名验收包，不是生产发布。
+当前稳定 tag 只发布 GitHub 自动生成的源码归档与四个源码证据文件，不要求平台代码签名凭据。普通 PR 的平台包只是有保留期的 Rolling CI 验收产物，不是稳定发布；未来若启用二进制 Release，必须先建立并审查独立的签名、公证、安装与回滚合同。
 
 项目级入口：
 

@@ -21,6 +21,26 @@ The first `v0.10.0` release is source-only. GitHub automatically supplies the ta
 - Do not rewrite a published tag or its assets. Withdraw a bad release and publish a higher patch version after the corrective change is reviewed and merged.
 - This source-only release has no binary installation, upgrade, signature, or installer rollback claim. A later binary-release contract must define and validate those lifecycle rules before it can publish platform artifacts.
 
+## P0.1 trusted plugin bootstrap
+
+The `0.11.1` patch line treats `plugins/vibebus` as source templates, never as a package output directory. `cargo metadata --locked --no-deps --format-version 1` is the version and target-directory authority. Platform packers create an allowlisted tree only below `dist/staging/VibeBus-X.Y.Z-<platform>-<arch>`, render exactly one platform `.mcp.json`, and copy the native binary only into that staging tree.
+
+Before accepting a rolling artifact, the platform-native validator checks the Cargo, Codex, Cursor, binary, platform and architecture contract; exact payload inventory; executable format and permissions; lifecycle Hooks; canonical staged marketplace; `initialize`, `tools/list`, and a real `vibebus_status` call against an isolated project. Generated archives are inspected for traversal, links, metadata, case collisions, Windows-unsafe names and size limits, then extracted and validated again. Windows MSI construction consumes only that validated staging root. Stable GitHub Release remains source-only and does not promote these rolling artifacts.
+
+Use dynamic paths instead of copying a version literal:
+
+```sh
+version="$(python3 scripts/plugin_package.py version --repo-root . --cargo cargo)"
+./scripts/package-plugin-macos.sh
+```
+
+```powershell
+$version = (python scripts/plugin_package.py version --repo-root . --cargo cargo).Trim()
+./scripts/package-plugin.ps1 -ExpectedVersion $version
+```
+
+The source marketplace cannot be installed directly because source templates intentionally contain no executable. Register the marketplace from the generated platform staging root. A macOS checkpoint proves only macOS; Windows PE/MSI and Linux ELF evidence must come from their native GitHub Actions runners before the P0 repair is accepted.
+
 ## Coordination boundaries
 
 VibeBus is the durable source of coordination facts. Claim tasks atomically, bind only the real native Codex task ID, inspect responsibility policy, reserve exact paths, use task-scoped expiring overrides for cross-domain paths, and process required messages with ACK before close. Use replay-safe subscription peek/ACK; at-least-once delivery requires idempotent side effects.

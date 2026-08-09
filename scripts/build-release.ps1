@@ -3,14 +3,24 @@ param(
     [string]$CargoPath = "cargo",
     [string]$OutputDirectory = "dist",
     [string]$SourceRef = "HEAD",
-    [switch]$SkipCargoBuild,
     [switch]$Sign
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$cargoManifestPath = Join-Path $repoRoot "Cargo.toml"
-$pluginManifestPath = Join-Path $repoRoot "plugins\vibebus\.codex-plugin\plugin.json"
+$helper = Join-Path $PSScriptRoot "plugin_package.py"
+
+function Invoke-PythonHelper {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    $output = & python $helper @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "plugin_package.py $($Arguments -join ' ') failed with exit code $exitCode."
+    }
+    return ($output | Out-String).Trim()
+}
+
 $sourceRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceRevision -notmatch '^[0-9a-f]{40}$') {
     throw "Git source revision could not be resolved."
@@ -22,101 +32,126 @@ if ($LASTEXITCODE -ne 0 -or $sourceRefRevision -notmatch '^[0-9a-f]{40}$') {
 if ($sourceRefRevision -ne $sourceRevision) {
     throw "SourceRef must resolve to the checked-out source revision."
 }
-
-$cargoText = Get-Content -Raw -LiteralPath $cargoManifestPath
-$cargoVersionMatch = [regex]::Match($cargoText, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"')
-if (-not $cargoVersionMatch.Success) {
-    throw "Could not read the package version from Cargo.toml."
+$workingTree = @(& git -C $repoRoot status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0) {
+    throw "Git working tree status could not be resolved."
 }
-$cargoVersion = $cargoVersionMatch.Groups["version"].Value
-$pluginVersion = (Get-Content -Raw -LiteralPath $pluginManifestPath | ConvertFrom-Json).version
+if ($workingTree.Count -ne 0) {
+    throw "Windows release assets require a clean working tree so binaries, source evidence, and sourceRevision agree."
+}
 
+$outputRoot = Invoke-PythonHelper @("output-root", "--repo-root", $repoRoot, "--output-root", $OutputDirectory)
+New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
+$cargoVersion = Invoke-PythonHelper @("version", "--repo-root", $repoRoot, "--cargo", $CargoPath)
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = $cargoVersion
 }
-if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-    throw "Release version must be semantic X.Y.Z."
+if ($Version -notmatch '^\d+\.\d+\.\d+$' -or $Version -ne $cargoVersion) {
+    throw "Release and Cargo versions must match (release=$Version cargo=$cargoVersion)."
 }
-if ($Version -ne $cargoVersion -or $Version -ne $pluginVersion) {
-    throw "Release, Cargo, and plugin versions must match (release=$Version cargo=$cargoVersion plugin=$pluginVersion)."
+$expectedStagingName = "VibeBus-$Version-windows-x64"
+$expectedStagingRoot = [IO.Path]::GetFullPath((Join-Path (Join-Path $outputRoot "staging") $expectedStagingName))
+
+$packageArguments = @(
+    "-CargoPath", $CargoPath,
+    "-OutputRoot", $outputRoot,
+    "-ExpectedVersion", $Version
+)
+$packageOutput = & (Join-Path $PSScriptRoot "package-plugin.ps1") @packageArguments
+$packageExitCode = $LASTEXITCODE
+if ($packageExitCode -ne 0) {
+    throw "package-plugin.ps1 failed with exit code $packageExitCode."
+}
+$package = (($packageOutput | Out-String).Trim() | ConvertFrom-Json -ErrorAction Stop)
+$StagingRoot = [IO.Path]::GetFullPath([string]$package.StagingRoot)
+if (-not $StagingRoot.Equals($expectedStagingRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "StagingRoot must be the controlled package output $expectedStagingRoot."
 }
 
-if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
-    $outputRoot = [System.IO.Path]::GetFullPath($OutputDirectory)
-} else {
-    $outputRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDirectory))
+$pluginRoot = Join-Path $StagingRoot "plugins\vibebus"
+$marketplacePath = Join-Path $StagingRoot ".agents\plugins\marketplace.json"
+$pluginManifestPath = Join-Path $pluginRoot ".codex-plugin\plugin.json"
+$pluginManifest = Get-Content -Raw -LiteralPath $pluginManifestPath | ConvertFrom-Json -ErrorAction Stop
+$stagedVersion = [string]$pluginManifest.version
+if ($Version -notmatch '^\d+\.\d+\.\d+$' -or $Version -ne $cargoVersion -or $Version -ne $stagedVersion) {
+    throw "Release, Cargo, and staged plugin versions must match (release=$Version cargo=$cargoVersion plugin=$stagedVersion)."
 }
-$repoPrefix = $repoRoot.TrimEnd('\') + '\'
-if (-not $outputRoot.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "OutputDirectory must resolve inside the repository: $outputRoot"
-}
-New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
-
-$stagingParent = Join-Path $outputRoot "staging"
-$stagingRoot = Join-Path $stagingParent "VibeBus-$Version"
-$wixIntermediate = Join-Path $outputRoot "wixobj"
-foreach ($pathToClear in @($stagingRoot, $wixIntermediate)) {
-    $fullPath = [System.IO.Path]::GetFullPath($pathToClear)
-    if (-not $fullPath.StartsWith($outputRoot.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to clear a path outside the release output directory: $fullPath"
-    }
-    if (Test-Path -LiteralPath $fullPath) {
-        Remove-Item -Recurse -Force -LiteralPath $fullPath
-    }
+if ((Split-Path -Leaf $StagingRoot) -ne $expectedStagingName) {
+    throw "Windows staging root must be named $expectedStagingName."
 }
 
-if (-not $SkipCargoBuild) {
-    & (Join-Path $PSScriptRoot "package-plugin.ps1") -CargoPath $CargoPath
-}
-& (Join-Path $PSScriptRoot "validate-plugin.ps1") -PluginRoot (Join-Path $repoRoot "plugins\vibebus") | Out-Null
-
-$packagedBinary = Join-Path $repoRoot "plugins\vibebus\bin\vibebus.exe"
+& (Join-Path $PSScriptRoot "validate-plugin.ps1") `
+    -StagingRoot $StagingRoot -CargoPath $CargoPath | Out-Null
+$packagedBinary = Join-Path $pluginRoot "bin\vibebus.exe"
 if ($Sign) {
     & (Join-Path $PSScriptRoot "sign-windows.ps1") -Path $packagedBinary | Out-Null
+    & (Join-Path $PSScriptRoot "validate-plugin.ps1") `
+        -StagingRoot $StagingRoot -CargoPath $CargoPath -RequireAuthenticodeSignature | Out-Null
 }
 
-New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
-Copy-Item -Recurse -Force -LiteralPath (Join-Path $repoRoot ".agents") -Destination (Join-Path $stagingRoot ".agents")
-New-Item -ItemType Directory -Force -Path (Join-Path $stagingRoot "plugins") | Out-Null
-Copy-Item -Recurse -Force -LiteralPath (Join-Path $repoRoot "plugins\vibebus") -Destination (Join-Path $stagingRoot "plugins\vibebus")
-Copy-Item -Force -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $stagingRoot "LICENSE")
-Copy-Item -Force -LiteralPath (Join-Path $repoRoot "README.md") -Destination (Join-Path $stagingRoot "README.md")
-
+$wixIntermediate = Join-Path $outputRoot "wixobj"
+if (Test-Path -LiteralPath $wixIntermediate) {
+    $wixItem = Get-Item -Force -LiteralPath $wixIntermediate
+    if (($wixItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "WiX intermediate directory must not be a reparse point: $wixIntermediate"
+    }
+    [IO.Directory]::Delete($wixIntermediate, $true)
+}
 Push-Location $repoRoot
 try {
     & dotnet tool restore
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet tool restore failed with exit code $LASTEXITCODE."
     }
-
     $msiPath = Join-Path $outputRoot "VibeBus-$Version-windows-x64.msi"
-    & dotnet tool run wix build "installer\Package.wxs" -arch x64 -d "Version=$Version" -d "PayloadRoot=$stagingRoot" -intermediateFolder $wixIntermediate -pdbtype none -out $msiPath
+    & dotnet tool run wix build "installer\Package.wxs" -arch x64 `
+        -d "Version=$Version" -d "PayloadRoot=$StagingRoot" `
+        -intermediateFolder $wixIntermediate -pdbtype none -out $msiPath
     if ($LASTEXITCODE -ne 0) {
         throw "WiX build failed with exit code $LASTEXITCODE."
     }
-} finally {
+}
+finally {
     Pop-Location
 }
-
 if ($Sign) {
     & (Join-Path $PSScriptRoot "sign-windows.ps1") -Path $msiPath | Out-Null
 }
 
 $portableZip = Join-Path $outputRoot "VibeBus-$Version-windows-x64.zip"
-$pluginZip = Join-Path $outputRoot "VibeBus-Codex-plugin-$Version.zip"
+$pluginZip = Join-Path $outputRoot "VibeBus-Codex-plugin-$Version-windows-x64.zip"
 $sourceZip = Join-Path $outputRoot "VibeBus-$Version-source.zip"
-foreach ($archive in @($portableZip, $pluginZip, $sourceZip)) {
-    if (Test-Path -LiteralPath $archive) {
-        Remove-Item -Force -LiteralPath $archive
-    }
+Invoke-PythonHelper @(
+    "archive",
+    "--repo-root", $repoRoot,
+    "--output-root", $outputRoot,
+    "--staging-root", $StagingRoot,
+    "--portable", $portableZip,
+    "--plugin", $pluginZip,
+    "--portable-format", "zip"
+) | Out-Null
+Invoke-PythonHelper @(
+    "validate-archive",
+    "--repo-root", $repoRoot,
+    "--archive", $portableZip,
+    "--kind", "portable",
+    "--platform", "windows",
+    "--arch", "x64",
+    "--cargo", $CargoPath
+) | Out-Null
+Invoke-PythonHelper @(
+    "validate-archive",
+    "--repo-root", $repoRoot,
+    "--archive", $pluginZip,
+    "--kind", "plugin",
+    "--platform", "windows",
+    "--arch", "x64",
+    "--cargo", $CargoPath
+) | Out-Null
+
+if (Test-Path -LiteralPath $sourceZip) {
+    [IO.File]::Delete($sourceZip)
 }
-Compress-Archive -CompressionLevel Optimal -LiteralPath @(
-    (Join-Path $stagingRoot ".agents"),
-    (Join-Path $stagingRoot "plugins"),
-    (Join-Path $stagingRoot "LICENSE"),
-    (Join-Path $stagingRoot "README.md")
-) -DestinationPath $portableZip
-Compress-Archive -CompressionLevel Optimal -LiteralPath (Join-Path $stagingRoot "plugins\vibebus") -DestinationPath $pluginZip
 & git -C $repoRoot archive --format=zip "--prefix=VibeBus-$Version/" "--output=$sourceZip" $SourceRef
 if ($LASTEXITCODE -ne 0) {
     throw "git archive failed for source ref '$SourceRef' with exit code $LASTEXITCODE."
@@ -125,11 +160,11 @@ if ($LASTEXITCODE -ne 0) {
 $releaseFiles = @($msiPath, $portableZip, $pluginZip, $sourceZip)
 $hashLines = foreach ($file in $releaseFiles) {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
-    "$hash  $([System.IO.Path]::GetFileName($file))"
+    "$hash  $([IO.Path]::GetFileName($file))"
 }
 $checksumsPath = Join-Path $outputRoot "SHA256SUMS.txt"
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllLines($checksumsPath, [string[]]$hashLines, $utf8NoBom)
+$utf8NoBom = [Text.UTF8Encoding]::new($false)
+[IO.File]::WriteAllLines($checksumsPath, [string[]]$hashLines, $utf8NoBom)
 
 $manifestPath = Join-Path $outputRoot "release-manifest.json"
 $manifest = [ordered]@{
@@ -138,6 +173,9 @@ $manifest = [ordered]@{
     signed = [bool]$Sign
     sourceRevision = $sourceRevision
     sourceRef = $SourceRef
+    staging = $expectedStagingName
+    binaryMachine = "AMD64"
+    binarySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedBinary).Hash.ToLowerInvariant()
     generatedAt = [DateTimeOffset]::UtcNow.ToString("O")
     artifacts = foreach ($file in $releaseFiles) {
         $item = Get-Item -LiteralPath $file
@@ -147,8 +185,8 @@ $manifest = [ordered]@{
             sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
         }
     }
-    checksums = [System.IO.Path]::GetFileName($checksumsPath)
+    checksums = [IO.Path]::GetFileName($checksumsPath)
 }
 $manifestJson = $manifest | ConvertTo-Json -Depth 5
-[System.IO.File]::WriteAllText($manifestPath, $manifestJson + [Environment]::NewLine, $utf8NoBom)
+[IO.File]::WriteAllText($manifestPath, $manifestJson + [Environment]::NewLine, $utf8NoBom)
 $manifestJson
