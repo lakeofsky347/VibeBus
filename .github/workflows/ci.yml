@@ -103,7 +103,7 @@ jobs:
           python3 scripts/normalize-cyclonedx.py --input vibebus.cdx.json --output dist/vibebus.cdx.json
 
       - name: Upload supply-chain evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vibebus-supply-chain-${{ github.sha }}
           path: 'dist/*.cdx.json'
@@ -161,7 +161,7 @@ jobs:
           shasum -a 256 -c SHA256SUMS-macos-*.txt
 
       - name: Upload macOS acceptance assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vibebus-macos-${{ github.sha }}
           path: |
@@ -225,7 +225,7 @@ jobs:
           ./scripts/test-installer.ps1 -MsiPath $msi.FullName -ExerciseLifecycle
 
       - name: Upload CI release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vibebus-windows-${{ github.sha }}
           path: |
